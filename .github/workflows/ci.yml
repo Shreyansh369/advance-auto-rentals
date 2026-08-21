@@ -1,0 +1,25 @@
+name: Verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with: { version: 11 }
+      - uses: actions/setup-node@v5
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: advance-auto-rentals/pnpm-lock.yaml }
+      - run: pnpm install --frozen-lockfile
+        working-directory: advance-auto-rentals
+      - run: pnpm lint && pnpm typecheck && pnpm test && pnpm functions:build && pnpm build
+        working-directory: advance-auto-rentals
+      - run: pnpm test:rules
+        working-directory: advance-auto-rentals
+      - run: pnpm audit --prod --audit-level=high
+        working-directory: advance-auto-rentals

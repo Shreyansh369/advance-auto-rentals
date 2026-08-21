@@ -1,0 +1,8 @@
+{
+  "indexes": [
+    { "collectionGroup": "reservations", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "vehicleId", "order": "ASCENDING" }, { "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "pickupAt", "order": "ASCENDING" }] },
+    { "collectionGroup": "reservations", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "pickupAt", "order": "ASCENDING" }] },
+    { "collectionGroup": "rentals", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "expectedReturnAt", "order": "ASCENDING" }] }
+  ],
+  "fieldOverrides": []
+}
