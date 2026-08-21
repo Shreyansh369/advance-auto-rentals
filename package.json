@@ -4,6 +4,11 @@
   "private": true,
   "packageManager": "pnpm@11.19.0",
   "engines": { "node": ">=22 <25", "pnpm": ">=11" },
+  "pnpm": {
+  "onlyBuiltDependencies": [
+    "re2"
+  ]
+},
   "scripts": {
     "dev": "next dev",
     "build": "next build",
