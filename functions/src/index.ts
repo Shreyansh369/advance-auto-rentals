@@ -41,6 +41,7 @@ import {
   checkoutSchema,
   serviceSchema,
   vehicleStatusSchema,
+  staffRegistrationSchema,
 } from "./services/schemas";
 
 import { financialOverview } from "./services/reporting";
@@ -1224,6 +1225,86 @@ export const validateUploadedEvidence =
               object.contentType,
           },
         );
+      }
+    },
+  );
+  export const registerStaffProfile =
+  onCall(
+    {
+      enforceAppCheck: true,
+      region: "us-central1",
+    },
+    async (request) => {
+      try {
+        if (!request.auth) {
+          throw new HttpsError(
+            "unauthenticated",
+            "Sign-in is required.",
+          );
+        }
+
+        const parsed =
+          staffRegistrationSchema.safeParse(
+            request.data,
+          );
+
+        if (!parsed.success) {
+          throw new HttpsError(
+            "invalid-argument",
+            "Invalid staff registration data.",
+            parsed.error.flatten(),
+          );
+        }
+
+        const uid =
+          request.auth.uid;
+
+        const email =
+          request.auth.token.email ??
+          null;
+
+        await db
+          .collection("users")
+          .doc(uid)
+          .set(
+            {
+              fullName:
+                parsed.data.fullName,
+
+              mobile:
+                parsed.data.mobile,
+
+              age:
+                parsed.data.age,
+
+              email,
+
+              requestedRole:
+                parsed.data.requestedRole,
+
+              role: null,
+
+              status: "pending",
+
+              emailVerified: false,
+
+              createdAt:
+                FieldValue.serverTimestamp(),
+
+              updatedAt:
+                FieldValue.serverTimestamp(),
+            },
+            {
+              merge: true,
+            },
+          );
+
+        return {
+          uid,
+          status: "pending",
+        };
+      } catch (error) {
+        return safeError(error);
       }
     },
   );

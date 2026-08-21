@@ -537,3 +537,31 @@ export const financialOverviewSchema =
       input.from <= input.to,
     "The reporting period is invalid",
   );
+  export const staffRegistrationSchema =
+  z.object({
+    fullName:
+      z.string()
+        .trim()
+        .min(2)
+        .max(160),
+
+    mobile:
+      z.string()
+        .trim()
+        .min(7)
+        .max(30),
+
+    age:
+      z.number()
+        .int()
+        .min(18)
+        .max(100),
+
+    requestedRole:
+      z.enum([
+        "admin",
+        "operations",
+      ]),
+  })
+  .strict();
+  
