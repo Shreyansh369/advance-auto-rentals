@@ -1,6 +1,9 @@
 "use client";
 
-import { doc, getDoc } from "firebase/firestore";
+import {
+  doc,
+  onSnapshot,
+} from "firebase/firestore";
 
 import {
   onAuthStateChanged,
@@ -32,9 +35,9 @@ type AuthState =
     }
   | {
       status: "loading";
-      user: null;
+      user: User | null;
       role: null;
-      message: null;
+      message: string | null;
     }
   | {
       status: "ready";
@@ -83,19 +86,59 @@ export function FirebaseProvider({
 
     let cancelled = false;
 
-    const { auth, db } =
-      getFirebaseClient();
+    let unsubscribeProfile:
+      | (() => void)
+      | undefined;
 
-    const unsubscribe =
+    let firebaseClient:
+      | ReturnType<
+          typeof getFirebaseClient
+        >
+      | undefined;
+
+    try {
+      firebaseClient =
+        getFirebaseClient();
+    } catch (error) {
+      setState({
+        status: "config-error",
+        user: null,
+        role: null,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Firebase could not initialize.",
+      });
+
+      return;
+    }
+
+    const {
+      auth,
+      db,
+    } = firebaseClient;
+
+    const unsubscribeAuth =
       onAuthStateChanged(
         auth,
-        async (user) => {
+        (user) => {
+          /*
+           * Always dispose of the previous
+           * staff-profile listener before
+           * handling the new authentication state.
+           */
+          unsubscribeProfile?.();
+          unsubscribeProfile =
+            undefined;
+
           if (cancelled) {
             return;
           }
 
           /*
-           * Signed out.
+           * ---------------------------------------------------
+           * SIGNED OUT
+           * ---------------------------------------------------
            */
           if (!user) {
             setState({
@@ -109,144 +152,188 @@ export function FirebaseProvider({
           }
 
           /*
-           * An unverified email must never enter the
-           * application authorization flow.
+           * ---------------------------------------------------
+           * AUTHENTICATED USER
+           * ---------------------------------------------------
            *
-           * This prevents the race where LoginForm starts
-           * signing the user out while this listener sees
-           * the newly authenticated Firebase user and
-           * incorrectly displays "Account awaiting approval".
+           * Authentication is complete.
+           *
+           * Authorization is resolved from:
+           *
+           * users/{uid}
+           *
+           * We retain the authenticated Firebase user while
+           * the Firestore profile is being resolved.
            */
-          if (!user.emailVerified) {
-            setState({
-              status: "ready",
-              user: null,
-              role: null,
-              message:
-                "Please verify your email address before signing in.",
-            });
+          setState({
+            status: "loading",
+            user,
+            role: null,
+            message:
+              "Checking your staff profile…",
+          });
 
-            try {
-              await auth.signOut();
-            } catch (error) {
-              console.error(
-                "Unable to clear unverified Firebase session:",
-                error,
-              );
-            }
-
-            return;
-          }
-
-          try {
-            /*
-             * Only verified Firebase users reach the
-             * Firestore staff-profile lookup.
-             */
-            const profileRef = doc(
+          const profileRef =
+            doc(
               db,
               "users",
               user.uid,
             );
 
-            const profileSnapshot =
-              await getDoc(profileRef);
+          /*
+           * Realtime profile listener.
+           *
+           * This is important because:
+           *
+           * 1. Google Auth can complete before signup writes
+           *    users/{uid}.
+           *
+           * 2. Admin approval can happen later.
+           *
+           * 3. Role changes should appear without forcing
+           *    the user to sign out and back in.
+           */
+          unsubscribeProfile =
+            onSnapshot(
+              profileRef,
+              (snapshot) => {
+                if (cancelled) {
+                  return;
+                }
 
-            if (cancelled) {
-              return;
-            }
+                /*
+                 * -------------------------------------------------
+                 * PROFILE DOES NOT EXIST
+                 * -------------------------------------------------
+                 *
+                 * This is different from "pending".
+                 *
+                 * No document means this Google account has
+                 * authenticated successfully but has not yet
+                 * completed staff registration.
+                 */
+                if (!snapshot.exists()) {
+                  setState({
+                    status: "ready",
+                    user,
+                    role: null,
+                    message:
+                      "Your Google account is authenticated, but no staff profile exists for this account yet.",
+                  });
 
-            if (!profileSnapshot.exists()) {
-              setState({
-                status: "ready",
-                user,
-                role: null,
-                message:
-                  "Your staff profile has not been created yet. Please contact the administrator.",
-              });
+                  return;
+                }
 
-              return;
-            }
+                const profile =
+                  snapshot.data();
 
-            const profile =
-              profileSnapshot.data();
+                const role: AppRole =
+                  profile.role === "admin" ||
+                  profile.role ===
+                    "operations"
+                    ? profile.role
+                    : null;
 
-            const role: AppRole =
-              profile.role === "admin" ||
-              profile.role === "operations"
-                ? profile.role
-                : null;
+                const status =
+                  String(
+                    profile.status ??
+                      "",
+                  ).toLowerCase();
 
-            const status =
-              String(
-                profile.status ?? "",
-              ).toLowerCase();
+                /*
+                 * -------------------------------------------------
+                 * ACCOUNT NOT APPROVED
+                 * -------------------------------------------------
+                 */
+                if (
+                  status !== "approved"
+                ) {
+                  if (
+                    status === "pending"
+                  ) {
+                    setState({
+                      status: "ready",
+                      user,
+                      role: null,
+                      message:
+                        "Your staff account is awaiting administrator approval.",
+                    });
 
-            /*
-             * Only approved users receive an application role.
-             */
-            if (status !== "approved") {
-              setState({
-                status: "ready",
-                user,
-                role: null,
-                message:
-                  "Your account is awaiting administrator approval.",
-              });
+                    return;
+                  }
 
-              return;
-            }
+                  setState({
+                    status: "ready",
+                    user,
+                    role: null,
+                    message:
+                      "Your staff account is not approved for application access.",
+                  });
 
-            /*
-             * Approved but malformed profile.
-             */
-            if (!role) {
-              setState({
-                status: "ready",
-                user,
-                role: null,
-                message:
-                  "Your account has been approved but no valid application role has been assigned.",
-              });
+                  return;
+                }
 
-              return;
-            }
+                /*
+                 * -------------------------------------------------
+                 * APPROVED BUT INVALID ROLE
+                 * -------------------------------------------------
+                 */
+                if (!role) {
+                  setState({
+                    status: "ready",
+                    user,
+                    role: null,
+                    message:
+                      "Your account has been approved, but no valid application role has been assigned.",
+                  });
 
-            /*
-             * Fully authenticated and authorized.
-             */
-            setState({
-              status: "ready",
-              user,
-              role,
-              message: null,
-            });
-          } catch (error) {
-            console.error(
-              "Firebase staff profile lookup failed:",
-              error,
+                  return;
+                }
+
+                /*
+                 * -------------------------------------------------
+                 * FULLY AUTHORIZED
+                 * -------------------------------------------------
+                 */
+                setState({
+                  status: "ready",
+                  user,
+                  role,
+                  message: null,
+                });
+              },
+              (error) => {
+                console.error(
+                  "Firebase staff profile listener failed:",
+                  error,
+                );
+
+                if (cancelled) {
+                  return;
+                }
+
+                setState({
+                  status: "ready",
+                  user,
+                  role: null,
+                  message:
+                    error instanceof Error
+                      ? `We could not verify your staff profile: ${error.message}`
+                      : "We could not verify your staff profile. Please try again.",
+                });
+              },
             );
-
-            if (cancelled) {
-              return;
-            }
-
-            setState({
-              status: "ready",
-              user,
-              role: null,
-              message:
-                error instanceof Error
-                  ? `We could not verify your staff profile: ${error.message}`
-                  : "We could not verify your staff profile. Please try again.",
-            });
-          }
         },
       );
 
     return () => {
       cancelled = true;
-      unsubscribe();
+
+      unsubscribeProfile?.();
+      unsubscribeProfile =
+        undefined;
+
+      unsubscribeAuth();
     };
   }, []);
 

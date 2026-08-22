@@ -1,38 +1,59 @@
 "use client";
 
 import {
+  GoogleAuthProvider,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
+  signInWithPopup,
 } from "firebase/auth";
-
-import {
-  AlertCircle,
-  ArrowRight,
-  KeyRound,
-  ShieldCheck,
-  UserPlus,
-} from "lucide-react";
-
-import { useRouter } from "next/navigation";
 
 import {
   useEffect,
   useState,
 } from "react";
 
+import { useRouter } from "next/navigation";
+
+import { firebaseErrorMessage } from "@/lib/presentation";
 import { getFirebaseClient } from "@/lib/firebase/client";
 
-import {
-  firebaseErrorMessage,
-} from "@/lib/presentation";
+import { useFirebaseAuth } from "./firebase-provider";
 
-import {
-  useFirebaseAuth,
-} from "./firebase-provider";
+function GoogleMark() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path
+        fill="#4285F4"
+        d="M21.35 12.23c0-.79-.07-1.55-.23-2.27H12v4.3h5.24a4.48 4.48 0 0 1-1.94 2.94v2.45h3.14c1.84-1.69 2.91-4.18 2.91-7.42Z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 21.63c2.63 0 4.84-.87 6.45-2.36l-3.14-2.45c-.87.58-1.98.92-3.31.92-2.54 0-4.69-1.72-5.46-4.03H3.3v2.53A9.74 9.74 0 0 0 12 21.63Z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M6.54 13.71A5.85 5.85 0 0 1 6.23 12c0-.59.11-1.17.31-1.71V7.76H3.3A9.74 9.74 0 0 0 2.25 12c0 1.57.38 3.06 1.05 4.24l3.24-2.53Z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 6.26c1.43 0 2.71.49 3.72 1.45l2.79-2.79C16.84 3.35 14.63 2.37 12 2.37a9.74 9.74 0 0 0-8.7 5.39l3.24 2.53c.77-2.31 2.92-4.03 5.46-4.03Z"
+      />
+    </svg>
+  );
+}
 
 export function LoginForm() {
   const auth = useFirebaseAuth();
   const router = useRouter();
+
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
 
   const [error, setError] =
     useState<string>();
@@ -40,7 +61,10 @@ export function LoginForm() {
   const [notice, setNotice] =
     useState<string>();
 
-  const [submitting, setSubmitting] =
+  const [loading, setLoading] =
+    useState(false);
+
+  const [googleLoading, setGoogleLoading] =
     useState(false);
 
   const [signingOut, setSigningOut] =
@@ -48,89 +72,153 @@ export function LoginForm() {
 
   /*
    * ---------------------------------------------------------
-   * LOGIN
+   * GOOGLE SIGN-IN
    * ---------------------------------------------------------
-   *
-   * Authentication is handled by Firebase Auth.
-   *
-   * Authorization is handled by Firestore:
-   *
-   * users/{uid}
-   *   status = "approved"
-   *   role   = "admin" | "operations"
-   *
-   * We intentionally do NOT require emailVerified here.
-   * The account's approved Firestore role is the application
-   * access gate.
+   */
+  async function signInWithGoogle() {
+    if (
+      loading ||
+      googleLoading
+    ) {
+      return;
+    }
+
+    setError(undefined);
+    setNotice(undefined);
+    setGoogleLoading(true);
+
+    try {
+      const {
+        auth: firebaseAuth,
+      } = getFirebaseClient();
+
+      const provider =
+        new GoogleAuthProvider();
+
+      provider.setCustomParameters({
+        prompt: "select_account",
+      });
+
+      await signInWithPopup(
+        firebaseAuth,
+        provider,
+      );
+
+      /*
+       * FirebaseProvider observes the authenticated user
+       * and resolves users/{uid}.
+       */
+    } catch (cause) {
+      console.error(
+        "Google sign-in failed:",
+        cause,
+      );
+
+      if (
+        typeof cause === "object" &&
+        cause !== null &&
+        "code" in cause
+      ) {
+        const code = String(
+          (
+            cause as {
+              code?: unknown;
+            }
+          ).code ?? "",
+        );
+
+        switch (code) {
+          case "auth/popup-closed-by-user":
+            setError(
+              "Google sign-in was cancelled.",
+            );
+            break;
+
+          case "auth/popup-blocked":
+            setError(
+              "Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.",
+            );
+            break;
+
+          case "auth/cancelled-popup-request":
+            setError(
+              "Another Google sign-in request is already in progress.",
+            );
+            break;
+
+          case "auth/operation-not-allowed":
+            setError(
+              "Google sign-in is not enabled in Firebase Authentication.",
+            );
+            break;
+
+          case "auth/unauthorized-domain":
+            setError(
+              "This domain is not authorized for Google sign-in in Firebase.",
+            );
+            break;
+
+          case "auth/account-exists-with-different-credential":
+            setError(
+              "An account already exists with this email using another sign-in method.",
+            );
+            break;
+
+          default:
+            setError(
+              firebaseErrorMessage(cause),
+            );
+            break;
+        }
+      } else {
+        setError(
+          firebaseErrorMessage(cause),
+        );
+      }
+    } finally {
+      setGoogleLoading(false);
+    }
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * EMAIL / PASSWORD SIGN-IN
+   * ---------------------------------------------------------
    */
   async function submit(
     event: React.FormEvent<HTMLFormElement>,
   ) {
     event.preventDefault();
 
-    if (submitting) {
+    if (
+      loading ||
+      googleLoading
+    ) {
       return;
     }
 
     setError(undefined);
     setNotice(undefined);
-    setSubmitting(true);
-
-    const form =
-      new FormData(event.currentTarget);
-
-    const email = String(
-      form.get("email") ?? "",
-    )
-      .trim()
-      .toLowerCase();
-
-    const password = String(
-      form.get("password") ?? "",
-    );
-
-    if (!email) {
-      setError(
-        "Enter your email address.",
-      );
-      setSubmitting(false);
-      return;
-    }
-
-    if (!password) {
-      setError(
-        "Enter your password.",
-      );
-      setSubmitting(false);
-      return;
-    }
+    setLoading(true);
 
     try {
       await signInWithEmailAndPassword(
         getFirebaseClient().auth,
-        email,
+        email.trim().toLowerCase(),
         password,
       );
 
       /*
-       * IMPORTANT:
-       *
-       * Do not router.replace() here.
-       *
-       * FirebaseProvider receives the authentication
-       * event, resolves users/{uid}, checks:
-       *
-       *   status === "approved"
-       *   role === "admin" | "operations"
-       *
-       * and only then this component redirects.
+       * Do not navigate here.
+       * FirebaseProvider resolves the user's Firestore
+       * profile and role.
        */
     } catch (cause) {
       setError(
         firebaseErrorMessage(cause),
       );
     } finally {
-      setSubmitting(false);
+      setLoading(false);
     }
   }
 
@@ -140,20 +228,13 @@ export function LoginForm() {
    * ---------------------------------------------------------
    */
   async function resetPassword() {
-    const field =
-      document.getElementById(
-        "email",
-      ) as HTMLInputElement | null;
-
-    const email =
-      field?.value
-        .trim()
-        .toLowerCase();
+    const cleanEmail =
+      email.trim().toLowerCase();
 
     setError(undefined);
     setNotice(undefined);
 
-    if (!email) {
+    if (!cleanEmail) {
       setError(
         "Enter your email address first.",
       );
@@ -163,7 +244,7 @@ export function LoginForm() {
     try {
       await sendPasswordResetEmail(
         getFirebaseClient().auth,
-        email,
+        cleanEmail,
       );
 
       setNotice(
@@ -178,7 +259,7 @@ export function LoginForm() {
 
   /*
    * ---------------------------------------------------------
-   * APPROVED USER → DASHBOARD
+   * APPROVED USER -> DASHBOARD
    * ---------------------------------------------------------
    */
   useEffect(() => {
@@ -201,33 +282,30 @@ export function LoginForm() {
 
   /*
    * ---------------------------------------------------------
-   * FIREBASE CONFIG ERROR
+   * FIREBASE CONFIGURATION ERROR
    * ---------------------------------------------------------
    */
   if (
-    auth.status ===
-    "config-error"
+    auth.status === "config-error"
   ) {
     return (
-      <main className="auth-shell">
-        <section className="auth-panel-centered">
-          <div className="auth-logo-wrap">
-            <img
-              src="/brand/logo.svg"
-              alt="Advance Auto Rentals"
-              className="auth-logo"
-            />
-          </div>
+      <main className="auth-page-clean auth-status-page">
+        <section className="auth-status-card">
+          <img
+            src="/brand/logo.svg"
+            alt="Advance Auto Rentals"
+            className="auth-status-logo"
+          />
 
           <p className="auth-eyebrow">
-            CONFIGURATION NEEDED
+            CONFIGURATION
           </p>
 
           <h1>
-            Connect Firebase to sign in
+            Connect Firebase to continue
           </h1>
 
-          <p className="auth-description">
+          <p>
             {auth.message}
           </p>
         </section>
@@ -237,27 +315,26 @@ export function LoginForm() {
 
   /*
    * ---------------------------------------------------------
-   * INITIAL AUTH LOADING
+   * AUTH / PROFILE LOADING
    * ---------------------------------------------------------
    */
   if (
     auth.status === "loading"
   ) {
     return (
-      <div
-        className="auth-loading"
-        role="status"
-        aria-live="polite"
-      >
-        <span />
-        Checking your account
-      </div>
+      <main className="auth-page-clean auth-status-page">
+        <div className="auth-progress">
+          <span className="auth-progress-dot" />
+          {auth.message ??
+            "Checking your account"}
+        </div>
+      </main>
     );
   }
 
   /*
    * ---------------------------------------------------------
-   * AUTHENTICATED BUT NOT APPROVED
+   * AUTHENTICATED BUT NOT AUTHORIZED
    * ---------------------------------------------------------
    */
   if (
@@ -265,7 +342,7 @@ export function LoginForm() {
     auth.user &&
     !auth.role
   ) {
-    async function signOutPendingAccount() {
+    async function signOutCurrentAccount() {
       if (signingOut) {
         return;
       }
@@ -279,75 +356,125 @@ export function LoginForm() {
           .auth
           .signOut();
 
-        /*
-         * Use a hard navigation here.
-         * This guarantees that the authenticated
-         * application state is discarded and the
-         * login page is loaded from a clean state.
-         */
         window.location.replace(
           "/login",
         );
       } catch (cause) {
         console.error(
-          "Pending-account sign out failed:",
+          "Sign out failed:",
           cause,
         );
 
         setSigningOut(false);
 
         setError(
-          firebaseErrorMessage(
-            cause,
-          ),
+          firebaseErrorMessage(cause),
         );
       }
     }
 
+    const message =
+      auth.message ?? "";
+
+    const normalizedMessage =
+      message.toLowerCase();
+
+    const registrationRequired =
+      normalizedMessage.includes(
+        "no staff profile",
+      ) ||
+      normalizedMessage.includes(
+        "staff profile does not exist",
+      ) ||
+      normalizedMessage.includes(
+        "staff profile has not been created",
+      );
+
+    const pendingApproval =
+      normalizedMessage.includes(
+        "awaiting administrator approval",
+      );
+
+    const invalidRole =
+      normalizedMessage.includes(
+        "no valid application role",
+      );
+
     return (
-      <main className="auth-shell">
-        <section className="auth-panel-centered">
-          <div className="auth-logo-wrap">
-            <img
-              src="/brand/logo.svg"
-              alt="Advance Auto Rentals"
-              className="auth-logo"
-            />
-          </div>
+      <main className="auth-page-clean auth-status-page">
+        <section className="auth-status-card">
+          <img
+            src="/brand/logo.svg"
+            alt="Advance Auto Rentals"
+            className="auth-status-logo"
+          />
 
           <p className="auth-eyebrow">
-            ACCESS PENDING
+            {registrationRequired
+              ? "REGISTRATION"
+              : pendingApproval
+                ? "ACCESS PENDING"
+                : "ACCESS REVIEW"}
           </p>
 
           <h1>
-            Account awaiting approval
+            {registrationRequired
+              ? "Complete your staff registration"
+              : pendingApproval
+                ? "Account awaiting approval"
+                : invalidRole
+                  ? "Role assignment required"
+                  : "Staff access unavailable"}
           </h1>
 
-          <p className="auth-description">
-            {auth.message ??
-              "Your account has not been approved for application access yet."}
+          <p>
+            {registrationRequired
+              ? "Your Google account is authenticated, but it is not registered as a staff account yet."
+              : pendingApproval
+                ? "Your staff profile has been submitted and is waiting for administrator approval."
+                : invalidRole
+                  ? "Your account has been approved, but an Administrator or Operations role has not been assigned."
+                  : message ||
+                    "Your account does not currently have access to the rental workspace."}
           </p>
 
           {error && (
             <div
-              className="auth-message auth-message-error"
+              className="auth-inline-error"
               role="alert"
             >
-              <AlertCircle size={17} />
-              <span>{error}</span>
+              {error}
             </div>
+          )}
+
+          {registrationRequired && (
+            <button
+              type="button"
+              className="auth-primary-small"
+              onClick={() =>
+                router.push("/signup")
+              }
+            >
+              <span>
+                Complete registration
+              </span>
+
+              <span aria-hidden="true">
+                →
+              </span>
+            </button>
           )}
 
           <button
             type="button"
-            className="auth-outline-button"
+            className="auth-secondary-button"
             onClick={() =>
-              void signOutPendingAccount()
+              void signOutCurrentAccount()
             }
             disabled={signingOut}
           >
             {signingOut
-              ? "Signing out…"
+              ? "Signing out..."
               : "Sign out"}
           </button>
         </section>
@@ -357,7 +484,7 @@ export function LoginForm() {
 
   /*
    * ---------------------------------------------------------
-   * APPROVED USER — WAITING FOR NAVIGATION
+   * APPROVED USER
    * ---------------------------------------------------------
    */
   if (
@@ -366,36 +493,36 @@ export function LoginForm() {
     auth.role
   ) {
     return (
-      <div
-        className="auth-loading"
-        role="status"
-        aria-live="polite"
-      >
-        <span />
-        Opening rental desk
-      </div>
+      <main className="auth-page-clean auth-status-page">
+        <div
+          className="auth-progress"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="auth-progress-dot" />
+          Opening rental workspace
+        </div>
+      </main>
     );
   }
 
   /*
    * ---------------------------------------------------------
-   * NORMAL LOGIN PAGE
+   * LOGIN SCREEN
    * ---------------------------------------------------------
    */
   return (
-    <main className="auth-shell">
-      <section className="auth-showcase">
-        <div className="auth-showcase-inner">
-          <div className="brand-block">
-            <div className="brand-logo-frame">
-              <img
-                src="/brand/logo.svg"
-                alt="Advance Auto Rentals"
-                className="auth-logo"
-              />
-            </div>
+    <main className="auth-page-clean">
+      <section className="auth-visual">
+        <div className="auth-visual-top">
+          <div className="auth-brand">
+            <img
+              src="/brand/logo.svg"
+              alt="Advance Auto Rentals"
+              className="auth-brand-logo"
+            />
 
-            <div className="brand-copy">
+            <div>
               <strong>
                 Advance Auto Rentals
               </strong>
@@ -405,74 +532,44 @@ export function LoginForm() {
               </span>
             </div>
           </div>
-
-          <div className="showcase-content">
-            <p className="auth-eyebrow">
-              OPERATIONS WORKSPACE
-            </p>
-
-            <h1>
-              Run your fleet.
-              <br />
-              Without the clutter.
-            </h1>
-
-            <p>
-              Manage vehicles, customers,
-              bookings, returns and
-              financial activity from one
-              workspace.
-            </p>
-
-            <div className="showcase-features">
-              <div>
-                <span className="feature-icon">
-                  <ShieldCheck
-                    size={17}
-                  />
-                </span>
-
-                <span>
-                  Secure staff access
-                </span>
-              </div>
-
-              <div>
-                <span className="feature-icon">
-                  <KeyRound
-                    size={17}
-                  />
-                </span>
-
-                <span>
-                  Controlled permissions
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div className="showcase-footer">
-            Advance Auto Rentals
-          </div>
         </div>
 
-        <div className="showcase-orb showcase-orb-one" />
-        <div className="showcase-orb showcase-orb-two" />
-        <div className="showcase-grid" />
+        <div className="auth-visual-content">
+          <p className="auth-visual-kicker">
+            OPERATIONS WORKSPACE
+          </p>
+
+          <h1>
+            Everything your
+            <br />
+            fleet needs.
+          </h1>
+
+          <p>
+            Vehicles, customers, bookings,
+            returns and financial activity —
+            organized in one workspace.
+          </p>
+        </div>
+
+        <div className="auth-visual-footer">
+          Advance Auto Rentals
+        </div>
+
+        <div className="auth-visual-circle auth-visual-circle-one" />
+        <div className="auth-visual-circle auth-visual-circle-two" />
       </section>
 
-      <section className="auth-panel">
-        <div className="auth-panel-inner">
-          <div className="mobile-brand">
-            <div className="brand-logo-frame">
-              <img
-                src="/brand/logo.svg"
-                alt="Advance Auto Rentals"
-                className="auth-logo"
-              />
-            </div>
+      <section className="auth-form-panel">
+        <div className="auth-form-card">
+          <div className="auth-mobile-brand">
+            <img
+              src="/brand/logo.svg"
+              alt="Advance Auto Rentals"
+              className="auth-brand-logo"
+            />
 
-            <div className="brand-copy">
+            <div>
               <strong>
                 Advance Auto Rentals
               </strong>
@@ -483,48 +580,97 @@ export function LoginForm() {
             </div>
           </div>
 
-          <div className="auth-heading">
-            <p className="auth-eyebrow">
-              STAFF SIGN IN
-            </p>
+          <p className="auth-eyebrow">
+            STAFF SIGN IN
+          </p>
 
-            <h2>
-              Welcome back
-            </h2>
+          <h2>
+            Welcome back
+          </h2>
 
-            <p className="auth-description">
-              Sign in to access your
-              rental operations workspace.
-            </p>
+          <p className="auth-form-intro">
+            Sign in to access your rental
+            operations workspace.
+          </p>
+
+          {error && (
+            <div
+              className="auth-inline-error"
+              role="alert"
+            >
+              {error}
+            </div>
+          )}
+
+          {notice && (
+            <div
+              className="auth-inline-success"
+              role="status"
+            >
+              {notice}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="google-outline-button"
+            onClick={() =>
+              void signInWithGoogle()
+            }
+            disabled={
+              loading ||
+              googleLoading
+            }
+          >
+            <span>
+              <GoogleMark />
+
+              {googleLoading
+                ? "Connecting..."
+                : "Continue with Google"}
+            </span>
+
+            <b aria-hidden="true">
+              →
+            </b>
+          </button>
+
+          <div className="auth-divider">
+            <span />
+            <small>
+              OR SIGN IN WITH EMAIL
+            </small>
+            <span />
           </div>
 
           <form
-            className="auth-form"
+            className="auth-clean-form"
             onSubmit={(event) =>
               void submit(event)
             }
           >
-            <div className="auth-field">
-              <label htmlFor="email">
-                Email address
-              </label>
+            <label>
+              Email address
 
               <input
-                id="email"
-                name="email"
                 type="email"
                 autoComplete="email"
-                inputMode="email"
+                value={email}
+                onChange={(event) =>
+                  setEmail(
+                    event.target.value,
+                  )
+                }
                 placeholder="name@company.com"
                 required
               />
-            </div>
+            </label>
 
-            <div className="auth-field">
-              <div className="auth-field-label">
-                <label htmlFor="password">
+            <label>
+              <span className="auth-label-row">
+                <span>
                   Password
-                </label>
+                </span>
 
                 <button
                   type="button"
@@ -532,80 +678,63 @@ export function LoginForm() {
                     void resetPassword()
                   }
                 >
-                  Reset password
+                  Forgot password?
                 </button>
-              </div>
+              </span>
 
               <input
-                id="password"
-                name="password"
                 type="password"
                 autoComplete="current-password"
+                value={password}
+                onChange={(event) =>
+                  setPassword(
+                    event.target.value,
+                  )
+                }
                 placeholder="Enter your password"
                 required
               />
-            </div>
-
-            {error && (
-              <div
-                className="auth-message auth-message-error"
-                role="alert"
-              >
-                <AlertCircle size={17} />
-                <span>{error}</span>
-              </div>
-            )}
-
-            {notice && (
-              <div
-                className="auth-message auth-message-success"
-                role="status"
-              >
-                {notice}
-              </div>
-            )}
+            </label>
 
             <button
               type="submit"
-              className="auth-submit-button"
-              disabled={submitting}
+              className="auth-primary-button"
+              disabled={
+                loading ||
+                googleLoading
+              }
             >
               <span>
-                {submitting
-                  ? "Signing in…"
+                {loading
+                  ? "Signing in..."
                   : "Sign in"}
               </span>
 
-              {!submitting && (
-                <ArrowRight
-                  size={18}
-                />
-              )}
+              <span aria-hidden="true">
+                →
+              </span>
             </button>
           </form>
 
-          <div className="auth-separator">
+          <div className="auth-divider auth-divider-small">
             <span />
-
             <small>
               NEW STAFF
             </small>
-
             <span />
           </div>
 
           <button
             type="button"
-            className="auth-outline-button"
+            className="auth-secondary-button"
             onClick={() =>
               router.push("/signup")
             }
           >
-            <UserPlus size={17} />
             Create staff account
           </button>
 
-          <p className="auth-footnote">
+          <p className="auth-small-note">
             Access is subject to
             administrator approval.
           </p>
