@@ -1,21 +1,28 @@
 "use client";
-import { registerStaffProfile } from "@/lib/services/functions-client";
+
 import {
   createUserWithEmailAndPassword,
   sendEmailVerification,
   updateProfile,
 } from "firebase/auth";
+
+import {
+  doc,
+  runTransaction,
+  serverTimestamp,
+} from "firebase/firestore";
+
 import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
 } from "lucide-react";
+
 import { useRouter } from "next/navigation";
-import {
-  useState,
-} from "react";
+import { useState } from "react";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
+
 import {
   firebaseErrorMessage,
 } from "@/lib/presentation";
@@ -23,10 +30,8 @@ import {
 export function SignupForm() {
   const router = useRouter();
 
-  const [
-    submitting,
-    setSubmitting,
-  ] = useState(false);
+  const [submitting, setSubmitting] =
+    useState(false);
 
   const [error, setError] =
     useState<string>();
@@ -46,40 +51,39 @@ export function SignupForm() {
     const form =
       new FormData(event.currentTarget);
 
-    const fullName =
-      String(
-        form.get("fullName") ?? "",
-      ).trim();
+    const fullName = String(
+      form.get("fullName") ?? "",
+    ).trim();
 
-    const mobile =
-      String(
-        form.get("mobile") ?? "",
-      ).trim();
+    const mobile = String(
+      form.get("mobile") ?? "",
+    ).trim();
 
     const age = Number(
       form.get("age"),
     );
 
-    const email =
-      String(
-        form.get("email") ?? "",
-      )
-        .trim()
-        .toLowerCase();
+    const email = String(
+      form.get("email") ?? "",
+    )
+      .trim()
+      .toLowerCase();
 
-    const requestedRole =
-      String(
-        form.get(
-          "requestedRole",
-        ) ?? "",
-      );
+    const requestedRole = String(
+      form.get("requestedRole") ?? "",
+    );
 
-    const password =
-      String(
-        form.get("password") ?? "",
-      );
+    const password = String(
+      form.get("password") ?? "",
+    );
 
     try {
+      /*
+       * -------------------------------------------------------
+       * Validate input
+       * -------------------------------------------------------
+       */
+
       if (fullName.length < 2) {
         throw new Error(
           "Enter your full name.",
@@ -103,10 +107,8 @@ export function SignupForm() {
       }
 
       if (
-        ![
-          "admin",
-          "operations",
-        ].includes(requestedRole)
+        requestedRole !== "admin" &&
+        requestedRole !== "operations"
       ) {
         throw new Error(
           "Select a requested role.",
@@ -119,12 +121,31 @@ export function SignupForm() {
         );
       }
 
+      /*
+       * -------------------------------------------------------
+       * Firebase initialization
+       * -------------------------------------------------------
+       */
+
+      const { auth, db } =
+        getFirebaseClient();
+
+      /*
+       * -------------------------------------------------------
+       * Create Firebase Authentication account
+       * -------------------------------------------------------
+       */
+
       const credential =
         await createUserWithEmailAndPassword(
-          getFirebaseClient().auth,
+          auth,
           email,
           password,
         );
+
+      /*
+       * Keep the user's display name in Firebase Auth.
+       */
 
       await updateProfile(
         credential.user,
@@ -133,33 +154,124 @@ export function SignupForm() {
         },
       );
 
+      /*
+       * Email verification is required before
+       * normal application access.
+       */
+
       await sendEmailVerification(
         credential.user,
       );
 
-      await registerStaffProfile({
-  fullName,
-  mobile,
-  age,
-  requestedRole:
-    requestedRole as
-      | "admin"
-      | "operations",
-});
+      /*
+       * -------------------------------------------------------
+       * Create application staff profile
+       * -------------------------------------------------------
+       *
+       * users/{uid}
+       *
+       * role:
+       *   null until administrator approval
+       *
+       * requestedRole:
+       *   role requested during signup
+       *
+       * status:
+       *   pending until administrator approval
+       */
 
-      await getFirebaseClient().auth.signOut();
-
-      setNotice(
-        "Account created. Verify your email and wait for administrator approval.",
+      const profileRef = doc(
+        db,
+        "users",
+        credential.user.uid,
       );
 
-      window.setTimeout(() => {
-        router.replace("/login");
-        router.refresh();
-      }, 1500);
+      await runTransaction(
+        db,
+        async (transaction) => {
+          const existing =
+            await transaction.get(
+              profileRef,
+            );
+
+          if (existing.exists()) {
+            throw new Error(
+              "A staff profile already exists for this account.",
+            );
+          }
+
+          transaction.set(
+            profileRef,
+            {
+              fullName,
+              mobile,
+              age,
+              email,
+
+              requestedRole:
+                requestedRole as
+                  | "admin"
+                  | "operations",
+
+              role: null,
+
+              status: "pending",
+
+              emailVerified: false,
+
+              createdAt:
+                serverTimestamp(),
+
+              updatedAt:
+                serverTimestamp(),
+            },
+          );
+        },
+      );
+
+      /*
+       * -------------------------------------------------------
+       * End the temporary authenticated session
+       * -------------------------------------------------------
+       *
+       * The user must verify their email and then
+       * sign in through the normal login flow.
+       */
+
+      await auth.signOut();
+
+      /*
+       * -------------------------------------------------------
+       * Success
+       * -------------------------------------------------------
+       */
+
+      setNotice(
+        "Account created successfully. Verify your email and wait for administrator approval.",
+      );
+
+      /*
+       * Navigate immediately after signOut().
+       *
+       * No timeout.
+       * No router.refresh().
+       *
+       * This prevents the signup/login pages from racing
+       * against Firebase authentication state changes.
+       */
+
+      router.replace("/login");
     } catch (cause) {
+      /*
+       * If Authentication succeeded but a later step failed,
+       * make sure we don't leave the user stuck in a newly
+       * authenticated state.
+       */
+
       try {
-        await getFirebaseClient().auth.signOut();
+        await getFirebaseClient()
+          .auth
+          .signOut();
       } catch {
         // Ignore cleanup failure.
       }
@@ -209,8 +321,8 @@ export function SignupForm() {
 
             <p>
               Create your staff account and
-              request the role that matches your
-              responsibilities.
+              request the role that matches
+              your responsibilities.
             </p>
 
             <div className="showcase-features">
@@ -457,8 +569,9 @@ export function SignupForm() {
           </form>
 
           <p className="auth-footnote">
-            New accounts require email verification
-            and administrator approval.
+            New accounts require email
+            verification and administrator
+            approval.
           </p>
         </div>
       </section>

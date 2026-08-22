@@ -1,7 +1,8 @@
 "use client";
 
+import { doc, getDoc } from "firebase/firestore";
 import {
-  onIdTokenChanged,
+  onAuthStateChanged,
   type User,
 } from "firebase/auth";
 
@@ -38,7 +39,7 @@ type AuthState =
       status: "ready";
       user: User | null;
       role: AppRole;
-      message: null;
+      message: string | null;
     };
 
 const FirebaseContext =
@@ -49,54 +50,59 @@ const FirebaseContext =
     message: null,
   });
 
-function getDemoAdminEmail() {
-  return (
-    process.env
-      .NEXT_PUBLIC_DEMO_ADMIN_EMAIL
-      ?.trim()
-      .toLowerCase() || ""
-  );
-}
-
 export function FirebaseProvider({
   children,
 }: {
   children: React.ReactNode;
 }) {
   const [state, setState] =
-    useState<AuthState>(() =>
-      firebaseEnvironment()
-        ? {
-            status: "loading",
-            user: null,
-            role: null,
-            message: null,
-          }
-        : {
-            status: "config-error",
-            user: null,
-            role: null,
-            message:
-              "Firebase configuration is missing. Check the Vercel environment variables.",
-          },
-    );
+    useState<AuthState>(() => {
+      if (!firebaseEnvironment()) {
+        return {
+          status: "config-error",
+          user: null,
+          role: null,
+          message:
+            "Firebase configuration is missing. Check the environment variables.",
+        };
+      }
+
+      return {
+        status: "loading",
+        user: null,
+        role: null,
+        message: null,
+      };
+    });
 
   useEffect(() => {
     if (!firebaseEnvironment()) {
       return;
     }
 
+    let cancelled = false;
+
     let unsubscribe:
       | (() => void)
       | undefined;
 
     try {
-      unsubscribe = onIdTokenChanged(
-        getFirebaseClient().auth,
-        async (user) => {
-          try {
+      const { auth, db } =
+        getFirebaseClient();
+
+      unsubscribe =
+        onAuthStateChanged(
+          auth,
+          async (user) => {
+            if (cancelled) {
+              return;
+            }
+
             /*
-             * No authenticated user.
+             * No authenticated Firebase user.
+             *
+             * This is a normal signed-out state,
+             * not an error.
              */
             if (!user) {
               setState({
@@ -110,69 +116,132 @@ export function FirebaseProvider({
             }
 
             /*
-             * Normal production role lookup:
-             * Firebase custom claim.
+             * Firebase Authentication has confirmed
+             * the identity. Now resolve the application's
+             * role from Firestore.
              */
-            const result =
-              await user.getIdTokenResult();
+            try {
+              const profileRef = doc(
+                db,
+                "users",
+                user.uid,
+              );
 
-            let role: AppRole =
-              result.claims.role ===
-                "admin" ||
-              result.claims.role ===
-                "operations"
-                ? result.claims.role
-                : null;
+              const profileSnapshot =
+                await getDoc(profileRef);
 
-            /*
-             * TEMPORARY CLIENT DEMO FALLBACK
-             *
-             * This allows one explicitly configured
-             * Firebase account to act as the demo
-             * administrator without requiring a
-             * deployed Cloud Function/custom claim.
-             *
-             * Remove this before production.
-             */
-            const demoAdminEmail =
-              getDemoAdminEmail();
+              if (cancelled) {
+                return;
+              }
 
-            if (
-              demoAdminEmail &&
-              user.email
-                ?.trim()
-                .toLowerCase() ===
-                demoAdminEmail
-            ) {
-              role = "admin";
+              /*
+               * Authenticated Firebase account exists,
+               * but application profile has not been
+               * created yet.
+               */
+              if (!profileSnapshot.exists()) {
+                setState({
+                  status: "ready",
+                  user,
+                  role: null,
+                  message:
+                    "Your staff profile has not been created yet. Please contact the administrator.",
+                });
+
+                return;
+              }
+
+              const profile =
+                profileSnapshot.data();
+
+              const role: AppRole =
+                profile.role === "admin" ||
+                profile.role === "operations"
+                  ? profile.role
+                  : null;
+
+              const status =
+                String(
+                  profile.status ?? "",
+                ).toLowerCase();
+
+              /*
+               * A role is only valid when the profile
+               * is explicitly approved.
+               */
+              if (status !== "approved") {
+                setState({
+                  status: "ready",
+                  user,
+                  role: null,
+                  message:
+                    "Your account is awaiting administrator approval.",
+                });
+
+                return;
+              }
+
+              /*
+               * Approved account but invalid/missing role.
+               * Do not grant application access.
+               */
+              if (!role) {
+                setState({
+                  status: "ready",
+                  user,
+                  role: null,
+                  message:
+                    "Your account has been approved but no valid application role has been assigned.",
+                });
+
+                return;
+              }
+
+              /*
+               * Fully authenticated and authorized.
+               */
+              setState({
+                status: "ready",
+                user,
+                role,
+                message: null,
+              });
+            } catch (error) {
+              console.error(
+                "Firebase profile lookup failed:",
+                error,
+              );
+
+              if (cancelled) {
+                return;
+              }
+
+              /*
+               * Keep the Firebase user attached to state.
+               *
+               * This is important: a Firestore lookup
+               * failure must not look like a sign-out.
+               * Otherwise the login page can immediately
+               * redirect back and forth.
+               */
+              setState({
+                status: "ready",
+                user,
+                role: null,
+                message:
+                  error instanceof Error
+                    ? `We could not verify your staff profile: ${error.message}`
+                    : "We could not verify your staff profile. Please try again.",
+              });
             }
-
-            setState({
-              status: "ready",
-              user,
-              role,
-              message: null,
-            });
-          } catch (error) {
-            console.error(
-              "Firebase session verification failed",
-              error,
-            );
-
-            setState({
-              status: "config-error",
-              user: null,
-              role: null,
-              message:
-                error instanceof Error
-                  ? error.message
-                  : "Session verification failed.",
-            });
-          }
-        },
-      );
+          },
+        );
     } catch (error) {
-      queueMicrotask(() =>
+      queueMicrotask(() => {
+        if (cancelled) {
+          return;
+        }
+
         setState({
           status: "config-error",
           user: null,
@@ -181,12 +250,14 @@ export function FirebaseProvider({
             error instanceof Error
               ? error.message
               : "Firebase could not initialize.",
-        }),
-      );
+        });
+      });
     }
 
-    return () =>
+    return () => {
+      cancelled = true;
       unsubscribe?.();
+    };
   }, []);
 
   const value = useMemo(
@@ -204,5 +275,7 @@ export function FirebaseProvider({
 }
 
 export function useFirebaseAuth() {
-  return useContext(FirebaseContext);
+  return useContext(
+    FirebaseContext,
+  );
 }

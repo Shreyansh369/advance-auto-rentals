@@ -2,15 +2,17 @@
 
 import {
   collection,
-  getDocs,
   limit,
+  onSnapshot,
   orderBy,
   query,
 } from "firebase/firestore";
+
 import {
   Search,
   UserRound,
 } from "lucide-react";
+
 import {
   useEffect,
   useMemo,
@@ -20,6 +22,7 @@ import {
 import { AppShell } from "./app-shell";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
+
 import {
   firebaseErrorMessage,
   formatDate,
@@ -50,71 +53,70 @@ export function CustomerDirectory() {
     useState(true);
 
   useEffect(() => {
-    let mounted = true;
+    const source = query(
+      collection(
+        getFirebaseClient().db,
+        "customers",
+      ),
+      orderBy("fullName"),
+      limit(500),
+    );
 
-    async function loadCustomers() {
-      try {
-        const snapshot =
-          await getDocs(
-            query(
-              collection(
-                getFirebaseClient().db,
-                "customers",
-              ),
-              orderBy("fullName"),
-              limit(500),
-            ),
-          );
-
-        if (!mounted) {
-          return;
-        }
-
+    return onSnapshot(
+      source,
+      (snapshot) => {
         setCustomers(
-          snapshot.docs.map((doc) => ({
-            id: doc.id,
+          snapshot.docs.map((customerDoc) => ({
+            id: customerDoc.id,
             fullName:
-              doc.get("fullName"),
+              customerDoc.get("fullName"),
             telephone:
-              doc.get("telephone"),
+              customerDoc.get("telephone"),
             email:
-              doc.get("email") ?? null,
+              customerDoc.get("email") ??
+              null,
             address:
-              doc.get("address") ?? null,
+              customerDoc.get("address") ??
+              null,
             licenceNumber:
-              doc.get("licenceNumber"),
+              customerDoc.get(
+                "licenceNumber",
+              ),
             licenceCountry:
-              doc.get("licenceCountry"),
+              customerDoc.get(
+                "licenceCountry",
+              ),
             licenceExpiresAt:
-              doc.get(
+              customerDoc.get(
                 "licenceExpiresAt",
               ) ?? null,
           })),
         );
-      } catch (cause) {
-        if (mounted) {
-          setError(
-            firebaseErrorMessage(cause),
-          );
-        }
-      } finally {
-        if (mounted) {
-          setLoading(false);
-        }
-      }
-    }
 
-    void loadCustomers();
+        setError(undefined);
+        setLoading(false);
+      },
+      (cause) => {
+        console.error(
+          "Customer directory listener failed:",
+          cause,
+        );
 
-    return () => {
-      mounted = false;
-    };
+        setError(
+          firebaseErrorMessage(cause),
+        );
+
+        setLoading(false);
+      },
+    );
   }, []);
 
   const filteredCustomers =
     useMemo(() => {
       const needle =
-        search.trim().toLowerCase();
+        search
+          .trim()
+          .toLowerCase();
 
       if (!needle) {
         return customers;
@@ -135,7 +137,10 @@ export function CustomerDirectory() {
                 .includes(needle),
             ),
       );
-    }, [customers, search]);
+    }, [
+      customers,
+      search,
+    ]);
 
   return (
     <AppShell
@@ -159,25 +164,35 @@ export function CustomerDirectory() {
             <input
               value={search}
               onChange={(event) =>
-                setSearch(event.target.value)
+                setSearch(
+                  event.target.value,
+                )
               }
               placeholder="Search name, telephone or licence"
+              aria-label="Search customers"
             />
           </div>
 
           <span className="customer-count">
-            {filteredCustomers.length} customer
-            {filteredCustomers.length === 1
+            {filteredCustomers.length}{" "}
+            customer
+            {filteredCustomers.length ===
+            1
               ? ""
               : "s"}
           </span>
         </div>
 
         {loading ? (
-          <div className="inline-empty">
+          <div
+            className="inline-empty"
+            role="status"
+            aria-live="polite"
+          >
             Loading customer records...
           </div>
-        ) : filteredCustomers.length === 0 ? (
+        ) : filteredCustomers.length ===
+          0 ? (
           <div className="empty-state">
             <div className="empty-illustration">
               <UserRound size={23} />
@@ -189,8 +204,9 @@ export function CustomerDirectory() {
 
             <p>
               Create a customer from the
-              Bookings screen. Saved customers
-              will appear here.
+              Bookings screen. Saved
+              customers will appear here
+              automatically.
             </p>
           </div>
         ) : (
@@ -209,10 +225,14 @@ export function CustomerDirectory() {
               <tbody>
                 {filteredCustomers.map(
                   (customer) => (
-                    <tr key={customer.id}>
+                    <tr
+                      key={customer.id}
+                    >
                       <td>
                         <strong>
-                          {customer.fullName}
+                          {
+                            customer.fullName
+                          }
                         </strong>
 
                         <span>
@@ -223,17 +243,23 @@ export function CustomerDirectory() {
 
                       <td>
                         <strong>
-                          {customer.telephone}
+                          {
+                            customer.telephone
+                          }
                         </strong>
                       </td>
 
                       <td>
                         <strong>
-                          {customer.licenceNumber}
+                          {
+                            customer.licenceNumber
+                          }
                         </strong>
 
                         <span>
-                          {customer.licenceCountry}
+                          {
+                            customer.licenceCountry
+                          }
                         </span>
                       </td>
 

@@ -18,10 +18,12 @@ const MAX_VIDEO_BYTES =
 
 function cloudinaryConfig() {
   const cloudName =
-    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
+    process.env
+      .NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
 
   const uploadPreset =
-    process.env.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET;
+    process.env
+      .NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET;
 
   if (!cloudName || !uploadPreset) {
     throw new Error(
@@ -73,7 +75,11 @@ export async function uploadVehicleMedia(
 
   const payload = new FormData();
 
-  payload.append("file", file);
+  payload.append(
+    "file",
+    file,
+  );
+
   payload.append(
     "upload_preset",
     uploadPreset,
@@ -84,30 +90,34 @@ export async function uploadVehicleMedia(
     `advance-auto-rentals,vehicle-evidence,${stage}`,
   );
 
-  const response = await fetch(
+  const uploadUrl =
     `https://api.cloudinary.com/v1_1/${encodeURIComponent(
       cloudName,
-    )}/auto/upload`,
+    )}/auto/upload`;
+
+  const response = await fetch(
+    uploadUrl,
     {
       method: "POST",
       body: payload,
     },
   );
 
-  const data = (await response.json()) as {
-    secure_url?: string;
-    public_id?: string;
-    resource_type?: string;
-    format?: string;
-    bytes?: number;
-    original_filename?: string;
-    width?: number;
-    height?: number;
-    duration?: number;
-    error?: {
-      message?: string;
+  const data =
+    (await response.json()) as {
+      secure_url?: string;
+      public_id?: string;
+      resource_type?: string;
+      format?: string;
+      bytes?: number;
+      original_filename?: string;
+      width?: number;
+      height?: number;
+      duration?: number;
+      error?: {
+        message?: string;
+      };
     };
-  };
 
   if (
     !response.ok ||
@@ -131,20 +141,33 @@ export async function uploadVehicleMedia(
 
   return {
     url: data.secure_url,
-    publicId: data.public_id,
-    resourceType: data.resource_type,
+
+    publicId:
+      data.public_id,
+
+    resourceType:
+      data.resource_type,
+
     format:
       data.format ||
       file.type.split("/")[1] ||
       "unknown",
+
     bytes:
       data.bytes ??
       file.size,
+
     originalFilename:
       data.original_filename ||
       file.name,
-    width: data.width,
-    height: data.height,
-    duration: data.duration,
+
+    width:
+      data.width,
+
+    height:
+      data.height,
+
+    duration:
+      data.duration,
   };
 }

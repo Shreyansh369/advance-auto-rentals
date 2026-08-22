@@ -3,9 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@11.19.0",
-  "engines": { "node": ">=22 <25", "pnpm": ">=11" },
-  "pnpm": {
-},
+  "engines": {
+    "node": ">=22 <25",
+    "pnpm": ">=11"
+  },
+  "pnpm": {},
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -14,12 +16,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run tests/unit --passWithNoTests",
     "test:watch": "vitest tests/unit",
-    "test:rules": "firebase emulators:exec --only auth,firestore,storage \"pnpm vitest run tests/rules\"",
-    "functions:build": "pnpm --dir functions build",
+    "test:rules": "firebase emulators:exec --only auth,firestore \"pnpm vitest run tests/rules\"",
     "import:inventory": "tsx scripts/import-inventory.ts",
     "bootstrap:staff": "tsx scripts/bootstrap-staff.ts",
     "bootstrap:admin": "tsx scripts/bootstrap-admin.ts",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm functions:build && pnpm build"
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:rules && pnpm build"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",

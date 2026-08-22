@@ -10,6 +10,7 @@ import {
   Square,
   X,
 } from "lucide-react";
+
 import {
   useEffect,
   useRef,
@@ -90,38 +91,31 @@ export function MediaCapture({
   useEffect(() => {
     return () => {
       stopCamera();
-
-      if (
-        timerRef.current !== null
-      ) {
-        window.clearInterval(
-          timerRef.current,
-        );
-      }
     };
   }, []);
 
   function stopCamera() {
-    if (recorderRef.current) {
-      try {
-        if (
-          recorderRef.current.state !==
-          "inactive"
-        ) {
-          recorderRef.current.stop();
-        }
-      } catch {
-        // Ignore recorder cleanup errors.
-      }
-
-      recorderRef.current =
-        null;
-    }
+    const recorder =
+      recorderRef.current;
 
     if (
-      streamRef.current
+      recorder &&
+      recorder.state !== "inactive"
     ) {
-      streamRef.current
+      try {
+        recorder.stop();
+      } catch {
+        // Recorder may already have stopped.
+      }
+    }
+
+    recorderRef.current = null;
+
+    const stream =
+      streamRef.current;
+
+    if (stream) {
+      stream
         .getTracks()
         .forEach((track) =>
           track.stop(),
@@ -130,9 +124,9 @@ export function MediaCapture({
       streamRef.current = null;
     }
 
-    if (
-      videoRef.current
-    ) {
+    if (videoRef.current) {
+      videoRef.current.pause();
+
       videoRef.current.srcObject =
         null;
     }
@@ -150,6 +144,12 @@ export function MediaCapture({
     }
 
     setRecordingSeconds(0);
+  }
+
+  function closeCamera() {
+    stopCamera();
+    setCameraMode(null);
+    setCameraError(undefined);
   }
 
   async function openCamera(
@@ -182,27 +182,26 @@ export function MediaCapture({
     try {
       stopCamera();
 
+      /*
+       * Keep the camera request deliberately
+       * conservative. Mobile browsers, especially
+       * Safari, may reject overly-specific constraints.
+       */
       const stream =
         await navigator.mediaDevices.getUserMedia(
           {
             video: {
-              facingMode:
-                mode === "photo"
-                  ? "environment"
-                  : {
-                      ideal:
-                        "environment",
-                    },
-
-              width: {
-                ideal: 1920,
+              facingMode: {
+                ideal:
+                  "environment",
               },
-
+              width: {
+                ideal: 1280,
+              },
               height: {
-                ideal: 1080,
+                ideal: 720,
               },
             },
-
             audio:
               mode === "video",
           },
@@ -213,18 +212,33 @@ export function MediaCapture({
 
       setCameraMode(mode);
 
-      requestAnimationFrame(
-        () => {
-          if (
-            videoRef.current
-          ) {
-            videoRef.current.srcObject =
-              stream;
+      /*
+       * Wait until the video element has been
+       * mounted before assigning the stream.
+       */
+      requestAnimationFrame(() => {
+        const video =
+          videoRef.current;
 
-            void videoRef.current.play();
-          }
-        },
-      );
+        if (!video) {
+          return;
+        }
+
+        video.srcObject =
+          stream;
+
+        video.muted = true;
+        video.playsInline = true;
+
+        void video
+          .play()
+          .catch(() => {
+            /*
+             * Safari may require another user gesture.
+             * The stream itself remains attached.
+             */
+          });
+      });
     } catch (cause) {
       stopCamera();
 
@@ -234,9 +248,8 @@ export function MediaCapture({
           "NotAllowedError"
       ) {
         setCameraError(
-          "Camera permission was denied. Allow camera access in your browser and try again.",
+          "Camera permission was denied. Allow camera access in your browser settings and try again.",
         );
-
         return;
       }
 
@@ -248,12 +261,26 @@ export function MediaCapture({
         setCameraError(
           "No camera was found on this device.",
         );
+        return;
+      }
 
+      if (
+        cause instanceof DOMException &&
+        (
+          cause.name ===
+            "NotReadableError" ||
+          cause.name ===
+            "AbortError"
+        )
+      ) {
+        setCameraError(
+          "The camera is currently being used by another application or could not be opened. Close other camera apps and try again.",
+        );
         return;
       }
 
       setCameraError(
-        "Unable to open the camera. Check your browser permissions and try again.",
+        "Unable to open the camera. Check browser permissions and try again.",
       );
     }
   }
@@ -327,7 +354,6 @@ export function MediaCapture({
       setCameraError(
         "Camera is still starting. Try again in a moment.",
       );
-
       return;
     }
 
@@ -349,7 +375,6 @@ export function MediaCapture({
       setCameraError(
         "Unable to capture the camera image.",
       );
-
       return;
     }
 
@@ -367,11 +392,10 @@ export function MediaCapture({
           setCameraError(
             "Unable to create the photo.",
           );
-
           return;
         }
 
-        stopCamera();
+        closeCamera();
 
         await uploadBlob(
           blob,
@@ -384,6 +408,13 @@ export function MediaCapture({
   }
 
   function getSupportedVideoMimeType() {
+    if (
+      typeof MediaRecorder ===
+      "undefined"
+    ) {
+      return undefined;
+    }
+
     const candidates = [
       "video/webm;codecs=vp9,opus",
       "video/webm;codecs=vp8,opus",
@@ -393,8 +424,6 @@ export function MediaCapture({
 
     return candidates.find(
       (type) =>
-        typeof MediaRecorder !==
-          "undefined" &&
         MediaRecorder.isTypeSupported(
           type,
         ),
@@ -406,6 +435,19 @@ export function MediaCapture({
       streamRef.current;
 
     if (!stream) {
+      setCameraError(
+        "Camera is not ready yet.",
+      );
+      return;
+    }
+
+    if (
+      typeof MediaRecorder ===
+      "undefined"
+    ) {
+      setCameraError(
+        "Video recording is not supported by this browser.",
+      );
       return;
     }
 
@@ -431,16 +473,21 @@ export function MediaCapture({
       recordedChunksRef.current =
         [];
 
-      recorder.ondataavailable = (
-        event,
-      ) => {
-        if (
-          event.data.size > 0
-        ) {
-          recordedChunksRef.current.push(
-            event.data,
-          );
-        }
+      recorder.ondataavailable =
+        (event) => {
+          if (
+            event.data.size > 0
+          ) {
+            recordedChunksRef.current.push(
+              event.data,
+            );
+          }
+        };
+
+      recorder.onerror = () => {
+        setCameraError(
+          "Video recording failed. Please try again.",
+        );
       };
 
       recorder.onstop = () => {
@@ -457,6 +504,11 @@ export function MediaCapture({
         recordedChunksRef.current =
           [];
 
+        /*
+         * Upload first, then clean up the camera.
+         * This avoids racing MediaRecorder cleanup
+         * on mobile Safari.
+         */
         void uploadBlob(
           blob,
           `vehicle-${stage}-video-${Date.now()}`,
@@ -499,7 +551,13 @@ export function MediaCapture({
       recorder.state !==
       "inactive"
     ) {
-      recorder.stop();
+      try {
+        recorder.stop();
+      } catch {
+        setCameraError(
+          "Unable to stop the video recording cleanly.",
+        );
+      }
     }
 
     setRecording(false);
@@ -564,7 +622,9 @@ export function MediaCapture({
       const uploaded: CloudinaryMedia[] =
         [];
 
-      for (const file of selected) {
+      for (
+        const file of selected
+      ) {
         uploaded.push(
           await uploadVehicleMedia(
             file,
@@ -688,19 +748,29 @@ export function MediaCapture({
         />
 
         {cameraError && (
-          <div className="media-error">
+          <div
+            className="media-error"
+            role="alert"
+          >
             {cameraError}
           </div>
         )}
 
         {uploadError && (
-          <div className="media-error">
+          <div
+            className="media-error"
+            role="alert"
+          >
             {uploadError}
           </div>
         )}
 
         {uploading && (
-          <div className="media-uploading">
+          <div
+            className="media-uploading"
+            role="status"
+            aria-live="polite"
+          >
             <LoaderCircle
               className="spin"
               size={16}
@@ -722,6 +792,7 @@ export function MediaCapture({
                     src={media.url}
                     controls
                     preload="metadata"
+                    playsInline
                   />
                 ) : (
                   <img
@@ -729,6 +800,7 @@ export function MediaCapture({
                     alt={
                       media.originalFilename
                     }
+                    loading="lazy"
                   />
                 )}
 
@@ -804,12 +876,9 @@ export function MediaCapture({
               <button
                 className="icon-button"
                 type="button"
-                onClick={() => {
-                  stopCamera();
-                  setCameraMode(
-                    null,
-                  );
-                }}
+                onClick={
+                  closeCamera
+                }
                 aria-label="Close camera"
               >
                 <X size={19} />
@@ -905,12 +974,9 @@ export function MediaCapture({
                 <button
                   className="camera-secondary-button"
                   type="button"
-                  onClick={() => {
-                    stopCamera();
-                    setCameraMode(
-                      null,
-                    );
-                  }}
+                  onClick={
+                    closeCamera
+                  }
                 >
                   <RotateCcw
                     size={17}
@@ -949,9 +1015,9 @@ export function MediaCapture({
               cameraMode ===
                 "video" && (
                 <div className="camera-help">
-                  Press the video button to
-                  start recording. Press it
-                  again to finish.
+                  Press the video button
+                  to start recording.
+                  Press it again to finish.
                 </div>
               )}
           </section>

@@ -4,12 +4,14 @@ import {
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
 } from "firebase/auth";
+
 import {
   ArrowRight,
   KeyRound,
   ShieldCheck,
   UserPlus,
 } from "lucide-react";
+
 import { useRouter } from "next/navigation";
 import {
   useEffect,
@@ -17,9 +19,11 @@ import {
 } from "react";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
+
 import {
   firebaseErrorMessage,
 } from "@/lib/presentation";
+
 import { useFirebaseAuth } from "./firebase-provider";
 
 export function LoginForm() {
@@ -65,10 +69,21 @@ export function LoginForm() {
           password,
         );
 
+      /*
+       * Do not navigate here.
+       *
+       * FirebaseProvider listens for the authentication
+       * change and then resolves users/{uid} from Firestore.
+       *
+       * Navigation is handled below by the auth state effect.
+       */
+
       if (
         !credential.user.emailVerified
       ) {
-        await getFirebaseClient().auth.signOut();
+        await getFirebaseClient()
+          .auth
+          .signOut();
 
         setError(
           "Please verify your email address before signing in.",
@@ -76,14 +91,10 @@ export function LoginForm() {
 
         return;
       }
-
-      router.replace("/");
-      router.refresh();
     } catch (cause) {
       setError(
         firebaseErrorMessage(cause),
       );
-    } finally {
       setSubmitting(false);
     }
   }
@@ -104,6 +115,7 @@ export function LoginForm() {
       setError(
         "Enter your email address first.",
       );
+
       return;
     }
 
@@ -123,19 +135,40 @@ export function LoginForm() {
     }
   }
 
+  /*
+   * The only successful navigation path is:
+   *
+   * Firebase Auth user
+   *        ↓
+   * Firestore profile resolved
+   *        ↓
+   * approved
+   *        ↓
+   * valid role
+   *        ↓
+   * dashboard
+   */
   useEffect(() => {
     if (
-      auth.status === "ready" &&
-      auth.user
+      auth.status !== "ready" ||
+      !auth.user
     ) {
+      return;
+    }
+
+    if (auth.role) {
       router.replace("/");
     }
   }, [
     auth.status,
     auth.user,
+    auth.role,
     router,
   ]);
 
+  /*
+   * Firebase configuration problem.
+   */
   if (
     auth.status === "config-error"
   ) {
@@ -166,12 +199,106 @@ export function LoginForm() {
     );
   }
 
+  /*
+   * Firebase has authenticated the user but the
+   * Firestore profile is still being resolved.
+   */
   if (
-    auth.status === "ready" &&
-    auth.user
+    auth.status === "loading"
   ) {
     return (
-      <div className="auth-loading">
+      <div
+        className="auth-loading"
+        role="status"
+        aria-live="polite"
+      >
+        <span />
+        Checking your account
+      </div>
+    );
+  }
+
+  /*
+   * Authenticated user without an approved role.
+   *
+   * This is deliberately NOT redirected to "/".
+   * It prevents the login/dashboard bounce.
+   */
+  if (
+    auth.status === "ready" &&
+    auth.user &&
+    !auth.role
+  ) {
+    async function signOutPendingAccount() {
+      setError(undefined);
+      setNotice(undefined);
+
+      try {
+        await getFirebaseClient()
+          .auth
+          .signOut();
+      } catch (cause) {
+        setError(
+          firebaseErrorMessage(cause),
+        );
+      }
+    }
+
+    return (
+      <main className="auth-shell">
+        <section className="auth-panel auth-panel-centered">
+          <div className="auth-logo-wrap">
+            <img
+              src="/brand/logo.svg"
+              alt="Advance Auto Rentals"
+              className="auth-logo"
+            />
+          </div>
+
+          <p className="auth-eyebrow">
+            ACCESS PENDING
+          </p>
+
+          <h1>
+            Account awaiting approval
+          </h1>
+
+          <p className="auth-description">
+            {auth.message ??
+              "Your staff account must be approved by an administrator before you can access the rental workspace."}
+          </p>
+
+          <button
+            type="button"
+            className="auth-outline-button"
+            onClick={() =>
+              void signOutPendingAccount()
+            }
+          >
+            Sign out
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  /*
+   * Authenticated + approved.
+   *
+   * The effect above performs router.replace("/").
+   * Keep this state visually stable until navigation completes.
+   */
+  if (
+    auth.status === "ready" &&
+    auth.user &&
+    auth.role
+  ) {
+    return (
+      <div
+        className="auth-loading"
+        role="status"
+        aria-live="polite"
+      >
         <span />
         Opening rental desk
       </div>
@@ -215,8 +342,9 @@ export function LoginForm() {
 
             <p>
               Manage vehicles, customers,
-              bookings, returns and financial
-              activity from one workspace.
+              bookings, returns and
+              financial activity from one
+              workspace.
             </p>
 
             <div className="showcase-features">

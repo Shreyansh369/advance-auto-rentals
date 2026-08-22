@@ -1,28 +1,281 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    function signedIn() { return request.auth != null; }
-    function role() { return signedIn() && request.auth.token.role is string ? request.auth.token.role : ""; }
-    function isAdmin() { return role() == "admin"; }
-    function isStaff() { return role() == "admin" || role() == "operations"; }
 
-    // Roles are Firebase custom claims managed only by the trusted setUserRole function.
-    match /users/{userId} { allow get: if signedIn() && request.auth.uid == userId; allow list: if isAdmin(); allow create, update, delete: if false; }
-    match /vehicles/{vehicleId} { allow read: if isStaff(); allow write: if false; }
-    match /vehicles/{vehicleId}/serviceRecords/{recordId} { allow read: if isStaff(); allow write: if false; }
-    match /customers/{customerId} { allow read: if isStaff(); allow write: if false; }
-    match /reservations/{reservationId} { allow read: if isStaff(); allow write: if false; }
-    match /rentals/{rentalId} { allow read: if isStaff(); allow write: if false; }
-    match /rentals/{rentalId}/inspections/{inspectionId} { allow read: if isStaff(); allow write: if false; }
+    /* =========================================================
+       AUTHENTICATION / STAFF
+       ========================================================= */
 
-    // Financial, audit, and idempotency data are never exposed to operations staff or browsers for mutation.
-    match /rentalFinancials/{rentalId} { allow read: if isAdmin(); allow write: if false; }
-    match /payments/{paymentId} { allow read: if isAdmin(); allow write: if false; }
-    match /refunds/{refundId} { allow read: if isAdmin(); allow write: if false; }
-    match /financialLedger/{entryId} { allow read: if isAdmin(); allow write: if false; }
-    match /vehicleExpenses/{expenseId} { allow read: if isAdmin(); allow write: if false; }
-    match /auditLogs/{auditId} { allow read: if isAdmin(); allow write: if false; }
-    match /idempotencyKeys/{key} { allow read, write: if false; }
-    match /{document=**} { allow read, write: if false; }
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function currentUser() {
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
+    }
+
+    function approvedUser() {
+      return signedIn()
+        && currentUser().status == "approved"
+        && (
+          currentUser().role == "admin"
+          || currentUser().role == "operations"
+        );
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && currentUser().status == "approved"
+        && currentUser().role == "admin";
+    }
+
+    function isOperations() {
+      return signedIn()
+        && currentUser().status == "approved"
+        && currentUser().role == "operations";
+    }
+
+    function isStaff() {
+      return isAdmin() || isOperations();
+    }
+
+
+    /* =========================================================
+       USERS / STAFF
+       ========================================================= */
+
+    match /users/{userId} {
+
+      /* Users can read themselves.
+         Admins can read all staff profiles. */
+      allow get: if signedIn()
+        && (
+          request.auth.uid == userId
+          || isAdmin()
+        );
+
+      /* Only admins can list staff. */
+      allow list: if isAdmin();
+
+      /* Signup creates its own pending profile.
+         A user cannot assign an approved role to itself. */
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.status == "pending"
+        && request.resource.data.role == null
+        && request.resource.data.requestedRole in [
+          "admin",
+          "operations"
+        ]
+        && request.resource.data.email
+            == request.auth.token.email;
+
+      /* Pending users may update only their
+         registration information. */
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && resource.data.role
+            == request.resource.data.role
+        && resource.data.status
+            == request.resource.data.status
+        && resource.data.requestedRole
+            == request.resource.data.requestedRole
+        && request.resource.data.diff(
+          resource.data
+        ).affectedKeys().hasOnly([
+          "fullName",
+          "mobile",
+          "age",
+          "email",
+          "updatedAt"
+        ]);
+
+      /* Only admins can approve, reject,
+         or change staff roles. */
+      allow update: if isAdmin();
+
+      /* Only admins can remove staff profiles. */
+      allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       VEHICLES
+       ========================================================= */
+
+    match /vehicles/{vehicleId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    match /vehicles/{vehicleId}/serviceRecords/{recordId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       CUSTOMERS
+       ========================================================= */
+
+    match /customers/{customerId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       RESERVATIONS
+       ========================================================= */
+
+    match /reservations/{reservationId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       RENTALS
+       ========================================================= */
+
+    match /rentals/{rentalId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    match /rentals/{rentalId}/inspections/{inspectionId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       RENTAL FINANCIALS
+       ========================================================= */
+
+    match /rentalFinancials/{rentalId} {
+
+      allow read: if isStaff();
+
+      allow create, update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       PAYMENTS
+       ========================================================= */
+
+    match /payments/{paymentId} {
+
+      allow read: if isStaff();
+
+      allow create: if isStaff();
+
+      allow update, delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       REFUNDS
+       ========================================================= */
+
+    match /refunds/{refundId} {
+
+      allow read: if isAdmin();
+
+      allow create, update, delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       FINANCIAL LEDGER
+       ========================================================= */
+
+    match /financialLedger/{entryId} {
+
+      allow read: if isAdmin();
+
+      allow create: if isStaff();
+
+      allow update, delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       VEHICLE EXPENSES
+       ========================================================= */
+
+    match /vehicleExpenses/{expenseId} {
+
+      allow read: if isAdmin();
+
+      allow create: if isStaff();
+
+      allow update, delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       AUDIT LOGS
+       ========================================================= */
+
+    match /auditLogs/{auditId} {
+
+      allow read: if isAdmin();
+
+      allow create: if isStaff();
+
+      allow update, delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       IDEMPOTENCY
+       ========================================================= */
+
+    match /idempotencyKeys/{key} {
+
+      allow read, write: if isStaff();
+    }
+
+
+    /* =========================================================
+       DEFAULT DENY
+       ========================================================= */
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
   }
 }

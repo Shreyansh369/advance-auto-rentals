@@ -32,7 +32,7 @@ import {
   formatMoney,
 } from "@/lib/presentation";
 import type { CloudinaryMedia } from "@/lib/cloudinary";
-import { callRentalFunction } from "@/lib/services/functions-client";
+import { callFirestoreOperation } from "@/lib/services/firestore-client";
 
 type Tab = "booking" | "checkout" | "extend" | "return" | "payment";
 type CustomerMode = "existing" | "new";
@@ -320,7 +320,7 @@ export function ReservationComposer() {
     const form = new FormData(formElement);
 
     void run(async () => {
-      const result = await callRentalFunction<
+      const result = await callFirestoreOperation<
         {
           customerId: string;
           vehicleId: string;
@@ -372,7 +372,7 @@ export function ReservationComposer() {
     const form = new FormData(formElement);
 
     void run(async () => {
-      const result = await callRentalFunction<
+      const result = await callFirestoreOperation<
         {
           reservationId: string;
           pickupFuelLevel: string;
@@ -409,7 +409,7 @@ export function ReservationComposer() {
     const form = new FormData(formElement);
 
     void run(async () => {
-      const result = await callRentalFunction<
+      const result = await callFirestoreOperation<
         {
           rentalId: string;
           expectedReturnAt: string;
@@ -470,7 +470,7 @@ export function ReservationComposer() {
           ]
         : [];
 
-      const result = await callRentalFunction<
+      const result = await callFirestoreOperation<
         {
           rentalId: string;
           actualReturnAt: string;
@@ -520,7 +520,7 @@ export function ReservationComposer() {
     const form = new FormData(formElement);
 
     void run(async () => {
-      const result = await callRentalFunction<
+      const result = await callFirestoreOperation<
         {
           rentalId: string;
           amountCents: number;
@@ -870,7 +870,7 @@ export function ReservationComposer() {
 
                         void run(async () => {
                           const result =
-                            await callRentalFunction<
+                            await callFirestoreOperation<
                               {
                                 fullName: string;
                                 telephone: string;

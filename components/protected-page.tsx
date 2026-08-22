@@ -1,29 +1,44 @@
 "use client";
 
-import { signOut } from "firebase/auth";
 import {
-  CheckCircle2,
-  LogOut,
+  signOut,
+} from "firebase/auth";
+
+import {
+  useRouter,
+} from "next/navigation";
+
+import {
+  useEffect,
+} from "react";
+
+import {
   ShieldAlert,
 } from "lucide-react";
-import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
 
-import { getFirebaseClient } from "@/lib/firebase/client";
+import {
+  getFirebaseClient,
+} from "@/lib/firebase/client";
 
-import { useFirebaseAuth } from "./firebase-provider";
+import {
+  useFirebaseAuth,
+} from "./firebase-provider";
 
 export function ProtectedPage({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const auth = useFirebaseAuth();
-  const router = useRouter();
+  const auth =
+    useFirebaseAuth();
 
-  const [leaving, setLeaving] =
-    useState(false);
+  const router =
+    useRouter();
 
+  /*
+   * Only redirect to login when Firebase has
+   * definitively resolved that there is no user.
+   */
   useEffect(() => {
     if (
       auth.status === "ready" &&
@@ -37,40 +52,16 @@ export function ProtectedPage({
     router,
   ]);
 
-  async function backToSignIn() {
-    setLeaving(true);
-
-    try {
-      await signOut(
-        getFirebaseClient().auth,
-      );
-
-      router.replace("/login");
-      router.refresh();
-    } catch {
-      setLeaving(false);
-      router.replace("/login");
-    }
-  }
-
-  if (
-    auth.status === "loading"
-  ) {
-    return (
-      <div className="page-loader">
-        <span className="loader-dot" />
-        Loading workspace
-      </div>
-    );
-  }
-
+  /*
+   * Firebase configuration is invalid.
+   */
   if (
     auth.status ===
     "config-error"
   ) {
     return (
-      <main className="auth-page auth-page-simple">
-        <section className="auth-card auth-card-mobile">
+      <main className="auth-page">
+        <section className="auth-card">
           <div className="auth-symbol">
             <ShieldAlert />
           </div>
@@ -83,111 +74,110 @@ export function ProtectedPage({
             Connect Firebase to continue
           </h1>
 
-          <p className="quiet">
+          <p>
             {auth.message}
+          </p>
+
+          <p className="quiet">
+            Check the Firebase
+            environment configuration
+            before continuing.
           </p>
         </section>
       </main>
     );
   }
 
+  /*
+   * Authentication and Firestore profile
+   * are still being resolved.
+   */
+  if (
+    auth.status === "loading"
+  ) {
+    return (
+      <div className="page-loader">
+        <span className="loader-dot" />
+        Loading workspace
+      </div>
+    );
+  }
+
+  /*
+   * Firebase has resolved a signed-out
+   * state. The effect above performs the
+   * actual navigation.
+   */
   if (!auth.user) {
     return (
       <div className="page-loader">
+        <span className="loader-dot" />
         Opening sign in…
       </div>
     );
   }
 
-  if (
-    !auth.user.emailVerified
-  ) {
-    return (
-      <main className="auth-page auth-page-simple">
-        <section className="auth-card auth-card-mobile auth-status-card">
-          <div className="auth-symbol">
-            <CheckCircle2 />
-          </div>
-
-          <p className="page-kicker">
-            Verify your email
-          </p>
-
-          <h1>
-            Email verification required
-          </h1>
-
-          <p>
-            Verify your email address before you can continue.
-          </p>
-
-          <button
-            className="button button-secondary"
-            type="button"
-            onClick={() =>
-              void backToSignIn()
-            }
-            disabled={leaving}
-          >
-            <LogOut size={17} />
-
-            {leaving
-              ? "Signing out…"
-              : "Back to sign in"}
-          </button>
-        </section>
-      </main>
-    );
-  }
-
+  /*
+   * Authenticated but not authorized.
+   *
+   * Do not redirect automatically.
+   * The user needs to see why access is
+   * unavailable and choose when to sign out.
+   */
   if (!auth.role) {
+    async function backToSignIn() {
+      try {
+        await signOut(
+          getFirebaseClient().auth,
+        );
+      } finally {
+        router.replace("/login");
+      }
+    }
+
     return (
-      <main className="auth-page auth-page-simple">
-        <section className="auth-card auth-card-mobile auth-status-card">
+      <main className="auth-page">
+        <section className="auth-card">
           <div className="auth-symbol">
             <ShieldAlert />
           </div>
 
           <p className="page-kicker">
-            Account pending
+            Access pending
           </p>
 
           <h1>
-            You're almost there
+            Your account is not assigned
           </h1>
 
           <p>
-            Your account has been created and your email is verified.
+            Sign-in succeeded, but this
+            account has not been assigned
+            an Operations or Administrator
+            role yet.
           </p>
 
-          <div className="pending-box">
-            <strong>
-              Administrator approval required
-            </strong>
-
-            <span>
-              Your requested role is waiting for an administrator to review your account.
-            </span>
-          </div>
+          <p className="quiet">
+            {auth.message ??
+              "Ask an administrator to approve your account and assign a role, then sign in again."}
+          </p>
 
           <button
-            className="button button-secondary"
             type="button"
+            className="button button-secondary"
             onClick={() =>
               void backToSignIn()
             }
-            disabled={leaving}
           >
-            <LogOut size={17} />
-
-            {leaving
-              ? "Signing out…"
-              : "Back to sign in"}
+            Back to sign in
           </button>
         </section>
       </main>
     );
   }
 
+  /*
+   * Authenticated + approved + valid role.
+   */
   return <>{children}</>;
 }

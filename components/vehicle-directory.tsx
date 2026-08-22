@@ -7,6 +7,7 @@ import {
   orderBy,
   query,
 } from "firebase/firestore";
+
 import {
   CarFront,
   CheckCircle2,
@@ -16,6 +17,7 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
+
 import {
   useEffect,
   useMemo,
@@ -28,12 +30,16 @@ import type {
 } from "@/packages/domain/src/types";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
+
 import {
   firebaseErrorMessage,
   formatDate,
   formatMoney,
 } from "@/lib/presentation";
-import { callRentalFunction } from "@/lib/services/functions-client";
+
+import {
+  callFirestoreOperation,
+} from "@/lib/services/firestore-client";
 
 import { AppShell } from "./app-shell";
 
@@ -336,9 +342,7 @@ export function VehicleDirectory() {
     setNotice(undefined);
 
     try {
-      if (
-        !form.registrationNumber.trim()
-      ) {
+      if (!form.registrationNumber.trim()) {
         throw new Error(
           "Registration number is required.",
         );
@@ -427,7 +431,10 @@ export function VehicleDirectory() {
 
       setSaving(true);
 
-      await callRentalFunction(
+      await callFirestoreOperation<
+        Record<string, unknown>,
+        void
+      >(
         "updateVehicleDetails",
         {
           vehicleId:
@@ -529,7 +536,14 @@ export function VehicleDirectory() {
     setBusyVehicleId(vehicle.id);
 
     try {
-      await callRentalFunction(
+      await callFirestoreOperation<
+        {
+          vehicleId: string;
+          status: VehicleStatus;
+          note: string;
+        },
+        void
+      >(
         "changeVehicleStatus",
         {
           vehicleId: vehicle.id,
@@ -1268,7 +1282,9 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>Colour</label>
+                  <label>
+                    Colour
+                  </label>
 
                   <input
                     value={form.color}
