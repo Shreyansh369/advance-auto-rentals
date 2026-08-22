@@ -6,6 +6,7 @@ import {
 } from "firebase/auth";
 
 import {
+  AlertCircle,
   ArrowRight,
   KeyRound,
   ShieldCheck,
@@ -13,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { useRouter } from "next/navigation";
+
 import {
   useEffect,
   useState,
@@ -24,7 +26,9 @@ import {
   firebaseErrorMessage,
 } from "@/lib/presentation";
 
-import { useFirebaseAuth } from "./firebase-provider";
+import {
+  useFirebaseAuth,
+} from "./firebase-provider";
 
 export function LoginForm() {
   const auth = useFirebaseAuth();
@@ -39,10 +43,34 @@ export function LoginForm() {
   const [submitting, setSubmitting] =
     useState(false);
 
+  const [signingOut, setSigningOut] =
+    useState(false);
+
+  /*
+   * ---------------------------------------------------------
+   * LOGIN
+   * ---------------------------------------------------------
+   *
+   * Authentication is handled by Firebase Auth.
+   *
+   * Authorization is handled by Firestore:
+   *
+   * users/{uid}
+   *   status = "approved"
+   *   role   = "admin" | "operations"
+   *
+   * We intentionally do NOT require emailVerified here.
+   * The account's approved Firestore role is the application
+   * access gate.
+   */
   async function submit(
     event: React.FormEvent<HTMLFormElement>,
   ) {
     event.preventDefault();
+
+    if (submitting) {
+      return;
+    }
 
     setError(undefined);
     setNotice(undefined);
@@ -61,44 +89,56 @@ export function LoginForm() {
       form.get("password") ?? "",
     );
 
+    if (!email) {
+      setError(
+        "Enter your email address.",
+      );
+      setSubmitting(false);
+      return;
+    }
+
+    if (!password) {
+      setError(
+        "Enter your password.",
+      );
+      setSubmitting(false);
+      return;
+    }
+
     try {
-      const credential =
-        await signInWithEmailAndPassword(
-          getFirebaseClient().auth,
-          email,
-          password,
-        );
+      await signInWithEmailAndPassword(
+        getFirebaseClient().auth,
+        email,
+        password,
+      );
 
       /*
-       * Do not navigate here.
+       * IMPORTANT:
        *
-       * FirebaseProvider listens for the authentication
-       * change and then resolves users/{uid} from Firestore.
+       * Do not router.replace() here.
        *
-       * Navigation is handled below by the auth state effect.
+       * FirebaseProvider receives the authentication
+       * event, resolves users/{uid}, checks:
+       *
+       *   status === "approved"
+       *   role === "admin" | "operations"
+       *
+       * and only then this component redirects.
        */
-
-      if (
-        !credential.user.emailVerified
-      ) {
-        await getFirebaseClient()
-          .auth
-          .signOut();
-
-        setError(
-          "Please verify your email address before signing in.",
-        );
-
-        return;
-      }
     } catch (cause) {
       setError(
         firebaseErrorMessage(cause),
       );
+    } finally {
       setSubmitting(false);
     }
   }
 
+  /*
+   * ---------------------------------------------------------
+   * PASSWORD RESET
+   * ---------------------------------------------------------
+   */
   async function resetPassword() {
     const field =
       document.getElementById(
@@ -106,7 +146,9 @@ export function LoginForm() {
       ) as HTMLInputElement | null;
 
     const email =
-      field?.value.trim().toLowerCase();
+      field?.value
+        .trim()
+        .toLowerCase();
 
     setError(undefined);
     setNotice(undefined);
@@ -115,7 +157,6 @@ export function LoginForm() {
       setError(
         "Enter your email address first.",
       );
-
       return;
     }
 
@@ -136,17 +177,9 @@ export function LoginForm() {
   }
 
   /*
-   * The only successful navigation path is:
-   *
-   * Firebase Auth user
-   *        ↓
-   * Firestore profile resolved
-   *        ↓
-   * approved
-   *        ↓
-   * valid role
-   *        ↓
-   * dashboard
+   * ---------------------------------------------------------
+   * APPROVED USER → DASHBOARD
+   * ---------------------------------------------------------
    */
   useEffect(() => {
     if (
@@ -167,14 +200,17 @@ export function LoginForm() {
   ]);
 
   /*
-   * Firebase configuration problem.
+   * ---------------------------------------------------------
+   * FIREBASE CONFIG ERROR
+   * ---------------------------------------------------------
    */
   if (
-    auth.status === "config-error"
+    auth.status ===
+    "config-error"
   ) {
     return (
       <main className="auth-shell">
-        <section className="auth-panel auth-panel-centered">
+        <section className="auth-panel-centered">
           <div className="auth-logo-wrap">
             <img
               src="/brand/logo.svg"
@@ -184,7 +220,7 @@ export function LoginForm() {
           </div>
 
           <p className="auth-eyebrow">
-            Configuration needed
+            CONFIGURATION NEEDED
           </p>
 
           <h1>
@@ -200,8 +236,9 @@ export function LoginForm() {
   }
 
   /*
-   * Firebase has authenticated the user but the
-   * Firestore profile is still being resolved.
+   * ---------------------------------------------------------
+   * INITIAL AUTH LOADING
+   * ---------------------------------------------------------
    */
   if (
     auth.status === "loading"
@@ -219,10 +256,9 @@ export function LoginForm() {
   }
 
   /*
-   * Authenticated user without an approved role.
-   *
-   * This is deliberately NOT redirected to "/".
-   * It prevents the login/dashboard bounce.
+   * ---------------------------------------------------------
+   * AUTHENTICATED BUT NOT APPROVED
+   * ---------------------------------------------------------
    */
   if (
     auth.status === "ready" &&
@@ -230,6 +266,11 @@ export function LoginForm() {
     !auth.role
   ) {
     async function signOutPendingAccount() {
+      if (signingOut) {
+        return;
+      }
+
+      setSigningOut(true);
       setError(undefined);
       setNotice(undefined);
 
@@ -237,16 +278,35 @@ export function LoginForm() {
         await getFirebaseClient()
           .auth
           .signOut();
+
+        /*
+         * Use a hard navigation here.
+         * This guarantees that the authenticated
+         * application state is discarded and the
+         * login page is loaded from a clean state.
+         */
+        window.location.replace(
+          "/login",
+        );
       } catch (cause) {
+        console.error(
+          "Pending-account sign out failed:",
+          cause,
+        );
+
+        setSigningOut(false);
+
         setError(
-          firebaseErrorMessage(cause),
+          firebaseErrorMessage(
+            cause,
+          ),
         );
       }
     }
 
     return (
       <main className="auth-shell">
-        <section className="auth-panel auth-panel-centered">
+        <section className="auth-panel-centered">
           <div className="auth-logo-wrap">
             <img
               src="/brand/logo.svg"
@@ -265,8 +325,18 @@ export function LoginForm() {
 
           <p className="auth-description">
             {auth.message ??
-              "Your staff account must be approved by an administrator before you can access the rental workspace."}
+              "Your account has not been approved for application access yet."}
           </p>
+
+          {error && (
+            <div
+              className="auth-message auth-message-error"
+              role="alert"
+            >
+              <AlertCircle size={17} />
+              <span>{error}</span>
+            </div>
+          )}
 
           <button
             type="button"
@@ -274,8 +344,11 @@ export function LoginForm() {
             onClick={() =>
               void signOutPendingAccount()
             }
+            disabled={signingOut}
           >
-            Sign out
+            {signingOut
+              ? "Signing out…"
+              : "Sign out"}
           </button>
         </section>
       </main>
@@ -283,10 +356,9 @@ export function LoginForm() {
   }
 
   /*
-   * Authenticated + approved.
-   *
-   * The effect above performs router.replace("/").
-   * Keep this state visually stable until navigation completes.
+   * ---------------------------------------------------------
+   * APPROVED USER — WAITING FOR NAVIGATION
+   * ---------------------------------------------------------
    */
   if (
     auth.status === "ready" &&
@@ -305,6 +377,11 @@ export function LoginForm() {
     );
   }
 
+  /*
+   * ---------------------------------------------------------
+   * NORMAL LOGIN PAGE
+   * ---------------------------------------------------------
+   */
   return (
     <main className="auth-shell">
       <section className="auth-showcase">
@@ -350,7 +427,9 @@ export function LoginForm() {
             <div className="showcase-features">
               <div>
                 <span className="feature-icon">
-                  <ShieldCheck size={17} />
+                  <ShieldCheck
+                    size={17}
+                  />
                 </span>
 
                 <span>
@@ -360,7 +439,9 @@ export function LoginForm() {
 
               <div>
                 <span className="feature-icon">
-                  <KeyRound size={17} />
+                  <KeyRound
+                    size={17}
+                  />
                 </span>
 
                 <span>
@@ -412,8 +493,8 @@ export function LoginForm() {
             </h2>
 
             <p className="auth-description">
-              Sign in to access your rental
-              operations workspace.
+              Sign in to access your
+              rental operations workspace.
             </p>
           </div>
 
@@ -470,7 +551,8 @@ export function LoginForm() {
                 className="auth-message auth-message-error"
                 role="alert"
               >
-                {error}
+                <AlertCircle size={17} />
+                <span>{error}</span>
               </div>
             )}
 
@@ -495,16 +577,20 @@ export function LoginForm() {
               </span>
 
               {!submitting && (
-                <ArrowRight size={18} />
+                <ArrowRight
+                  size={18}
+                />
               )}
             </button>
           </form>
 
           <div className="auth-separator">
             <span />
+
             <small>
               NEW STAFF
             </small>
+
             <span />
           </div>
 
@@ -520,8 +606,8 @@ export function LoginForm() {
           </button>
 
           <p className="auth-footnote">
-            Access is subject to administrator
-            approval.
+            Access is subject to
+            administrator approval.
           </p>
         </div>
       </section>

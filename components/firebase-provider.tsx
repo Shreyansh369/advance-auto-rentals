@@ -1,6 +1,7 @@
 "use client";
 
 import { doc, getDoc } from "firebase/firestore";
+
 import {
   onAuthStateChanged,
   type User,
@@ -82,181 +83,170 @@ export function FirebaseProvider({
 
     let cancelled = false;
 
-    let unsubscribe:
-      | (() => void)
-      | undefined;
+    const { auth, db } =
+      getFirebaseClient();
 
-    try {
-      const { auth, db } =
-        getFirebaseClient();
+    const unsubscribe =
+      onAuthStateChanged(
+        auth,
+        async (user) => {
+          if (cancelled) {
+            return;
+          }
 
-      unsubscribe =
-        onAuthStateChanged(
-          auth,
-          async (user) => {
+          /*
+           * Signed out.
+           */
+          if (!user) {
+            setState({
+              status: "ready",
+              user: null,
+              role: null,
+              message: null,
+            });
+
+            return;
+          }
+
+          /*
+           * An unverified email must never enter the
+           * application authorization flow.
+           *
+           * This prevents the race where LoginForm starts
+           * signing the user out while this listener sees
+           * the newly authenticated Firebase user and
+           * incorrectly displays "Account awaiting approval".
+           */
+          if (!user.emailVerified) {
+            setState({
+              status: "ready",
+              user: null,
+              role: null,
+              message:
+                "Please verify your email address before signing in.",
+            });
+
+            try {
+              await auth.signOut();
+            } catch (error) {
+              console.error(
+                "Unable to clear unverified Firebase session:",
+                error,
+              );
+            }
+
+            return;
+          }
+
+          try {
+            /*
+             * Only verified Firebase users reach the
+             * Firestore staff-profile lookup.
+             */
+            const profileRef = doc(
+              db,
+              "users",
+              user.uid,
+            );
+
+            const profileSnapshot =
+              await getDoc(profileRef);
+
             if (cancelled) {
               return;
             }
 
-            /*
-             * No authenticated Firebase user.
-             *
-             * This is a normal signed-out state,
-             * not an error.
-             */
-            if (!user) {
-              setState({
-                status: "ready",
-                user: null,
-                role: null,
-                message: null,
-              });
-
-              return;
-            }
-
-            /*
-             * Firebase Authentication has confirmed
-             * the identity. Now resolve the application's
-             * role from Firestore.
-             */
-            try {
-              const profileRef = doc(
-                db,
-                "users",
-                user.uid,
-              );
-
-              const profileSnapshot =
-                await getDoc(profileRef);
-
-              if (cancelled) {
-                return;
-              }
-
-              /*
-               * Authenticated Firebase account exists,
-               * but application profile has not been
-               * created yet.
-               */
-              if (!profileSnapshot.exists()) {
-                setState({
-                  status: "ready",
-                  user,
-                  role: null,
-                  message:
-                    "Your staff profile has not been created yet. Please contact the administrator.",
-                });
-
-                return;
-              }
-
-              const profile =
-                profileSnapshot.data();
-
-              const role: AppRole =
-                profile.role === "admin" ||
-                profile.role === "operations"
-                  ? profile.role
-                  : null;
-
-              const status =
-                String(
-                  profile.status ?? "",
-                ).toLowerCase();
-
-              /*
-               * A role is only valid when the profile
-               * is explicitly approved.
-               */
-              if (status !== "approved") {
-                setState({
-                  status: "ready",
-                  user,
-                  role: null,
-                  message:
-                    "Your account is awaiting administrator approval.",
-                });
-
-                return;
-              }
-
-              /*
-               * Approved account but invalid/missing role.
-               * Do not grant application access.
-               */
-              if (!role) {
-                setState({
-                  status: "ready",
-                  user,
-                  role: null,
-                  message:
-                    "Your account has been approved but no valid application role has been assigned.",
-                });
-
-                return;
-              }
-
-              /*
-               * Fully authenticated and authorized.
-               */
-              setState({
-                status: "ready",
-                user,
-                role,
-                message: null,
-              });
-            } catch (error) {
-              console.error(
-                "Firebase profile lookup failed:",
-                error,
-              );
-
-              if (cancelled) {
-                return;
-              }
-
-              /*
-               * Keep the Firebase user attached to state.
-               *
-               * This is important: a Firestore lookup
-               * failure must not look like a sign-out.
-               * Otherwise the login page can immediately
-               * redirect back and forth.
-               */
+            if (!profileSnapshot.exists()) {
               setState({
                 status: "ready",
                 user,
                 role: null,
                 message:
-                  error instanceof Error
-                    ? `We could not verify your staff profile: ${error.message}`
-                    : "We could not verify your staff profile. Please try again.",
+                  "Your staff profile has not been created yet. Please contact the administrator.",
               });
-            }
-          },
-        );
-    } catch (error) {
-      queueMicrotask(() => {
-        if (cancelled) {
-          return;
-        }
 
-        setState({
-          status: "config-error",
-          user: null,
-          role: null,
-          message:
-            error instanceof Error
-              ? error.message
-              : "Firebase could not initialize.",
-        });
-      });
-    }
+              return;
+            }
+
+            const profile =
+              profileSnapshot.data();
+
+            const role: AppRole =
+              profile.role === "admin" ||
+              profile.role === "operations"
+                ? profile.role
+                : null;
+
+            const status =
+              String(
+                profile.status ?? "",
+              ).toLowerCase();
+
+            /*
+             * Only approved users receive an application role.
+             */
+            if (status !== "approved") {
+              setState({
+                status: "ready",
+                user,
+                role: null,
+                message:
+                  "Your account is awaiting administrator approval.",
+              });
+
+              return;
+            }
+
+            /*
+             * Approved but malformed profile.
+             */
+            if (!role) {
+              setState({
+                status: "ready",
+                user,
+                role: null,
+                message:
+                  "Your account has been approved but no valid application role has been assigned.",
+              });
+
+              return;
+            }
+
+            /*
+             * Fully authenticated and authorized.
+             */
+            setState({
+              status: "ready",
+              user,
+              role,
+              message: null,
+            });
+          } catch (error) {
+            console.error(
+              "Firebase staff profile lookup failed:",
+              error,
+            );
+
+            if (cancelled) {
+              return;
+            }
+
+            setState({
+              status: "ready",
+              user,
+              role: null,
+              message:
+                error instanceof Error
+                  ? `We could not verify your staff profile: ${error.message}`
+                  : "We could not verify your staff profile. Please try again.",
+            });
+          }
+        },
+      );
 
     return () => {
       cancelled = true;
-      unsubscribe?.();
+      unsubscribe();
     };
   }, []);
 
