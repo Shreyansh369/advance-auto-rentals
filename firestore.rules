@@ -52,13 +52,17 @@ service cloud.firestore {
       /* Users can read themselves.
          Admins can read all staff profiles. */
       allow get: if signedIn()
-        && (
-          request.auth.uid == userId
-          || isAdmin()
-        );
+  && request.auth.uid == userId;
 
-      /* Only admins can list staff. */
-      allow list: if isAdmin();
+/*
+ * Administrators can read other staff profiles.
+ */
+allow get: if isAdmin();
+
+/*
+ * Only admins can list staff.
+ */
+allow list: if isAdmin();
 
       /* Signup creates its own pending profile.
          A user cannot assign an approved role to itself. */
