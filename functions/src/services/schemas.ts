@@ -25,12 +25,33 @@ export const requestId =
 
 export const fuelLevel =
   z.enum([
-    "empty",
+    "one_eighth",
     "quarter",
+    "three_eighths",
     "half",
+    "five_eighths",
     "three_quarters",
+    "seven_eighths",
     "full",
+
+    // Retained for backwards compatibility
+    // with existing records.
+    "empty",
   ]);
+
+export const customerLicenseDocumentSchema =
+  z.object({
+    customerId:
+      id,
+
+    licenceStoragePath:
+      z.string()
+        .regex(
+          /^customer-documents\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/,
+          "Invalid licence storage path",
+        ),
+  })
+  .strict();
 
 export const customerSchema =
   z.object({
@@ -75,7 +96,22 @@ export const customerSchema =
         .toUpperCase(),
 
     licenceExpiresAt:
-      z.string().date(),
+      z.string()
+        .date()
+        .refine(
+          (value) =>
+            value >
+            new Date()
+              .toISOString()
+              .slice(
+                0,
+                10,
+              ),
+          {
+            message:
+              "Licence expiry must be after today.",
+          },
+        ),
 
     dateOfBirth:
       z.string()
@@ -99,14 +135,37 @@ export const customerSchema =
 
 export const reservationSchema =
   z.object({
-    customerId: id,
+    customerId:
+      id,
 
-    vehicleId: id,
+    vehicleId:
+      id,
 
-    pickupAt: isoDateTime,
+    pickupAt:
+      isoDateTime,
 
     expectedReturnAt:
       isoDateTime,
+
+    /*
+     * Optional pickup and drop-off locations.
+     *
+     * Nullable/defaulted so existing booking
+     * records and callers remain compatible.
+     */
+    pickupLocation:
+      z.string()
+        .trim()
+        .max(300)
+        .nullable()
+        .default(null),
+
+    dropoffLocation:
+      z.string()
+        .trim()
+        .max(300)
+        .nullable()
+        .default(null),
 
     notes:
       z.string()
@@ -117,18 +176,48 @@ export const reservationSchema =
   })
   .strict();
 
+export const reservationSignatureSchema =
+  reservationSchema.extend({
+    customerSignatureDataUrl:
+      z.string()
+        .regex(
+          /^data:image\/png;base64,[A-Za-z0-9+/=]+$/,
+          "Invalid customer signature image",
+        )
+        .max(600_000),
+  })
+  .strict();
+
+export const sendReservationContractSchema =
+  z.object({
+    reservationId:
+      id,
+  })
+  .strict();
+
 export const checkoutSchema =
   z.object({
-    reservationId: id,
+    reservationId:
+      id,
 
     pickupFuelLevel:
       fuelLevel,
 
-    pickupOdometerKm:
-      z.number()
-        .int()
-        .nonnegative()
-        .max(10_000_000),
+    pickupOdometer:
+      z.object({
+        value:
+          z.number()
+            .int()
+            .nonnegative()
+            .max(10_000_000),
+
+        unit:
+          z.enum([
+            "km",
+            "mi",
+          ]),
+      })
+      .strict(),
 
     notes:
       z.string()
@@ -141,17 +230,18 @@ export const checkoutSchema =
 
 export const adjustmentSchema =
   z.object({
-    type: z.enum([
-      "discount",
-      "late_fee",
-      "fuel",
-      "cleaning",
-      "damage",
-      "car_seat",
-      "pickup_dropoff",
-      "insurance",
-      "other",
-    ]),
+    type:
+      z.enum([
+        "discount",
+        "late_fee",
+        "fuel",
+        "cleaning",
+        "damage",
+        "car_seat",
+        "pickup_dropoff",
+        "insurance",
+        "other",
+      ]),
 
     amountCents:
       cents,
@@ -166,7 +256,8 @@ export const adjustmentSchema =
 
 export const returnSchema =
   z.object({
-    rentalId: id,
+    rentalId:
+      id,
 
     actualReturnAt:
       isoDateTime,
@@ -174,11 +265,21 @@ export const returnSchema =
     returnFuelLevel:
       fuelLevel,
 
-    returnOdometerKm:
-      z.number()
-        .int()
-        .nonnegative()
-        .max(10_000_000),
+    returnOdometer:
+      z.object({
+        value:
+          z.number()
+            .int()
+            .nonnegative()
+            .max(10_000_000),
+
+        unit:
+          z.enum([
+            "km",
+            "mi",
+          ]),
+      })
+      .strict(),
 
     adjustments:
       z.array(
@@ -208,7 +309,8 @@ export const returnSchema =
 
 export const extensionSchema =
   z.object({
-    rentalId: id,
+    rentalId:
+      id,
 
     expectedReturnAt:
       isoDateTime,
@@ -224,13 +326,35 @@ export const extensionSchema =
   })
   .strict();
 
-export const paymentSchema =
+export const paymentFeeSchema =
   z.object({
-    rentalId: id,
+    type:
+      z.enum([
+        "car_seat",
+        "insurance",
+        "cleaning",
+        "smoke_fee",
+        "refueling",
+      ]),
 
     amountCents:
       cents.refine(
-        (value) => value > 0,
+        (value) =>
+          value > 0,
+        "Fee amount must be positive",
+      ),
+  })
+  .strict();
+
+export const paymentSchema =
+  z.object({
+    rentalId:
+      id,
+
+    amountCents:
+      cents.refine(
+        (value) =>
+          value > 0,
         "Amount must be positive",
       ),
 
@@ -256,6 +380,37 @@ export const paymentSchema =
         .nullable()
         .default(null),
 
+    additionalFees:
+      z.array(
+        paymentFeeSchema,
+      )
+      .max(5)
+      .default([])
+      .superRefine(
+        (fees, ctx) => {
+          const types =
+            new Set(
+              fees.map(
+                (fee) =>
+                  fee.type,
+              ),
+            );
+
+          if (
+            types.size !==
+            fees.length
+          ) {
+            ctx.addIssue({
+              code:
+                z.ZodIssueCode.custom,
+
+              message:
+                "Each additional fee can only be selected once.",
+            });
+          }
+        },
+      ),
+
     idempotencyKey:
       requestId,
   })
@@ -263,11 +418,13 @@ export const paymentSchema =
 
 export const refundSchema =
   z.object({
-    rentalId: id,
+    rentalId:
+      id,
 
     amountCents:
       cents.refine(
-        (value) => value > 0,
+        (value) =>
+          value > 0,
         "Amount must be positive",
       ),
 
@@ -291,7 +448,8 @@ export const refundSchema =
 
 export const rateSchema =
   z.object({
-    vehicleId: id,
+    vehicleId:
+      id,
 
     dailyCents:
       cents.nullable(),
@@ -308,12 +466,14 @@ export const rateSchema =
       data.dailyCents !== null ||
       data.weeklyCents !== null ||
       data.monthlyCents !== null,
+
     "At least one rate is required",
   );
 
 export const vehicleStatusSchema =
   z.object({
-    vehicleId: id,
+    vehicleId:
+      id,
 
     status:
       z.enum([
@@ -336,7 +496,8 @@ export const vehicleStatusSchema =
 
 export const vehicleUpdateSchema =
   z.object({
-    vehicleId: id,
+    vehicleId:
+      id,
 
     registrationNumber:
       z.string()
@@ -361,7 +522,8 @@ export const vehicleUpdateSchema =
         .int()
         .min(1886)
         .max(
-          new Date().getUTCFullYear() + 1,
+          new Date().getUTCFullYear() +
+            1,
         )
         .nullable(),
 
@@ -419,12 +581,14 @@ export const vehicleUpdateSchema =
       data.dailyCents !== null ||
       data.weeklyCents !== null ||
       data.monthlyCents !== null,
+
     "At least one rate is required",
   );
 
 export const serviceSchema =
   z.object({
-    vehicleId: id,
+    vehicleId:
+      id,
 
     completedAt:
       isoDateTime,
@@ -450,7 +614,8 @@ export const serviceSchema =
 
 export const expenseSchema =
   z.object({
-    vehicleId: id,
+    vehicleId:
+      id,
 
     category:
       z.enum([
@@ -463,7 +628,8 @@ export const expenseSchema =
 
     amountCents:
       cents.refine(
-        (value) => value > 0,
+        (value) =>
+          value > 0,
       ),
 
     occurredAt:
@@ -490,7 +656,8 @@ export const expenseSchema =
 
 export const inspectionSchema =
   z.object({
-    rentalId: id,
+    rentalId:
+      id,
 
     stage:
       z.enum([
@@ -514,9 +681,9 @@ export const inspectionSchema =
 
     photoPaths:
       z.array(
-        z.string().regex(
-          /^inspection-photos\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/,
-        ),
+        z.string()
+          .min(1)
+          .max(500),
       )
       .max(20)
       .default([]),
@@ -526,18 +693,16 @@ export const inspectionSchema =
 export const financialOverviewSchema =
   z.object({
     from:
-      z.string().date(),
+      z.string()
+        .date(),
 
     to:
-      z.string().date(),
+      z.string()
+        .date(),
   })
-  .strict()
-  .refine(
-    (input) =>
-      input.from <= input.to,
-    "The reporting period is invalid",
-  );
-  export const staffRegistrationSchema =
+  .strict();
+
+export const staffRegistrationSchema =
   z.object({
     fullName:
       z.string()
@@ -548,8 +713,8 @@ export const financialOverviewSchema =
     mobile:
       z.string()
         .trim()
-        .min(7)
-        .max(30),
+        .min(5)
+        .max(40),
 
     age:
       z.number()
@@ -564,4 +729,3 @@ export const financialOverviewSchema =
       ]),
   })
   .strict();
-  

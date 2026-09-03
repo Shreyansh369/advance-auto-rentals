@@ -8,6 +8,7 @@ import type { VehicleDocument } from "../../../packages/domain/src/types";
 import { isValidVehicleTransition } from "../../../packages/domain/src/lifecycle";
 import { audit } from "./audit";
 import { db } from "./firebase";
+import { getStorage } from "firebase-admin/storage";
 import { MAX_MONEY_CENTS } from "./schemas";
 
 function asIso(value: string): string {
@@ -16,6 +17,26 @@ function asIso(value: string): string {
 
 function asTimestamp(value: string): Timestamp {
   return Timestamp.fromDate(new Date(value));
+}
+
+function odometerToKm(value: number, unit: "km" | "mi"): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Odometer reading must be a non-negative number.",
+    );
+  }
+
+  const km = unit === "mi" ? value * 1.609344 : value;
+
+  if (!Number.isFinite(km) || km > 10_000_000) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Odometer reading is outside the permitted range.",
+    );
+  }
+
+  return km;
 }
 
 function finiteTotal(
@@ -49,6 +70,219 @@ function finiteTotal(
   );
 }
 
+
+export async function createVehicle(
+  actorUid: string,
+  input: {
+    registrationNumber: string;
+    make: string;
+    model: string;
+    year: number | null;
+    color: string | null;
+    vin: string | null;
+    registrationExpiresAt: string | null;
+    insuranceExpiresAt: string | null;
+    lastServiceAt: string | null;
+    nextServiceDueAt: string | null;
+    dailyCents: number | null;
+    weeklyCents: number | null;
+    monthlyCents: number | null;
+    notes: string | null;
+  },
+) {
+  const vehicleRef =
+    db.collection("vehicles").doc();
+
+  const registrationNumber =
+    input.registrationNumber
+      .trim()
+      .toUpperCase();
+
+  const vin =
+    input.vin
+      ?.trim()
+      .toUpperCase() ||
+    null;
+
+  if (!registrationNumber) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Registration number is required.",
+    );
+  }
+
+  if (!input.make.trim()) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Vehicle make is required.",
+    );
+  }
+
+  if (!input.model.trim()) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Vehicle model is required.",
+    );
+  }
+
+  if (
+    input.dailyCents === null &&
+    input.weeklyCents === null &&
+    input.monthlyCents === null
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "At least one vehicle rate is required.",
+    );
+  }
+
+  if (
+    vin !== null &&
+    vin.length !== 17
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "VIN must contain exactly 17 characters.",
+    );
+  }
+
+  const rates = {
+    currency: "USD" as const,
+    dailyCents:
+      input.dailyCents,
+    weeklyCents:
+      input.weeklyCents,
+    monthlyCents:
+      input.monthlyCents,
+  };
+
+  return db.runTransaction(
+    async (transaction) => {
+      const duplicateRegistrationSnapshot =
+        await transaction.get(
+          db
+            .collection("vehicles")
+            .where(
+              "registrationNumber",
+              "==",
+              registrationNumber,
+            )
+            .limit(1),
+        );
+
+      if (
+        !duplicateRegistrationSnapshot.empty
+      ) {
+        throw new HttpsError(
+          "already-exists",
+          `Registration number ${registrationNumber} is already assigned to another vehicle.`,
+        );
+      }
+
+      if (vin !== null) {
+        const duplicateVinSnapshot =
+          await transaction.get(
+            db
+              .collection("vehicles")
+              .where(
+                "vin",
+                "==",
+                vin,
+              )
+              .limit(1),
+          );
+
+        if (
+          !duplicateVinSnapshot.empty
+        ) {
+          throw new HttpsError(
+            "already-exists",
+            `VIN ${vin} is already assigned to another vehicle.`,
+          );
+        }
+      }
+
+      const payload = {
+        registrationNumber,
+
+        make:
+          input.make
+            .trim()
+            .toUpperCase(),
+
+        model:
+          input.model.trim(),
+
+        year:
+          input.year,
+
+        color:
+          input.color?.trim() ||
+          null,
+
+        vin,
+
+        registrationExpiresAt:
+          input.registrationExpiresAt,
+
+        insuranceExpiresAt:
+          input.insuranceExpiresAt,
+
+        lastServiceAt:
+          input.lastServiceAt,
+
+        nextServiceDueAt:
+          input.nextServiceDueAt,
+
+        rates,
+
+        notes:
+          input.notes?.trim() ||
+          null,
+
+        status:
+          "available" as const,
+
+        createdBy:
+          actorUid,
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      };
+
+      transaction.create(
+        vehicleRef,
+        payload,
+      );
+
+      audit(
+        transaction,
+        actorUid,
+        "vehicle.created",
+        {
+          collection:
+            "vehicles",
+          id: vehicleRef.id,
+        },
+        {
+          registrationNumber,
+          vin,
+        },
+      );
+
+      return {
+        vehicleId:
+          vehicleRef.id,
+
+        registrationNumber,
+      };
+    },
+  );
+}
+
 export async function createReservation(
   actorUid: string,
   input: {
@@ -56,8 +290,11 @@ export async function createReservation(
     vehicleId: string;
     pickupAt: string;
     expectedReturnAt: string;
+    pickupLocation: string | null;
+    dropoffLocation: string | null;
     notes: string | null;
     bookingMedia: Array<Record<string, unknown>>;
+    customerSignatureDataUrl: string;
   },
 ) {
   const pickupAt = asTimestamp(
@@ -92,12 +329,15 @@ export async function createReservation(
 
   return db.runTransaction(
     async (transaction) => {
+      const actorRef = db.collection("users").doc(actorUid);
       const [
         vehicleSnapshot,
         customerSnapshot,
+        actorSnapshot,
       ] = await transaction.getAll(
         vehicleRef,
         customerRef,
+        actorRef,
       );
 
       if (!vehicleSnapshot.exists) {
@@ -175,6 +415,14 @@ export async function createReservation(
         );
       }
 
+      const actorProfile = actorSnapshot.data() ?? {};
+      const staffNameSnapshot =
+        typeof actorProfile.fullName === "string" && actorProfile.fullName.trim()
+          ? actorProfile.fullName.trim()
+          : typeof actorProfile.email === "string" && actorProfile.email.trim()
+            ? actorProfile.email.trim()
+            : actorUid;
+
       const conflictQuery = db
         .collection("reservations")
         .where(
@@ -224,11 +472,40 @@ export async function createReservation(
         vehicle.rates,
       );
 
+      const signatureDataUrl = input.customerSignatureDataUrl;
+      const signatureMatch = signatureDataUrl.match(/^data:image\/png;base64,(.+)$/);
+      if (!signatureMatch) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Customer signature must be a PNG image.",
+        );
+      }
+
+      const signatureBytes = Buffer.from(signatureMatch[1], "base64");
+      if (signatureBytes.length === 0 || signatureBytes.length > 600_000) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Customer signature is invalid or too large.",
+        );
+      }
+
+      const signaturePath = `rental-documents/${reservationRef.id}/customer-signature-${reservationRef.id}.png`;
+      await getStorage().bucket().file(signaturePath).save(signatureBytes, {
+        resumable: false,
+        metadata: {
+          contentType: "image/png",
+          cacheControl: "private, max-age=3600, no-store",
+        },
+      });
+
       transaction.create(
         reservationRef,
         {
           bookingMedia:
             input.bookingMedia,
+
+          customerSignatureStoragePath: signaturePath,
+          customerSignatureCapturedAt: FieldValue.serverTimestamp(),
 
           customerId:
             input.customerId,
@@ -246,6 +523,9 @@ export async function createReservation(
           pickupAt,
           expectedReturnAt,
 
+          pickupLocation: input.pickupLocation,
+          dropoffLocation: input.dropoffLocation,
+
           status: "confirmed",
 
           rateSnapshot: {
@@ -262,6 +542,7 @@ export async function createReservation(
           notes: input.notes,
 
           createdBy: actorUid,
+          createdByNameSnapshot: staffNameSnapshot,
 
           createdAt:
             FieldValue.serverTimestamp(),
@@ -306,7 +587,7 @@ export async function checkoutRental(
   input: {
     reservationId: string;
     pickupFuelLevel: string;
-    pickupOdometerKm: number;
+    pickupOdometer: { value: number; unit: "km" | "mi" };
     notes: string | null;
   },
 ) {
@@ -351,9 +632,11 @@ export async function checkoutRental(
           ),
         );
 
-      const vehicleSnapshot =
-        await transaction.get(
+      const actorRef = db.collection("users").doc(actorUid);
+      const [vehicleSnapshot, actorSnapshot] =
+        await transaction.getAll(
           vehicleRef,
+          actorRef,
         );
 
       if (!vehicleSnapshot.exists) {
@@ -376,6 +659,17 @@ export async function checkoutRental(
 
       const reservation =
         reservationSnapshot.data()!;
+      const pickupOdometerKm = odometerToKm(
+        input.pickupOdometer.value,
+        input.pickupOdometer.unit,
+      );
+      const actorProfile = actorSnapshot.data() ?? {};
+      const checkedOutByNameSnapshot =
+        typeof actorProfile.fullName === "string" && actorProfile.fullName.trim()
+          ? actorProfile.fullName.trim()
+          : typeof actorProfile.email === "string" && actorProfile.email.trim()
+            ? actorProfile.email.trim()
+            : actorUid;
 
       transaction.create(
         rentalRef,
@@ -390,8 +684,11 @@ export async function checkoutRental(
           pickupFuelLevel:
             input.pickupFuelLevel,
 
-          pickupOdometerKm:
-            input.pickupOdometerKm,
+          pickupOdometerKm,
+          pickupOdometerValue:
+            input.pickupOdometer.value,
+          pickupOdometerUnit:
+            input.pickupOdometer.unit,
 
           checkoutNotes:
             input.notes,
@@ -405,6 +702,8 @@ export async function checkoutRental(
             FieldValue.serverTimestamp(),
 
           checkedOutBy: actorUid,
+          checkedOutByNameSnapshot,
+
         },
       );
 
@@ -550,7 +849,7 @@ export async function returnRental(
     rentalId: string;
     actualReturnAt: string;
     returnFuelLevel: string;
-    returnOdometerKm: number;
+    returnOdometer: { value: number; unit: "km" | "mi" };
 
     adjustments: Array<{
       amountCents: number;
@@ -622,10 +921,15 @@ export async function returnRental(
         );
       }
 
+      const returnOdometerKm = odometerToKm(
+        input.returnOdometer.value,
+        input.returnOdometer.unit,
+      );
+
       if (
-        input.returnOdometerKm <
-        rentalSnapshot.get(
-          "pickupOdometerKm",
+        returnOdometerKm <
+        Number(
+          rentalSnapshot.get("pickupOdometerKm") ?? 0,
         )
       ) {
         throw new HttpsError(
@@ -689,8 +993,11 @@ export async function returnRental(
           returnFuelLevel:
             input.returnFuelLevel,
 
-          returnOdometerKm:
-            input.returnOdometerKm,
+          returnOdometerKm,
+          returnOdometerValue:
+            input.returnOdometer.value,
+          returnOdometerUnit:
+            input.returnOdometer.unit,
 
           returnNotes:
             input.notes,
@@ -698,8 +1005,7 @@ export async function returnRental(
           adjustments:
             input.adjustments,
 
-          // NEW:
-          // Persist return photos/videos.
+          // Persist return photos.
           returnMedia:
             input.returnMedia,
 
@@ -1164,6 +1470,55 @@ export async function extendRental(
   );
 }
 
+export async function getPayableRentals() {
+  const financialSnapshot = await db
+    .collection("rentalFinancials")
+    .where("outstandingCents", ">", 0)
+    .limit(200)
+    .get();
+
+  if (financialSnapshot.empty) {
+    return [];
+  }
+
+  const rentalsSnapshot = await db.getAll(
+    ...financialSnapshot.docs.map((snapshot) =>
+      db.collection("rentals").doc(snapshot.id),
+    ),
+  );
+
+  return financialSnapshot.docs
+    .map((financialDoc) => {
+      const rental = rentalsSnapshot.find(
+        (snapshot) => snapshot.id === financialDoc.id,
+      );
+      const financial = financialDoc.data();
+      const data = rental?.data();
+
+      if (!data || !["active", "overdue", "returned"].includes(String(data.status))) {
+        return null;
+      }
+
+      return {
+        id: financialDoc.id,
+        customerName:
+          financial.customerName ??
+          data.customerNameSnapshot ??
+          "Unknown customer",
+        vehicleRegistration:
+          financial.vehicleRegistration ??
+          data.vehicleRegistrationSnapshot ??
+          "Unknown vehicle",
+        status: String(data.status),
+        outstandingCents: Number(financial.outstandingCents ?? 0),
+      };
+    })
+    .filter(
+      (item): item is NonNullable<typeof item> => item !== null,
+    )
+    .sort((a, b) => a.outstandingCents - b.outstandingCents);
+}
+
 export async function recordPayment(
   actorUid: string,
   input: {
@@ -1175,6 +1530,15 @@ export async function recordPayment(
       | string
       | null;
     idempotencyKey: string;
+    additionalFees?: Array<{
+      type:
+        | "car_seat"
+        | "insurance"
+        | "cleaning"
+        | "smoke_fee"
+        | "refueling";
+      amountCents: number;
+    }>;
   },
   isRefund = false,
   refundReason?: string,
@@ -1236,6 +1600,53 @@ export async function recordPayment(
 
       const financial =
         financialSnapshot.data()!;
+
+      const additionalFees =
+        !isRefund && input.kind === "payment"
+          ? input.additionalFees ?? []
+          : [];
+
+      const feeTypes = new Set(
+        additionalFees.map(
+          (fee) => fee.type,
+        ),
+      );
+
+      if (
+        feeTypes.size !==
+        additionalFees.length
+      ) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Each additional fee can only be selected once.",
+        );
+      }
+
+      const additionalFeesCents =
+        additionalFees.reduce(
+          (sum, fee) =>
+            sum + fee.amountCents,
+          0,
+        );
+
+      if (
+        additionalFees.some(
+          (fee) =>
+            !Number.isInteger(
+              fee.amountCents,
+            ) ||
+            fee.amountCents <= 0 ||
+            fee.amountCents >
+              MAX_MONEY_CENTS,
+        ) ||
+        additionalFeesCents >
+          MAX_MONEY_CENTS
+      ) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Additional fee amounts are invalid.",
+        );
+      }
 
       const refundedPaymentCents =
         financial.refundedPaymentCents ??
@@ -1308,9 +1719,27 @@ export async function recordPayment(
         nextRefundedPaymentCents +
         nextRefundedDepositCents;
 
+      const nextAdjustmentCents =
+        financial.adjustmentCents +
+        additionalFeesCents;
+
+      const nextTotalCents =
+        financial.totalCents +
+        additionalFeesCents;
+
+      if (
+        nextTotalCents >
+        MAX_MONEY_CENTS
+      ) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Additional fees exceed the permitted rental total.",
+        );
+      }
+
       const outstandingCents =
         calculateBalance(
-          financial.totalCents,
+          nextTotalCents,
           paidCents,
           nextRefundedPaymentCents,
         );
@@ -1343,6 +1772,8 @@ export async function recordPayment(
 
           kind: input.kind,
 
+          additionalFees,
+
           method: isRefund
             ? "refund"
             : input.method,
@@ -1360,6 +1791,57 @@ export async function recordPayment(
 
           recordedAt:
             FieldValue.serverTimestamp(),
+        },
+      );
+
+      additionalFees.forEach(
+        (fee) => {
+          transaction.create(
+            db
+              .collection(
+                "financialLedger",
+              )
+              .doc(),
+            {
+              rentalId:
+                input.rentalId,
+
+              vehicleId:
+                financial.vehicleId ??
+                rentalSnapshot.get(
+                  "vehicleId",
+                ),
+
+              vehicleRegistration:
+                financial.vehicleRegistration ??
+                rentalSnapshot.get(
+                  "vehicleRegistrationSnapshot",
+                ),
+
+              customerId:
+                financial.customerId ??
+                rentalSnapshot.get(
+                  "customerId",
+                ),
+
+              entryType:
+                "rental_fee",
+
+              feeType:
+                fee.type,
+
+              amountCents:
+                fee.amountCents,
+
+              paymentId:
+                paymentRef.id,
+
+              occurredAt:
+                FieldValue.serverTimestamp(),
+
+              recordedBy: actorUid,
+            },
+          );
         },
       );
 
@@ -1413,6 +1895,12 @@ export async function recordPayment(
           paidCents,
 
           refundedCents,
+
+          adjustmentCents:
+            nextAdjustmentCents,
+
+          totalCents:
+            nextTotalCents,
 
           refundedPaymentCents:
             nextRefundedPaymentCents,
@@ -1621,6 +2109,11 @@ export async function addExpense(
         {
           vehicleId:
             input.vehicleId,
+
+          vehicleRegistration:
+            vehicle.get(
+              "registrationNumber",
+            ),
 
           entryType:
             "expense",
@@ -1858,6 +2351,7 @@ export async function updateVehicleStatus(
     },
   );
 }
+
 export async function updateVehicleDetails(
   actorUid: string,
   input: {
@@ -2040,8 +2534,7 @@ export async function updateVehicleDetails(
           previousRegistrationNumber:
             current.registrationNumber,
 
-          vehicleId:
-            vehicleRef.id,
+          vehicleId: vehicleRef.id,
         },
       );
 
@@ -2055,6 +2548,7 @@ export async function updateVehicleDetails(
     },
   );
 }
+
 export async function recordService(
   actorUid: string,
   input: {

@@ -81,6 +81,11 @@ export function FinanceOverview() {
       toDateInput(new Date()),
     );
 
+  const [
+    selectedVehicleId,
+    setSelectedVehicleId,
+  ] = useState("");
+
   const [data, setData] =
     useState<FinancialData>();
 
@@ -114,18 +119,22 @@ export function FinanceOverview() {
           fleet,
         ] = await Promise.all([
           callFirestoreOperation<
-            {
-              from: string;
-              to: string;
-            },
-            FinancialData
-          >(
-            "getFinancialOverview",
-            {
-              from,
-              to,
-            },
-          ),
+  {
+    from: string;
+    to: string;
+    vehicleId: string | null;
+  },
+  FinancialData
+>(
+  "getFinancialOverview",
+  {
+    from,
+    to,
+    vehicleId:
+      selectedVehicleId ||
+      null,
+  },
+),
 
           getDocs(
             query(
@@ -165,7 +174,12 @@ export function FinanceOverview() {
         setLoading(false);
       }
     },
-    [from, to, role],
+    [
+      from,
+      to,
+      role,
+      selectedVehicleId,
+    ],
   );
 
   useEffect(() => {
@@ -391,6 +405,35 @@ export function FinanceOverview() {
               )
             }
           />
+        </div>
+
+        <div className="field">
+          <label htmlFor="vehicle-filter">
+            Vehicle
+          </label>
+
+          <select
+            id="vehicle-filter"
+            value={selectedVehicleId}
+            onChange={(event) =>
+              setSelectedVehicleId(
+                event.target.value,
+              )
+            }
+          >
+            <option value="">
+              All vehicles
+            </option>
+
+            {vehicles.map((vehicle) => (
+              <option
+                key={vehicle.id}
+                value={vehicle.id}
+              >
+                {vehicle.label}
+              </option>
+            ))}
+          </select>
         </div>
 
         <button

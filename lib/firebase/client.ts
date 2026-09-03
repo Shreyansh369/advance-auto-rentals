@@ -20,6 +20,18 @@ import {
 } from "firebase/firestore";
 
 import {
+  connectFunctionsEmulator,
+  getFunctions,
+  type Functions,
+} from "firebase/functions";
+
+import {
+  connectStorageEmulator,
+  getStorage,
+  type FirebaseStorage,
+} from "firebase/storage";
+
+import {
   initializeAppCheck,
   ReCaptchaEnterpriseProvider,
   type AppCheck,
@@ -31,12 +43,17 @@ export interface FirebaseClient {
   app: FirebaseApp;
   auth: Auth;
   db: Firestore;
+  functions: Functions;
+  storage: FirebaseStorage;
   appCheck?: AppCheck;
 }
 
-let client: FirebaseClient | undefined;
+let client:
+  | FirebaseClient
+  | undefined;
 
 let emulatorsConnected = false;
+
 let appCheckInitialized = false;
 
 export function getFirebaseClient(): FirebaseClient {
@@ -44,7 +61,8 @@ export function getFirebaseClient(): FirebaseClient {
     return client;
   }
 
-  const environment = firebaseEnvironment();
+  const environment =
+    firebaseEnvironment();
 
   if (!environment) {
     throw new Error(
@@ -52,42 +70,66 @@ export function getFirebaseClient(): FirebaseClient {
     );
   }
 
-  const app = getApps().length
-    ? getApp()
-    : initializeApp(environment);
+  const app =
+    getApps().length
+      ? getApp()
+      : initializeApp(
+          environment,
+        );
 
-  const auth = getAuth(app);
-  const db = getFirestore(app);
+  const auth =
+    getAuth(app);
 
-  let appCheck: AppCheck | undefined;
+  const db =
+    getFirestore(app);
+
+  const functions =
+    getFunctions(app);
+
+  const storage =
+    getStorage(app);
+
+  let appCheck:
+    | AppCheck
+    | undefined;
 
   if (
     !environment.useEmulators &&
     environment.appCheckSiteKey &&
-    typeof window !== "undefined" &&
+    typeof window !==
+      "undefined" &&
     !appCheckInitialized
   ) {
-    appCheck = initializeAppCheck(app, {
-      provider:
-        new ReCaptchaEnterpriseProvider(
-          environment.appCheckSiteKey,
-        ),
-      isTokenAutoRefreshEnabled: true,
-    });
+    appCheck =
+      initializeAppCheck(
+        app,
+        {
+          provider:
+            new ReCaptchaEnterpriseProvider(
+              environment.appCheckSiteKey,
+            ),
 
-    appCheckInitialized = true;
+          isTokenAutoRefreshEnabled:
+            true,
+        },
+      );
+
+    appCheckInitialized =
+      true;
   }
 
   if (
     environment.useEmulators &&
-    typeof window !== "undefined" &&
+    typeof window !==
+      "undefined" &&
     !emulatorsConnected
   ) {
     connectAuthEmulator(
       auth,
       "http://127.0.0.1:9099",
       {
-        disableWarnings: true,
+        disableWarnings:
+          true,
       },
     );
 
@@ -97,15 +139,32 @@ export function getFirebaseClient(): FirebaseClient {
       8080,
     );
 
-    emulatorsConnected = true;
+    connectFunctionsEmulator(
+      functions,
+      "127.0.0.1",
+      5001,
+    );
+
+    connectStorageEmulator(
+      storage,
+      "127.0.0.1",
+      9199,
+    );
+
+    emulatorsConnected =
+      true;
   }
 
   client = {
     app,
     auth,
     db,
+    functions,
+    storage,
     ...(appCheck
-      ? { appCheck }
+      ? {
+          appCheck,
+        }
       : {}),
   };
 

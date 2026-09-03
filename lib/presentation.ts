@@ -43,13 +43,31 @@ export function formatDate(
 export function formatFuel(
   value: string,
 ): string {
-  return value
-    .replaceAll("_", " ")
-    .replace(
-      /\b\w/g,
-      (letter) =>
-        letter.toUpperCase(),
-    );
+  const labels: Record<
+    string,
+    string
+  > = {
+    one_eighth: "1/8",
+    quarter: "1/4",
+    three_eighths: "3/8",
+    half: "1/2",
+    five_eighths: "5/8",
+    three_quarters: "3/4",
+    seven_eighths: "7/8",
+    full: "Full",
+    empty: "Empty",
+  };
+
+  return (
+    labels[value] ??
+    value
+      .replaceAll("_", " ")
+      .replace(
+        /\b\w/g,
+        (letter) =>
+          letter.toUpperCase(),
+      )
+  );
 }
 
 export function firebaseErrorMessage(

@@ -190,32 +190,19 @@ a {
 .brand-lockup {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 10px;
-  color: #fff;
-  font-size: 16px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
+  justify-content: center;
+  min-height: 70px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: #ffffff;
 }
 
-.brand-lockup > span:last-child > span {
+.sidebar-brand-logo {
   display: block;
-  color: #a9b8d6;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.085em;
-  text-transform: uppercase;
-}
-
-.brand-mark {
-  display: grid;
-  width: 31px;
-  height: 31px;
-  place-items: center;
-  border-radius: 10px;
-  background: linear-gradient(140deg, #6187ff, #315efb);
-  box-shadow: 0 6px 18px rgb(49 94 251 / 35%);
-  font-size: 18px;
+  width: min(100%, 190px);
+  height: auto;
+  max-height: 58px;
+  object-fit: contain;
 }
 
 .sidebar-nav {
@@ -4528,9 +4515,11 @@ canvas {
 }
 
 .auth-brand-logo {
-  width: 48px;
-  height: 48px;
   display: block;
+  width: 156px;
+  height: auto;
+  max-height: 58px;
+  object-fit: contain;
 }
 
 .auth-brand strong,
@@ -5060,11 +5049,12 @@ canvas {
 }
 
 .auth-status-logo {
-  width: 48px;
-  height: 48px;
   display: block;
-
+  width: 210px;
+  height: auto;
+  max-width: 100%;
   margin-bottom: 24px;
+  object-fit: contain;
 }
 
 .auth-status-card h1 {
@@ -5159,8 +5149,9 @@ canvas {
   }
 
   .auth-mobile-brand .auth-brand-logo {
-    width: 42px;
-    height: 42px;
+    width: 142px;
+    height: auto;
+    max-height: 50px;
   }
 
   .auth-mobile-brand strong {
@@ -5372,8 +5363,9 @@ canvas {
   }
 
   .auth-status-logo {
-    width: 48px;
-    height: 48px;
+    width: 170px;
+    height: auto;
+    max-width: 100%;
     margin-bottom: 24px;
   }
 
@@ -5443,4 +5435,83 @@ canvas {
   .auth-status-card h1 {
     font-size: 27px;
   }
+}
+.checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.checkbox-row input[type="checkbox"],
+.field input[type="checkbox"] {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  min-height: 16px;
+  margin: 0;
+  padding: 0;
+  flex: 0 0 16px;
+  accent-color: #3157d5;
+}
+
+.checkbox-row span {
+  line-height: 1.4;
+}
+.customer-tabs {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px 4px;
+}
+
+.customer-tabs .button {
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 9px;
+  white-space: nowrap;
+}
+.customer-create-panel {
+  width: min(
+    100%,
+    980px
+  );
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.customer-create-panel .form-grid {
+  max-width: 920px;
+}
+.customer-create-panel .field.full {
+  max-width: 920px;
+}
+.new-customer-licence {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafbfc;
+}
+
+.new-customer-licence-header {
+  display: flex;
+  align-items: center;
+}
+
+.new-customer-licence-header > div {
+  display: grid;
+  gap: 3px;
+}
+
+.new-customer-licence-header strong {
+  font-size: 14px;
+}
+
+.new-customer-licence-header span {
+  color: #66738a;
+  font-size: 12px;
 }

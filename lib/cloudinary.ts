@@ -13,9 +13,6 @@ export type CloudinaryMedia = {
 const MAX_IMAGE_BYTES =
   10 * 1024 * 1024;
 
-const MAX_VIDEO_BYTES =
-  100 * 1024 * 1024;
-
 function cloudinaryConfig() {
   const cloudName =
     process.env
@@ -46,30 +43,18 @@ export async function uploadVehicleMedia(
     uploadPreset,
   } = cloudinaryConfig();
 
-  const isVideo =
-    file.type.startsWith("video/");
-
-  const maxBytes = isVideo
-    ? MAX_VIDEO_BYTES
-    : MAX_IMAGE_BYTES;
-
-  if (
-    !file.type.startsWith("image/") &&
-    !isVideo
-  ) {
+  if (!file.type.startsWith("image/")) {
     throw new Error(
-      "Only image and video files can be uploaded.",
+      "Only image files can be uploaded.",
     );
   }
 
   if (
     file.size <= 0 ||
-    file.size > maxBytes
+    file.size > MAX_IMAGE_BYTES
   ) {
     throw new Error(
-      isVideo
-        ? "Each video must be 100 MB or smaller."
-        : "Each image must be 10 MB or smaller.",
+      "Each image must be 10 MB or smaller.",
     );
   }
 
@@ -130,10 +115,7 @@ export async function uploadVehicleMedia(
     );
   }
 
-  if (
-    data.resource_type !== "image" &&
-    data.resource_type !== "video"
-  ) {
+  if (data.resource_type !== "image") {
     throw new Error(
       "Cloudinary returned an unsupported media type.",
     );

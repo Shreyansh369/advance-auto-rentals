@@ -1,4 +1,4 @@
-"use client";
+
 
 import {
   collection,
@@ -12,6 +12,8 @@ import {
   Timestamp,
   where,
 } from "firebase/firestore";
+
+import { httpsCallable } from "firebase/functions";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 import {
@@ -43,11 +45,26 @@ export type DashboardSummary = {
     customerName: string;
     vehicleRegistration: string;
   }>;
+  activeRentals: Array<{
+    id: string;
+    customerName: string;
+    vehicleRegistration: string;
+    expectedReturnAt: string;
+    checkedOutBy: string;
+    status: "active" | "overdue";
+  }>;
 };
-
+export type PayableRental = {
+  id: string;
+  customerName: string;
+  vehicleRegistration: string;
+  status: string;
+  outstandingCents: number;
+};
 export type FinancialOverview = {
   from: string;
   to: string;
+  vehicleId: string | null;
   invoicedCents: number;
   receivedCents: number;
   refundedCents: number;
@@ -110,6 +127,25 @@ function getActorUid(): string {
   }
 
   return user.uid;
+}
+
+async function callTrustedFunction<
+  TInput extends Record<string, unknown>,
+  TResult,
+>(
+  name: string,
+  data: TInput,
+): Promise<TResult> {
+  const callable = httpsCallable<
+    TInput,
+    TResult
+  >(
+    getFirebaseClient().functions,
+    name,
+  );
+
+  const result = await callable(data);
+  return result.data;
 }
 
 function toIso(value: unknown): string {
@@ -464,6 +500,47 @@ async function getOperationalDashboard(): Promise<DashboardSummary> {
       },
     ).length;
 
+  const activeRentals =
+    rentals
+      .filter((rental) =>
+        ["active", "overdue"].includes(
+          String(rental.status),
+        ),
+      )
+      .filter((rental) => Boolean(rental.expectedReturnAt))
+      .sort(
+        (a, b) =>
+          new Date(
+            toIso(a.expectedReturnAt),
+          ).getTime() -
+          new Date(
+            toIso(b.expectedReturnAt),
+          ).getTime(),
+      )
+      .slice(0, 20)
+      .map((rental) => ({
+        id: rental.id,
+        customerName: String(
+          rental.customerNameSnapshot ??
+            "Unknown customer",
+        ),
+        vehicleRegistration: String(
+          rental.vehicleRegistrationSnapshot ??
+            "Unknown vehicle",
+        ),
+        expectedReturnAt: toIso(
+          rental.expectedReturnAt,
+        ),
+        checkedOutBy: String(
+          rental.checkedOutByNameSnapshot ??
+            "—",
+        ),
+        status:
+          rental.status === "overdue"
+            ? "overdue"
+            : "active",
+      })) as DashboardSummary["activeRentals"];
+
   const upcomingReservations =
     reservations
       .filter(
@@ -539,9 +616,68 @@ async function getOperationalDashboard(): Promise<DashboardSummary> {
     maintenanceDue,
     expiringDocuments,
     upcomingReservations,
+    activeRentals,
   };
 }
+async function getPayableRentals(): Promise<PayableRental[]> {
+  const { db } = getFirebaseClient();
 
+  const snapshot = await getDocs(
+    query(
+      collection(db, "rentalFinancials"),
+      where("outstandingCents", ">", 0),
+      limit(500),
+    ),
+  );
+
+  return snapshot.docs
+    .map((snapshot) => {
+      const data = snapshot.data();
+
+      return {
+        id: String(
+          data.rentalId ?? snapshot.id,
+        ),
+        customerName: String(
+          data.customerNameSnapshot ??
+            data.customerName ??
+            "Unknown customer",
+        ),
+        vehicleRegistration: String(
+          data.vehicleRegistration ??
+            data.vehicleRegistrationSnapshot ??
+            "Unknown vehicle",
+        ),
+        status: String(
+          data.rentalStatus ?? "active",
+        ),
+        outstandingCents: Number(
+          data.outstandingCents ?? 0,
+        ),
+        updatedAt:
+          data.updatedAt instanceof Timestamp
+            ? data.updatedAt.toMillis()
+            : 0,
+      };
+    })
+    .filter(
+      (rental) =>
+        Number.isFinite(
+          rental.outstandingCents,
+        ) &&
+        rental.outstandingCents > 0,
+    )
+    .sort(
+      (a, b) =>
+        b.updatedAt - a.updatedAt,
+    )
+    .map(
+      ({
+        updatedAt: _updatedAt,
+        ...rental
+      }) => rental,
+    );
+}
 /* =========================================================
    Customer
    ========================================================= */
@@ -561,12 +697,55 @@ async function createOrUpdateCustomer(
     ),
   );
 
-  await runTransaction(
-    db,
-    async (transaction) => {
-      transaction.set(
-        customerRef,
-        {
+await runTransaction(
+  db,
+  async (transaction) => {
+    const licenceExpiresAt =
+      input.licenceExpiresAt
+        ? String(
+            input.licenceExpiresAt,
+          )
+        : null;
+
+    if (licenceExpiresAt) {
+      const today =
+        new Date();
+
+      today.setHours(
+        0,
+        0,
+        0,
+        0,
+      );
+
+      const expiryDate =
+        new Date(
+          `${licenceExpiresAt}T00:00:00`,
+        );
+
+      expiryDate.setHours(
+        0,
+        0,
+        0,
+        0,
+      );
+
+      if (
+        Number.isNaN(
+          expiryDate.getTime(),
+        ) ||
+        expiryDate.getTime() <=
+          today.getTime()
+      ) {
+        throw new Error(
+          "Licence expiry must be after today.",
+        );
+      }
+    }
+
+    transaction.set(
+      customerRef,
+      {
           fullName:
             String(
               input.fullName ??
@@ -610,11 +789,7 @@ async function createOrUpdateCustomer(
               .toUpperCase(),
 
           licenceExpiresAt:
-            input.licenceExpiresAt
-              ? String(
-                  input.licenceExpiresAt,
-                )
-              : null,
+  licenceExpiresAt,
 
           dateOfBirth:
             input.dateOfBirth == null
@@ -654,6 +829,49 @@ async function createOrUpdateCustomer(
   };
 }
 
+async function updateCustomerLicenceDocument(
+  input: {
+    customerId: string;
+    licenceStoragePath: string;
+  },
+): Promise<{
+  customerId: string;
+  licenceStoragePath: string;
+}> {
+  const callable =
+    httpsCallable<
+      typeof input,
+      {
+        customerId: string;
+        licenceStoragePath: string;
+      }
+    >(
+      getFirebaseClient().functions,
+      "updateCustomerLicenceDocument",
+    );
+
+  const result =
+    await callable(input);
+
+  return result.data;
+}
+
+async function sendReservationContract(
+  input: { reservationId: string },
+): Promise<{ emailId: string }> {
+  const callable =
+    httpsCallable<
+      typeof input,
+      { emailId: string }
+    >(
+      getFirebaseClient().functions,
+      "sendReservationContract",
+    );
+
+  const result = await callable(input);
+  return result.data;
+}
+
 /* =========================================================
    Reservation
    ========================================================= */
@@ -664,10 +882,11 @@ async function createReservation(
     vehicleId: string;
     pickupAt: string;
     expectedReturnAt: string;
+    pickupLocation: string | null;
+    dropoffLocation: string | null;
     notes: string | null;
-    bookingMedia: Array<
-      Record<string, unknown>
-    >;
+    bookingMedia: Array<Record<string, unknown>>;
+    customerSignatureDataUrl: string;
   },
 ): Promise<{
   reservationId: string;
@@ -676,354 +895,23 @@ async function createReservation(
     chargedDays: number;
   };
 }> {
-  const { db } =
-    getFirebaseClient();
-
-  const actorUid =
-    getActorUid();
-
-  const pickupAt =
-    asTimestamp(
-      input.pickupAt,
-    );
-
-  const expectedReturnAt =
-    asTimestamp(
-      input.expectedReturnAt,
-    );
-
-  if (
-    expectedReturnAt.toMillis() <=
-    pickupAt.toMillis()
-  ) {
-    throw new Error(
-      "Expected return must be after pickup.",
-    );
-  }
-
-  if (
-    pickupAt.toMillis() <
-    Date.now()
-  ) {
-    throw new Error(
-      "Pickup time cannot be in the past.",
-    );
-  }
-
-  /*
-   * Queries cannot be read with transaction.get()
-   * in the Web SDK. Fetch conflicts first.
-   */
-  const conflictSnapshot =
-    await getDocs(
-      query(
-        collection(
-          db,
-          "reservations",
-        ),
-        where(
-          "vehicleId",
-          "==",
-          input.vehicleId,
-        ),
-        limit(100),
-      ),
-    );
-
-  const overlaps =
-    conflictSnapshot.docs.some(
-      (snapshot) => {
-        const reservation =
-          snapshot.data();
-
-        if (
-          ![
-            "confirmed",
-            "checked_out",
-          ].includes(
-            String(
-              reservation.status,
-            ),
-          )
-        ) {
-          return false;
-        }
-
-        if (
-          !reservation.pickupAt ||
-          !reservation.expectedReturnAt
-        ) {
-          return false;
-        }
-
-        const existingPickup =
-          new Date(
-            toIso(
-              reservation.pickupAt,
-            ),
-          ).getTime();
-
-        const existingReturn =
-          new Date(
-            toIso(
-              reservation.expectedReturnAt,
-            ),
-          ).getTime();
-
-        return (
-          existingPickup <
-            expectedReturnAt.toMillis() &&
-          existingReturn >
-            pickupAt.toMillis()
-        );
-      },
-    );
-
-  if (overlaps) {
-    throw new Error(
-      "Vehicle has an overlapping reservation.",
-    );
-  }
-
-  const reservationRef =
-    doc(
-      collection(
-        db,
-        "reservations",
-      ),
-    );
-
-  const vehicleRef =
-    doc(
-      db,
-      "vehicles",
-      input.vehicleId,
-    );
-
-  const customerRef =
-    doc(
-      db,
-      "customers",
-      input.customerId,
-    );
-
-  let resultQuote:
-    | {
-        baseRentalCents: number;
-        chargedDays: number;
+  const callable =
+    httpsCallable<
+      typeof input,
+      {
+        reservationId: string;
+        quote: {
+          baseRentalCents: number;
+          chargedDays: number;
+        };
       }
-    | undefined;
+    >(
+      getFirebaseClient().functions,
+      "createReservation",
+    );
 
-  await runTransaction(
-    db,
-    async (transaction) => {
-      const vehicleSnapshot =
-        await transaction.get(
-          vehicleRef,
-        );
-
-      const customerSnapshot =
-        await transaction.get(
-          customerRef,
-        );
-
-      if (
-        !vehicleSnapshot.exists()
-      ) {
-        throw new Error(
-          "Vehicle was not found.",
-        );
-      }
-
-      if (
-        !customerSnapshot.exists()
-      ) {
-        throw new Error(
-          "Customer was not found.",
-        );
-      }
-
-      const vehicle =
-        vehicleSnapshot.data() as VehicleDocument;
-
-      if (
-        ![
-          "available",
-          "reserved",
-        ].includes(
-          String(
-            vehicle.status,
-          ),
-        )
-      ) {
-        throw new Error(
-          "Vehicle cannot be reserved in its current status.",
-        );
-      }
-
-      if (
-        !vehicle.insuranceExpiresAt ||
-        !vehicle.registrationExpiresAt ||
-        Date.parse(
-          vehicle.insuranceExpiresAt,
-        ) <
-          pickupAt.toMillis() ||
-        Date.parse(
-          vehicle.registrationExpiresAt,
-        ) <
-          pickupAt.toMillis()
-      ) {
-        throw new Error(
-          "Vehicle registration and insurance must be valid through pickup.",
-        );
-      }
-
-      const licenceExpiresAt =
-        customerSnapshot.get(
-          "licenceExpiresAt",
-        );
-
-      if (
-        !licenceExpiresAt ||
-        Date.parse(
-          String(
-            licenceExpiresAt,
-          ),
-        ) <
-          pickupAt.toMillis()
-      ) {
-        throw new Error(
-          "Customer licence is missing or expires before pickup.",
-        );
-      }
-
-      const quote =
-        quoteRental(
-          {
-            pickupAt:
-              input.pickupAt,
-            expectedReturnAt:
-              input.expectedReturnAt,
-          },
-          vehicle.rates,
-        );
-
-      resultQuote = {
-        baseRentalCents:
-          quote.baseRentalCents,
-        chargedDays:
-          quote.chargedDays,
-      };
-
-      transaction.set(
-        reservationRef,
-        {
-          bookingMedia:
-            input.bookingMedia,
-
-          customerId:
-            input.customerId,
-
-          customerNameSnapshot:
-            customerSnapshot.get(
-              "fullName",
-            ),
-
-          vehicleId:
-            input.vehicleId,
-
-          vehicleRegistrationSnapshot:
-            vehicle.registrationNumber,
-
-          pickupAt,
-
-          expectedReturnAt,
-
-          status: "confirmed",
-
-          rateSnapshot: {
-            ...vehicle.rates,
-            quotedAt:
-              new Date().toISOString(),
-            vehicleId:
-              vehicleRef.id,
-            vehicleRegistration:
-              vehicle.registrationNumber,
-          },
-
-          quote,
-
-          notes:
-            input.notes,
-
-          createdBy:
-            actorUid,
-
-          createdAt:
-            nowTimestamp(),
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      transaction.update(
-        vehicleRef,
-        {
-          status: "reserved",
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      const auditRef =
-        doc(
-          collection(
-            db,
-            "auditLogs",
-          ),
-        );
-
-      transaction.set(
-        auditRef,
-        {
-          actorUid,
-
-          action:
-            "reservation.created",
-
-          resource: {
-            collection:
-              "reservations",
-            id:
-              reservationRef.id,
-          },
-
-          details: {
-            vehicleId:
-              vehicleRef.id,
-
-            customerId:
-              customerRef.id,
-
-            pickupAt:
-              input.pickupAt,
-          },
-
-          createdAt:
-            nowTimestamp(),
-        },
-      );
-    },
-  );
-
-  return {
-    reservationId:
-      reservationRef.id,
-
-    quote:
-      resultQuote!,
-  };
+  const result = await callable(input);
+  return result.data;
 }
 
 /* =========================================================
@@ -2147,6 +2035,43 @@ async function recordRentalPayment(
 }
 
 /* =========================================================
+   Vehicle creation
+   ========================================================= */
+
+async function createVehicle(
+  input: {
+    registrationNumber: string;
+    make: string;
+    model: string;
+    year: number | null;
+    color: string | null;
+    vin: string | null;
+    registrationExpiresAt: string | null;
+    insuranceExpiresAt: string | null;
+    lastServiceAt: string | null;
+    nextServiceDueAt: string | null;
+    dailyCents: number | null;
+    weeklyCents: number | null;
+    monthlyCents: number | null;
+    notes: string | null;
+  },
+): Promise<{
+  vehicleId: string;
+  registrationNumber: string;
+}> {
+  return callTrustedFunction<
+    typeof input,
+    {
+      vehicleId: string;
+      registrationNumber: string;
+    }
+  >(
+    "createVehicleRecord",
+    input,
+  );
+}
+
+/* =========================================================
    Vehicle details
    ========================================================= */
 
@@ -2545,9 +2470,9 @@ async function recordVehicleExpense(
             input.amountCents,
 
           occurredAt:
-            asTimestamp(
-              input.occurredAt,
-            ),
+  asTimestamp(
+    input.occurredAt,
+  ),
 
           vendor:
             input.vendor,
@@ -2630,6 +2555,7 @@ async function getFinancialOverview(
   input: {
     from: string;
     to: string;
+    vehicleId: string | null;
   },
 ): Promise<FinancialOverview> {
   const { db } =
@@ -2698,6 +2624,13 @@ async function getFinancialOverview(
       }),
     );
 
+  const matchesVehicle =
+    (record: FirestoreDoc): boolean =>
+      !input.vehicleId ||
+      String(
+        record.vehicleId ?? "",
+      ) === input.vehicleId;
+
   const fromDate =
     new Date(
       `${input.from}T00:00:00`,
@@ -2728,6 +2661,7 @@ async function getFinancialOverview(
   const filteredFinancial =
     financialRecords.filter(
       (record) =>
+        matchesVehicle(record) &&
         withinRange(
           record.createdAt ??
             record.pickupAt,
@@ -2737,6 +2671,7 @@ async function getFinancialOverview(
   const filteredExpenses =
     expenses.filter(
       (record) =>
+        matchesVehicle(record) &&
         withinRange(
           record.occurredAt,
         ),
@@ -2745,6 +2680,7 @@ async function getFinancialOverview(
   const filteredLedger =
     ledgerEntries.filter(
       (entry) =>
+        matchesVehicle(entry) &&
         withinRange(
           entry.occurredAt,
         ),
@@ -3015,6 +2951,9 @@ async function getFinancialOverview(
     to:
       input.to,
 
+    vehicleId:
+      input.vehicleId,
+
     invoicedCents,
 
     receivedCents,
@@ -3056,13 +2995,17 @@ export async function callFirestoreOperation<
       return (
         (await getOperationalDashboard()) as TResult
       );
-
+    case "getPayableRentals":
+  return (
+    (await getPayableRentals()) as TResult
+  );
     case "getFinancialOverview":
       return (
         (await getFinancialOverview(
           data as {
             from: string;
             to: string;
+            vehicleId: string | null;
           },
         )) as TResult
       );
@@ -3094,6 +3037,23 @@ export async function callFirestoreOperation<
         )) as TResult
       );
 
+    case "updateCustomerLicenceDocument":
+      return (
+        (await updateCustomerLicenceDocument(
+          data as {
+            customerId: string;
+            licenceStoragePath: string;
+          },
+        )) as TResult
+      );
+
+    case "sendReservationContract":
+      return (
+        (await sendReservationContract(
+          data as { reservationId: string },
+        )) as TResult
+      );
+
     case "createReservation":
       return (
         (await createReservation(
@@ -3102,10 +3062,13 @@ export async function callFirestoreOperation<
             vehicleId: string;
             pickupAt: string;
             expectedReturnAt: string;
+            pickupLocation: string | null;
+            dropoffLocation: string | null;
             notes: string | null;
             bookingMedia: Array<
               Record<string, unknown>
             >;
+            customerSignatureDataUrl: string;
           },
         )) as TResult
       );
@@ -3124,7 +3087,8 @@ export async function callFirestoreOperation<
 
     case "extendRental":
       return (
-        (await extendRental(
+        (await callTrustedFunction(
+          "extendRental",
           data as {
             rentalId: string;
             expectedReturnAt: string;
@@ -3166,6 +3130,28 @@ export async function callFirestoreOperation<
               | string
               | null;
             idempotencyKey: string;
+          },
+        )) as TResult
+      );
+
+    case "createVehicle":
+      return (
+        (await createVehicle(
+          data as {
+            registrationNumber: string;
+            make: string;
+            model: string;
+            year: number | null;
+            color: string | null;
+            vin: string | null;
+            registrationExpiresAt: string | null;
+            insuranceExpiresAt: string | null;
+            lastServiceAt: string | null;
+            nextServiceDueAt: string | null;
+            dailyCents: number | null;
+            weeklyCents: number | null;
+            monthlyCents: number | null;
+            notes: string | null;
           },
         )) as TResult
       );

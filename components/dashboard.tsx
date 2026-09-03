@@ -26,7 +26,17 @@ import {
 } from "@/lib/presentation";
 
 const cards: Array<{
-  key: keyof Omit<DashboardSummary, "upcomingReservations">;
+  key: keyof Pick<
+    DashboardSummary,
+    | "totalFleet"
+    | "available"
+    | "reserved"
+    | "todayPickups"
+    | "todayReturns"
+    | "overdue"
+    | "maintenanceDue"
+    | "expiringDocuments"
+  >;
   label: string;
   icon: typeof CarFront;
   tone: string;
@@ -225,6 +235,88 @@ export function Dashboard() {
       )}
 
       <section className="dashboard-grid">
+        <article className="surface upcoming-panel">
+          <div className="section-heading">
+            <div>
+              <p className="section-kicker">
+                Currently on rent
+              </p>
+
+              <h2>Active rentals</h2>
+            </div>
+
+            <Link
+              className="text-link"
+              href="/rentals"
+            >
+              Manage rentals
+            </Link>
+          </div>
+
+          {summary?.activeRentals.length ? (
+            <div className="list-table">
+              {summary.activeRentals.map(
+                (rental) => (
+                  <div
+                    className="pickup-row"
+                    key={rental.id}
+                  >
+                    <div className="pickup-time">
+                      <strong>
+                        {formatDate(
+                          rental.expectedReturnAt,
+                          {
+                            month: "short",
+                            day: "numeric",
+                          },
+                        )}
+                      </strong>
+
+                      <span>
+                        {new Intl.DateTimeFormat(
+                          "en-US",
+                          {
+                            hour: "numeric",
+                            minute: "2-digit",
+                          },
+                        ).format(
+                          new Date(
+                            rental.expectedReturnAt,
+                          ),
+                        )}
+                      </span>
+                    </div>
+
+                    <div className="pickup-customer">
+                      <strong>
+                        {rental.customerName}
+                      </strong>
+
+                      <span>
+                        {rental.vehicleRegistration}
+                        {" · "}
+                        {rental.checkedOutBy}
+                      </span>
+                    </div>
+
+                    <span
+                      className={`status-pill ${rental.status}`}
+                    >
+                      {rental.status === "overdue"
+                        ? "Overdue"
+                        : "Rented"}
+                    </span>
+                  </div>
+                ),
+              )}
+            </div>
+          ) : (
+            <div className="inline-empty">
+              No active rentals.
+            </div>
+          )}
+        </article>
+
         <article className="surface upcoming-panel">
           <div className="section-heading">
             <div>

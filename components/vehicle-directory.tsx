@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   FileWarning,
   Pencil,
+  Plus,
   Search,
   ShieldCheck,
   X,
@@ -175,6 +176,25 @@ function vehicleToForm(
   };
 }
 
+function emptyVehicleForm(): VehicleForm {
+  return {
+    registrationNumber: "",
+    make: "",
+    model: "",
+    year: "",
+    color: "",
+    vin: "",
+    registrationExpiresAt: "",
+    insuranceExpiresAt: "",
+    lastServiceAt: "",
+    nextServiceDueAt: "",
+    dailyCents: "",
+    weeklyCents: "",
+    monthlyCents: "",
+    notes: "",
+  };
+}
+
 function dateIsValid(
   value: string,
 ): boolean {
@@ -229,6 +249,9 @@ export function VehicleDirectory() {
 
   const [editingVehicle, setEditingVehicle] =
     useState<Vehicle | null>(null);
+
+  const [creatingVehicle, setCreatingVehicle] =
+    useState(false);
 
   const [form, setForm] =
     useState<VehicleForm | null>(null);
@@ -303,6 +326,14 @@ export function VehicleDirectory() {
         vehicle.status === item,
     ).length;
 
+  function openCreator() {
+    setError(undefined);
+    setNotice(undefined);
+    setEditingVehicle(null);
+    setForm(emptyVehicleForm());
+    setCreatingVehicle(true);
+  }
+
   function openEditor(vehicle: Vehicle) {
     setError(undefined);
     setNotice(undefined);
@@ -316,6 +347,7 @@ export function VehicleDirectory() {
     }
 
     setEditingVehicle(null);
+    setCreatingVehicle(false);
     setForm(null);
   }
 
@@ -334,7 +366,7 @@ export function VehicleDirectory() {
   }
 
   async function saveVehicle() {
-    if (!editingVehicle || !form) {
+    if ((!editingVehicle && !creatingVehicle) || !form) {
       return;
     }
 
@@ -431,86 +463,108 @@ export function VehicleDirectory() {
 
       setSaving(true);
 
-      await callFirestoreOperation<
-        Record<string, unknown>,
-        void
-      >(
-        "updateVehicleDetails",
-        {
-          vehicleId:
-            editingVehicle.id,
+      const payload = {
+        registrationNumber:
+          form.registrationNumber
+            .trim()
+            .toUpperCase(),
 
-          registrationNumber:
-            form.registrationNumber
-              .trim()
-              .toUpperCase(),
+        make:
+          form.make
+            .trim()
+            .toUpperCase(),
 
-          make:
-            form.make
-              .trim()
-              .toUpperCase(),
+        model:
+          form.model.trim(),
 
-          model:
-            form.model.trim(),
+        year:
+          form.year.trim()
+            ? Number(form.year)
+            : null,
 
-          year:
-            form.year.trim()
-              ? Number(form.year)
-              : null,
+        color:
+          form.color.trim() ||
+          null,
 
-          color:
-            form.color.trim() ||
-            null,
+        vin:
+          form.vin.trim()
+            ? form.vin
+                .trim()
+                .toUpperCase()
+            : null,
 
-          vin:
-            form.vin.trim()
-              ? form.vin
-                  .trim()
-                  .toUpperCase()
-              : null,
+        registrationExpiresAt:
+          form.registrationExpiresAt ||
+          null,
 
-          registrationExpiresAt:
-            form.registrationExpiresAt ||
-            null,
+        insuranceExpiresAt:
+          form.insuranceExpiresAt ||
+          null,
 
-          insuranceExpiresAt:
-            form.insuranceExpiresAt ||
-            null,
+        lastServiceAt:
+          form.lastServiceAt ||
+          null,
 
-          lastServiceAt:
-            form.lastServiceAt ||
-            null,
+        nextServiceDueAt:
+          form.nextServiceDueAt ||
+          null,
 
-          nextServiceDueAt:
-            form.nextServiceDueAt ||
-            null,
+        dailyCents:
+          centsFromInput(
+            form.dailyCents,
+          ),
 
-          dailyCents:
-            centsFromInput(
-              form.dailyCents,
-            ),
+        weeklyCents:
+          centsFromInput(
+            form.weeklyCents,
+          ),
 
-          weeklyCents:
-            centsFromInput(
-              form.weeklyCents,
-            ),
+        monthlyCents:
+          centsFromInput(
+            form.monthlyCents,
+          ),
 
-          monthlyCents:
-            centsFromInput(
-              form.monthlyCents,
-            ),
+        notes:
+          form.notes.trim() ||
+          null,
+      };
 
-          notes:
-            form.notes.trim() ||
-            null,
-        },
-      );
+      if (creatingVehicle) {
+        const result =
+          await callFirestoreOperation<
+            Record<string, unknown>,
+            {
+              vehicleId: string;
+              registrationNumber: string;
+            }
+          >(
+            "createVehicle",
+            payload,
+          );
 
-      setNotice(
-        `${form.registrationNumber.toUpperCase()} updated successfully.`,
-      );
+        setNotice(
+          `${result.registrationNumber} added successfully.`,
+        );
+      } else {
+        await callFirestoreOperation<
+          Record<string, unknown>,
+          void
+        >(
+          "updateVehicleDetails",
+          {
+            vehicleId:
+              editingVehicle!.id,
+            ...payload,
+          },
+        );
+
+        setNotice(
+          `${payload.registrationNumber} updated successfully.`,
+        );
+      }
 
       setEditingVehicle(null);
+      setCreatingVehicle(false);
       setForm(null);
     } catch (cause) {
       setError(
@@ -665,6 +719,16 @@ export function VehicleDirectory() {
               aria-label="Search fleet"
             />
           </div>
+
+          <button
+            className="button button-primary compact"
+            type="button"
+            onClick={openCreator}
+            disabled={saving}
+          >
+            <Plus size={16} />
+            Add vehicle
+          </button>
 
           <div
             className="filter-scroll"
@@ -1108,7 +1172,7 @@ export function VehicleDirectory() {
         )}
       </section>
 
-      {editingVehicle &&
+      {(editingVehicle || creatingVehicle) &&
         form && (
           <div
             className="vehicle-modal-backdrop"
@@ -1135,10 +1199,9 @@ export function VehicleDirectory() {
                   </p>
 
                   <h2 id="vehicle-editor-title">
-                    Edit{" "}
-                    {
-                      editingVehicle.registrationNumber
-                    }
+                    {creatingVehicle
+                      ? "Add vehicle"
+                      : `Edit ${editingVehicle?.registrationNumber ?? "vehicle"}`}
                   </h2>
                 </div>
 

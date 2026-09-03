@@ -175,16 +175,11 @@ export function AppShell({
         aria-label="Main navigation"
       >
         <div className="brand-lockup">
-          <span className="brand-mark">
-            A
-          </span>
-
-          <span>
-            Advance
-            <span>
-              Auto Rentals
-            </span>
-          </span>
+          <img
+            src="/brand/advance-auto-rentals-logo.png"
+            alt="Advance Auto Rental & Repairs"
+            className="sidebar-brand-logo"
+          />
         </div>
 
         <nav className="sidebar-nav">

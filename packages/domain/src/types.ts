@@ -10,7 +10,17 @@ export const VEHICLE_STATUSES = [
 
 export type VehicleStatus = (typeof VEHICLE_STATUSES)[number];
 export type UserRole = "admin" | "operations";
-export type FuelLevel = "empty" | "quarter" | "half" | "three_quarters" | "full";
+export type FuelLevel =
+  | "empty"
+  | "one_eighth"
+  | "quarter"
+  | "three_eighths"
+  | "half"
+  | "five_eighths"
+  | "three_quarters"
+  | "seven_eighths"
+  | "full";
+export type OdometerUnit = "km" | "mi";
 export type PaymentMethod = "cash" | "card" | "bank_transfer" | "other";
 
 export interface VehicleRates {

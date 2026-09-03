@@ -5,6 +5,7 @@ import {
   onCall,
 } from "firebase-functions/https";
 import { logger } from "firebase-functions";
+import { defineSecret } from "firebase-functions/params";
 import { onSchedule } from "firebase-functions/scheduler";
 import { onObjectFinalized } from "firebase-functions/storage";
 import { getStorage } from "firebase-admin/storage";
@@ -15,6 +16,7 @@ import { audit } from "./services/audit";
 
 import {
   addExpense,
+  createVehicle,
   changeRates,
   checkoutRental,
   createReservation as createReservationRecord,
@@ -29,6 +31,9 @@ import {
 
 import {
   customerSchema,
+  customerLicenseDocumentSchema,
+  reservationSignatureSchema,
+  sendReservationContractSchema,
   expenseSchema,
   extensionSchema,
   financialOverviewSchema,
@@ -36,7 +41,6 @@ import {
   paymentSchema,
   rateSchema,
   refundSchema,
-  reservationSchema,
   returnSchema,
   checkoutSchema,
   serviceSchema,
@@ -45,6 +49,7 @@ import {
 } from "./services/schemas";
 
 import { financialOverview } from "./services/reporting";
+import { sendReservationContractEmail } from "./services/contracts";
 import {
   requireAdmin,
   requireRole,
@@ -61,6 +66,8 @@ import {
 const enforceAppCheck =
   process.env.FUNCTIONS_EMULATOR !== "true";
 
+const resendApiKey = defineSecret("RESEND_API_KEY");
+
 /**
  * Existing reservation schema + vehicle evidence.
  *
@@ -69,7 +76,7 @@ const enforceAppCheck =
  * metadata to this callable.
  */
 const reservationWorkflowSchema =
-  reservationSchema.extend({
+  reservationSignatureSchema.extend({
     bookingMedia: z
       .array(
         z.record(
@@ -209,6 +216,103 @@ const vehicleUpdateSchema =
     "At least one rate is required",
   );
 
+const createVehicleSchema = z.object({
+  registrationNumber: z
+    .string()
+    .trim()
+    .min(1)
+    .max(40),
+
+  make: z
+    .string()
+    .trim()
+    .min(1)
+    .max(80),
+
+  model: z
+    .string()
+    .trim()
+    .min(1)
+    .max(120),
+
+  year: z
+    .number()
+    .int()
+    .min(1886)
+    .max(
+      new Date().getUTCFullYear() + 1,
+    )
+    .nullable(),
+
+  color: z
+    .string()
+    .trim()
+    .max(60)
+    .nullable(),
+
+  vin: z
+    .string()
+    .trim()
+    .length(17)
+    .toUpperCase()
+    .nullable(),
+
+  registrationExpiresAt: z
+    .string()
+    .date()
+    .nullable(),
+
+  insuranceExpiresAt: z
+    .string()
+    .date()
+    .nullable(),
+
+  lastServiceAt: z
+    .string()
+    .date()
+    .nullable(),
+
+  nextServiceDueAt: z
+    .string()
+    .date()
+    .nullable(),
+
+  dailyCents: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(10_000_000)
+    .nullable(),
+
+  weeklyCents: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(10_000_000)
+    .nullable(),
+
+  monthlyCents: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(10_000_000)
+    .nullable(),
+
+  notes: z
+    .string()
+    .trim()
+    .max(2_000)
+    .nullable(),
+})
+  .strict()
+  .refine(
+    (data) =>
+      data.dailyCents !== null ||
+      data.weeklyCents !== null ||
+      data.monthlyCents !== null,
+    "At least one rate is required",
+  );
+
 const callable = <T extends z.ZodType>(
   schema: T,
   roles: Array<
@@ -231,7 +335,7 @@ const callable = <T extends z.ZodType>(
     },
     async (request) => {
       try {
-        const actor = requireRole(
+        const actor = await requireRole(
           request,
           ...roles,
         );
@@ -359,6 +463,71 @@ export const createOrUpdateCustomer =
   );
 
 /* =========================================================
+   CUSTOMER LICENCE DOCUMENT
+   ========================================================= */
+
+export const updateCustomerLicenceDocument =
+  callable(
+    customerLicenseDocumentSchema,
+    ["admin", "operations"],
+    async (actor, input) => {
+      const customerRef =
+        db
+          .collection("customers")
+          .doc(input.customerId);
+
+      await db.runTransaction(
+        async (transaction) => {
+          const customer =
+            await transaction.get(
+              customerRef,
+            );
+
+          if (!customer.exists) {
+            throw new HttpsError(
+              "not-found",
+              "Customer could not be found.",
+            );
+          }
+
+          transaction.update(
+            customerRef,
+            {
+              licenceStoragePath:
+                input.licenceStoragePath,
+              updatedAt:
+                FieldValue.serverTimestamp(),
+              updatedBy: actor.uid,
+            },
+          );
+
+          audit(
+            transaction,
+            actor.uid,
+            "customer.licence.document.updated",
+            {
+              collection: "customers",
+              id: input.customerId,
+            },
+            {
+              fields: [
+                "licenceStoragePath",
+              ],
+            },
+          );
+        },
+      );
+
+      return {
+        customerId:
+          input.customerId,
+        licenceStoragePath:
+          input.licenceStoragePath,
+      };
+    },
+  );
+
+/* =========================================================
    RESERVATIONS
    ========================================================= */
 
@@ -384,6 +553,61 @@ async function createReservationWorkflow(
     input,
   );
 }
+
+export const sendReservationContract =
+  onCall(
+    {
+      enforceAppCheck,
+      region: "us-central1",
+      secrets: [resendApiKey],
+    },
+    async (request) => {
+      try {
+        const actor = await requireRole(
+          request,
+          "admin",
+          "operations",
+        );
+
+        const parsed = sendReservationContractSchema.safeParse(request.data);
+        if (!parsed.success) {
+          throw new HttpsError(
+            "invalid-argument",
+            "Invalid request data.",
+            parsed.error.flatten(),
+          );
+        }
+
+        const key = resendApiKey.value();
+        if (!key) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Contract email is not configured on the server.",
+          );
+        }
+
+        const fromEmail =
+          process.env.CONTRACT_EMAIL_FROM?.trim();
+
+        if (!fromEmail) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Contract sender email is not configured on the server.",
+          );
+        }
+
+        return await sendReservationContractEmail({
+          reservationId: parsed.data.reservationId,
+          actorUid: actor.uid,
+          resendApiKey: key,
+          fromEmail,
+          signatureDataUrl: null,
+        });
+      } catch (error) {
+        return safeError(error);
+      }
+    },
+  );
 
 /* =========================================================
    CHECKOUT
@@ -495,6 +719,21 @@ export const issueRefund =
         },
         true,
         input.reason,
+      ),
+  );
+
+/* =========================================================
+   VEHICLE CREATION
+   ========================================================= */
+
+export const createVehicleRecord =
+  callable(
+    createVehicleSchema,
+    ["admin", "operations"],
+    async (actor, input) =>
+      createVehicle(
+        actor.uid,
+        input,
       ),
   );
 
@@ -625,7 +864,7 @@ export const setUserRole =
     async (request) => {
       try {
         const actor =
-          requireAdmin(request);
+          await requireAdmin(request);
 
         const input =
           roleSchema.parse(
@@ -696,7 +935,7 @@ export const getOperationalDashboard =
     },
     async (request) => {
       try {
-        requireRole(
+        await requireRole(
           request,
           "admin",
           "operations",
@@ -748,6 +987,7 @@ export const getOperationalDashboard =
           insurance,
           registration,
           upcoming,
+          activeRentals,
         ] = await Promise.all([
           db
             .collection("vehicles")
@@ -898,6 +1138,19 @@ export const getOperationalDashboard =
             )
             .limit(10)
             .get(),
+
+          db
+            .collection("rentals")
+            .where(
+              "status",
+              "in",
+              ["active", "overdue"],
+            )
+            .orderBy(
+              "expectedReturnAt",
+            )
+            .limit(20)
+            .get(),
         ]);
 
         const expiringIds =
@@ -969,6 +1222,40 @@ export const getOperationalDashboard =
                   item.get(
                     "vehicleRegistrationSnapshot",
                   ),
+              }),
+            ),
+
+          activeRentals:
+            activeRentals.docs.map(
+              (item) => ({
+                id: item.id,
+                customerName:
+                  item.get(
+                    "customerNameSnapshot",
+                  ) ??
+                  "Unknown customer",
+                vehicleRegistration:
+                  item.get(
+                    "vehicleRegistrationSnapshot",
+                  ) ??
+                  "Unknown vehicle",
+                expectedReturnAt:
+                  item
+                    .get(
+                      "expectedReturnAt",
+                    )
+                    .toDate()
+                    .toISOString(),
+                checkedOutBy:
+                  item.get(
+                    "checkedOutByNameSnapshot",
+                  ) ??
+                  "—",
+                status:
+                  item.get("status") ===
+                  "overdue"
+                    ? "overdue"
+                    : "active",
               }),
             ),
         };
@@ -1228,7 +1515,8 @@ export const validateUploadedEvidence =
       }
     },
   );
-  export const registerStaffProfile =
+
+export const registerStaffProfile =
   onCall(
     {
       enforceAppCheck: true,

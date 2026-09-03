@@ -2,12 +2,9 @@
 
 import {
   Camera,
-  Check,
-  Film,
   ImagePlus,
   LoaderCircle,
   RotateCcw,
-  Square,
   X,
 } from "lucide-react";
 
@@ -24,7 +21,6 @@ import {
 
 type CameraMode =
   | "photo"
-  | "video"
   | null;
 
 export function MediaCapture({
@@ -32,7 +28,7 @@ export function MediaCapture({
   value,
   onChange,
   label = "Vehicle evidence",
-  hint = "Capture photos or videos of the vehicle.",
+  hint = "Capture photos of the vehicle.",
   maxFiles = 20,
 }: {
   stage: "booking" | "return";
@@ -54,14 +50,6 @@ export function MediaCapture({
       null,
     );
 
-  const recorderRef =
-    useRef<MediaRecorder | null>(
-      null,
-    );
-
-  const recordedChunksRef =
-    useRef<Blob[]>([]);
-
   const fileInputRef =
     useRef<HTMLInputElement | null>(
       null,
@@ -73,20 +61,11 @@ export function MediaCapture({
   const [cameraError, setCameraError] =
     useState<string>();
 
-  const [recording, setRecording] =
-    useState(false);
-
   const [uploading, setUploading] =
     useState(false);
 
   const [uploadError, setUploadError] =
     useState<string>();
-
-  const [recordingSeconds, setRecordingSeconds] =
-    useState(0);
-
-  const timerRef =
-    useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
@@ -95,22 +74,6 @@ export function MediaCapture({
   }, []);
 
   function stopCamera() {
-    const recorder =
-      recorderRef.current;
-
-    if (
-      recorder &&
-      recorder.state !== "inactive"
-    ) {
-      try {
-        recorder.stop();
-      } catch {
-        // Recorder may already have stopped.
-      }
-    }
-
-    recorderRef.current = null;
-
     const stream =
       streamRef.current;
 
@@ -130,34 +93,17 @@ export function MediaCapture({
       videoRef.current.srcObject =
         null;
     }
-
-    setRecording(false);
-
-    if (
-      timerRef.current !== null
-    ) {
-      window.clearInterval(
-        timerRef.current,
-      );
-
-      timerRef.current = null;
-    }
-
-    setRecordingSeconds(0);
   }
 
   function closeCamera() {
     stopCamera();
+
     setCameraMode(null);
+
     setCameraError(undefined);
   }
 
-  async function openCamera(
-    mode: Exclude<
-      CameraMode,
-      null
-    >,
-  ) {
+  async function openCamera() {
     setCameraError(undefined);
     setUploadError(undefined);
 
@@ -167,6 +113,7 @@ export function MediaCapture({
       setUploadError(
         `You can attach up to ${maxFiles} files.`,
       );
+
       return;
     }
 
@@ -176,6 +123,7 @@ export function MediaCapture({
       setCameraError(
         "Camera access is not supported by this browser.",
       );
+
       return;
     }
 
@@ -195,22 +143,28 @@ export function MediaCapture({
                 ideal:
                   "environment",
               },
+
               width: {
                 ideal: 1280,
               },
+
               height: {
                 ideal: 720,
               },
             },
-            audio:
-              mode === "video",
+
+            /*
+             * Video recording has intentionally
+             * been removed from this component.
+             */
+            audio: false,
           },
         );
 
       streamRef.current =
         stream;
 
-      setCameraMode(mode);
+      setCameraMode("photo");
 
       /*
        * Wait until the video element has been
@@ -250,6 +204,7 @@ export function MediaCapture({
         setCameraError(
           "Camera permission was denied. Allow camera access in your browser settings and try again.",
         );
+
         return;
       }
 
@@ -261,6 +216,7 @@ export function MediaCapture({
         setCameraError(
           "No camera was found on this device.",
         );
+
         return;
       }
 
@@ -276,6 +232,7 @@ export function MediaCapture({
         setCameraError(
           "The camera is currently being used by another application or could not be opened. Close other camera apps and try again.",
         );
+
         return;
       }
 
@@ -301,22 +258,15 @@ export function MediaCapture({
         );
       }
 
-      const extension =
-        blob.type ===
-        "video/webm"
-          ? "webm"
-          : blob.type ===
-              "video/mp4"
-            ? "mp4"
-            : "jpg";
-
-      const file = new File(
-        [blob],
-        `${filename}.${extension}`,
-        {
-          type: blob.type,
-        },
-      );
+      const file =
+        new File(
+          [blob],
+          `${filename}.jpg`,
+          {
+            type:
+              "image/jpeg",
+          },
+        );
 
       const uploaded =
         await uploadVehicleMedia(
@@ -332,7 +282,7 @@ export function MediaCapture({
       setUploadError(
         cause instanceof Error
           ? cause.message
-          : "Media upload failed.",
+          : "Photo upload failed.",
       );
     } finally {
       setUploading(false);
@@ -354,6 +304,7 @@ export function MediaCapture({
       setCameraError(
         "Camera is still starting. Try again in a moment.",
       );
+
       return;
     }
 
@@ -375,6 +326,7 @@ export function MediaCapture({
       setCameraError(
         "Unable to capture the camera image.",
       );
+
       return;
     }
 
@@ -392,6 +344,7 @@ export function MediaCapture({
           setCameraError(
             "Unable to create the photo.",
           );
+
           return;
         }
 
@@ -405,186 +358,6 @@ export function MediaCapture({
       "image/jpeg",
       0.92,
     );
-  }
-
-  function getSupportedVideoMimeType() {
-    if (
-      typeof MediaRecorder ===
-      "undefined"
-    ) {
-      return undefined;
-    }
-
-    const candidates = [
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp8,opus",
-      "video/webm",
-      "video/mp4",
-    ];
-
-    return candidates.find(
-      (type) =>
-        MediaRecorder.isTypeSupported(
-          type,
-        ),
-    );
-  }
-
-  function startVideoRecording() {
-    const stream =
-      streamRef.current;
-
-    if (!stream) {
-      setCameraError(
-        "Camera is not ready yet.",
-      );
-      return;
-    }
-
-    if (
-      typeof MediaRecorder ===
-      "undefined"
-    ) {
-      setCameraError(
-        "Video recording is not supported by this browser.",
-      );
-      return;
-    }
-
-    const mimeType =
-      getSupportedVideoMimeType();
-
-    try {
-      const recorder =
-        mimeType
-          ? new MediaRecorder(
-              stream,
-              {
-                mimeType,
-              },
-            )
-          : new MediaRecorder(
-              stream,
-            );
-
-      recorderRef.current =
-        recorder;
-
-      recordedChunksRef.current =
-        [];
-
-      recorder.ondataavailable =
-        (event) => {
-          if (
-            event.data.size > 0
-          ) {
-            recordedChunksRef.current.push(
-              event.data,
-            );
-          }
-        };
-
-      recorder.onerror = () => {
-        setCameraError(
-          "Video recording failed. Please try again.",
-        );
-      };
-
-      recorder.onstop = () => {
-        const blob =
-          new Blob(
-            recordedChunksRef.current,
-            {
-              type:
-                recorder.mimeType ||
-                "video/webm",
-            },
-          );
-
-        recordedChunksRef.current =
-          [];
-
-        /*
-         * Upload first, then clean up the camera.
-         * This avoids racing MediaRecorder cleanup
-         * on mobile Safari.
-         */
-        void uploadBlob(
-          blob,
-          `vehicle-${stage}-video-${Date.now()}`,
-        );
-
-        stopCamera();
-      };
-
-      recorder.start(250);
-
-      setRecording(true);
-      setRecordingSeconds(0);
-
-      timerRef.current =
-        window.setInterval(
-          () => {
-            setRecordingSeconds(
-              (seconds) =>
-                seconds + 1,
-            );
-          },
-          1000,
-        );
-    } catch {
-      setCameraError(
-        "This browser cannot record video from the selected camera.",
-      );
-    }
-  }
-
-  function stopVideoRecording() {
-    const recorder =
-      recorderRef.current;
-
-    if (!recorder) {
-      return;
-    }
-
-    if (
-      recorder.state !==
-      "inactive"
-    ) {
-      try {
-        recorder.stop();
-      } catch {
-        setCameraError(
-          "Unable to stop the video recording cleanly.",
-        );
-      }
-    }
-
-    setRecording(false);
-  }
-
-  function formatTime(
-    seconds: number,
-  ) {
-    const minutes =
-      Math.floor(
-        seconds / 60,
-      );
-
-    const remainder =
-      seconds % 60;
-
-    return `${String(
-      minutes,
-    ).padStart(
-      2,
-      "0",
-    )}:${String(
-      remainder,
-    ).padStart(
-      2,
-      "0",
-    )}`;
   }
 
   async function handleFiles(
@@ -614,10 +387,22 @@ export function MediaCapture({
       const selected =
         Array.from(
           files,
-        ).slice(
-          0,
-          remaining,
+        )
+          .filter((file) =>
+            file.type.startsWith(
+              "image/",
+            ),
+          )
+          .slice(
+            0,
+            remaining,
+          );
+
+      if (!selected.length) {
+        throw new Error(
+          "Please select image files only.",
         );
+      }
 
       const uploaded: CloudinaryMedia[] =
         [];
@@ -641,7 +426,7 @@ export function MediaCapture({
       setUploadError(
         cause instanceof Error
           ? cause.message
-          : "Media upload failed.",
+          : "Photo upload failed.",
       );
     } finally {
       setUploading(false);
@@ -684,9 +469,7 @@ export function MediaCapture({
                 maxFiles
             }
             onClick={() =>
-              void openCamera(
-                "photo",
-              )
+              void openCamera()
             }
           >
             <Camera
@@ -704,33 +487,13 @@ export function MediaCapture({
                 maxFiles
             }
             onClick={() =>
-              void openCamera(
-                "video",
-              )
-            }
-          >
-            <Film
-              size={16}
-            />
-            Record video
-          </button>
-
-          <button
-            className="button button-secondary compact"
-            type="button"
-            disabled={
-              uploading ||
-              value.length >=
-                maxFiles
-            }
-            onClick={() =>
               fileInputRef.current?.click()
             }
           >
             <ImagePlus
               size={16}
             />
-            Choose files
+            Choose photos
           </button>
         </div>
 
@@ -738,7 +501,7 @@ export function MediaCapture({
           ref={fileInputRef}
           className="media-input"
           type="file"
-          accept="image/*,video/*"
+          accept="image/*"
           multiple
           onChange={(event) =>
             void handleFiles(
@@ -775,67 +538,77 @@ export function MediaCapture({
               className="spin"
               size={16}
             />
-            Uploading media...
+            Uploading photo...
           </div>
         )}
 
         {value.length > 0 && (
           <div className="media-list">
-            {value.map((media) => (
-              <div
-                className="media-item"
-                key={`${media.publicId}-${media.url}`}
-              >
-                {media.resourceType ===
-                "video" ? (
-                  <video
-                    src={media.url}
-                    controls
-                    preload="metadata"
-                    playsInline
-                  />
-                ) : (
-                  <img
-                    src={media.url}
-                    alt={
-                      media.originalFilename
-                    }
-                    loading="lazy"
-                  />
-                )}
-
-                <div className="media-item-footer">
-                  <span
-                    title={
-                      media.originalFilename
-                    }
-                  >
-                    {
-                      media.originalFilename
-                    }
-                  </span>
-
-                  <button
-                    className="icon-button media-remove"
-                    type="button"
-                    aria-label={`Remove ${media.originalFilename}`}
-                    onClick={() =>
-                      onChange(
-                        value.filter(
-                          (item) =>
-                            item.url !==
-                            media.url,
-                        ),
-                      )
-                    }
-                  >
-                    <X
-                      size={15}
+            {value.map(
+              (media) => (
+                <div
+                  className="media-item"
+                  key={`${media.publicId}-${media.url}`}
+                >
+                  {/*
+                   * Historical videos remain renderable so existing
+                   * records are not broken. New uploads are image-only.
+                   */}
+                  {media.resourceType ===
+                  "video" ? (
+                    <video
+                      src={
+                        media.url
+                      }
+                      controls
+                      preload="metadata"
+                      playsInline
                     />
-                  </button>
+                  ) : (
+                    <img
+                      src={
+                        media.url
+                      }
+                      alt={
+                        media.originalFilename
+                      }
+                      loading="lazy"
+                    />
+                  )}
+
+                  <div className="media-item-footer">
+                    <span
+                      title={
+                        media.originalFilename
+                      }
+                    >
+                      {
+                        media.originalFilename
+                      }
+                    </span>
+
+                    <button
+                      className="icon-button media-remove"
+                      type="button"
+                      aria-label={`Remove ${media.originalFilename}`}
+                      onClick={() =>
+                        onChange(
+                          value.filter(
+                            (item) =>
+                              item.url !==
+                              media.url,
+                          ),
+                        )
+                      }
+                    >
+                      <X
+                        size={15}
+                      />
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              ),
+            )}
           </div>
         )}
       </div>
@@ -849,27 +622,16 @@ export function MediaCapture({
             className="camera-modal"
             role="dialog"
             aria-modal="true"
-            aria-label={
-              cameraMode ===
-              "photo"
-                ? "Take vehicle photo"
-                : "Record vehicle video"
-            }
+            aria-label="Take vehicle photo"
           >
             <header className="camera-modal-header">
               <div>
                 <span>
-                  {cameraMode ===
-                  "photo"
-                    ? "PHOTO CAPTURE"
-                    : "VIDEO CAPTURE"}
+                  PHOTO CAPTURE
                 </span>
 
                 <h3>
-                  {cameraMode ===
-                  "photo"
-                    ? "Capture vehicle photo"
-                    : "Record vehicle video"}
+                  Capture vehicle photo
                 </h3>
               </div>
 
@@ -892,134 +654,44 @@ export function MediaCapture({
                 playsInline
                 muted
               />
-
-              {cameraMode ===
-                "video" &&
-                recording && (
-                  <div className="camera-recording-indicator">
-                    <span />
-                    REC{" "}
-                    {formatTime(
-                      recordingSeconds,
-                    )}
-                  </div>
-                )}
-
-              {recording && (
-                <div className="camera-recording-banner">
-                  Recording in progress
-                </div>
-              )}
             </div>
 
             <footer className="camera-controls">
-              {cameraMode ===
-                "photo" && (
-                <button
-                  className="camera-main-button"
-                  type="button"
-                  onClick={() =>
-                    void capturePhoto()
-                  }
-                  disabled={
-                    uploading
-                  }
-                  aria-label="Capture photo"
-                >
-                  <Camera
-                    size={25}
-                  />
-                </button>
-              )}
+              <button
+                className="camera-main-button"
+                type="button"
+                onClick={() =>
+                  void capturePhoto()
+                }
+                disabled={
+                  uploading
+                }
+                aria-label="Capture photo"
+              >
+                <Camera
+                  size={25}
+                />
+              </button>
 
-              {cameraMode ===
-                "video" &&
-                !recording && (
-                  <button
-                    className="camera-main-button camera-video-button"
-                    type="button"
-                    onClick={
-                      startVideoRecording
-                    }
-                    disabled={
-                      uploading
-                    }
-                    aria-label="Start recording"
-                  >
-                    <Film
-                      size={25}
-                    />
-                  </button>
-                )}
-
-              {cameraMode ===
-                "video" &&
-                recording && (
-                  <button
-                    className="camera-main-button camera-stop-button"
-                    type="button"
-                    onClick={
-                      stopVideoRecording
-                    }
-                    aria-label="Stop recording"
-                  >
-                    <Square
-                      size={24}
-                      fill="currentColor"
-                    />
-                  </button>
-                )}
-
-              {!recording && (
-                <button
-                  className="camera-secondary-button"
-                  type="button"
-                  onClick={
-                    closeCamera
-                  }
-                >
-                  <RotateCcw
-                    size={17}
-                  />
-                  Cancel
-                </button>
-              )}
-
-              {recording && (
-                <div className="camera-recording-status">
-                  <span>
-                    <span />
-                    Recording
-                  </span>
-
-                  <strong>
-                    {formatTime(
-                      recordingSeconds,
-                    )}
-                  </strong>
-                </div>
-              )}
+              <button
+                className="camera-secondary-button"
+                type="button"
+                onClick={
+                  closeCamera
+                }
+              >
+                <RotateCcw
+                  size={17}
+                />
+                Cancel
+              </button>
             </footer>
 
-            {!recording &&
-              cameraMode ===
-                "photo" && (
-                <div className="camera-help">
-                  Position the vehicle
-                  inside the frame and
-                  press the camera button.
-                </div>
-              )}
-
-            {!recording &&
-              cameraMode ===
-                "video" && (
-                <div className="camera-help">
-                  Press the video button
-                  to start recording.
-                  Press it again to finish.
-                </div>
-              )}
+            <div className="camera-help">
+              Position the vehicle
+              inside the frame and
+              press the camera button.
+            </div>
           </section>
         </div>
       )}

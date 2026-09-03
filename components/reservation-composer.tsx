@@ -30,7 +30,10 @@ import {
 } from "react";
 
 import { AppShell } from "./app-shell";
+import { CountrySelect } from "./country-select";
+import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
+import { CustomerSignaturePad } from "./customer-signature-pad";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
@@ -86,7 +89,18 @@ type Rental = {
   customerName: string;
   vehicleRegistration: string;
   pickupOdometerKm: number;
+  expectedReturnAt: string | null;
+  createdByNameSnapshot: string | null;
+  checkedOutByNameSnapshot: string | null;
   status: string;
+};
+
+type PayableRental = {
+  id: string;
+  customerName: string;
+  vehicleRegistration: string;
+  status: string;
+  outstandingCents: number;
 };
 
 const tabs: Array<{
@@ -122,11 +136,47 @@ const tabs: Array<{
 ];
 
 const fuelLevels = [
-  "empty",
+  "one_eighth",
   "quarter",
+  "three_eighths",
   "half",
+  "five_eighths",
   "three_quarters",
+  "seven_eighths",
   "full",
+] as const;
+
+const paymentFeeOptions = [
+  {
+    type: "car_seat",
+    label: "Car seat",
+    selectedName: "fee_car_seat_selected",
+    amountName: "fee_car_seat_amount",
+  },
+  {
+    type: "insurance",
+    label: "Insurance",
+    selectedName: "fee_insurance_selected",
+    amountName: "fee_insurance_amount",
+  },
+  {
+    type: "cleaning",
+    label: "Detailing / Cleaning",
+    selectedName: "fee_cleaning_selected",
+    amountName: "fee_cleaning_amount",
+  },
+  {
+    type: "smoke_fee",
+    label: "Smoke fee",
+    selectedName: "fee_smoke_fee_selected",
+    amountName: "fee_smoke_fee_amount",
+  },
+  {
+    type: "refueling",
+    label: "Refueling",
+    selectedName: "fee_refueling_selected",
+    amountName: "fee_refueling_amount",
+  },
 ] as const;
 
 function localToIso(
@@ -136,7 +186,11 @@ function localToIso(
     String(value),
   );
 
-  if (Number.isNaN(date.valueOf())) {
+  if (
+    Number.isNaN(
+      date.valueOf(),
+    )
+  ) {
     throw new Error(
       "Enter a valid date and time.",
     );
@@ -145,16 +199,21 @@ function localToIso(
   return date.toISOString();
 }
 
-function formatVehicleStatus(status: string): string {
+function formatVehicleStatus(
+  status: string,
+): string {
   return status
     .replaceAll("_", " ")
-    .replace(/\b\w/g, (letter) =>
-      letter.toUpperCase(),
+    .replace(
+      /\b\w/g,
+      (letter) =>
+        letter.toUpperCase(),
     );
 }
 
 function todayDateTime(): string {
-  const value = new Date();
+  const value =
+    new Date();
 
   value.setMinutes(
     value.getMinutes() -
@@ -166,12 +225,82 @@ function todayDateTime(): string {
     .slice(0, 16);
 }
 
+function tomorrowDate(): string {
+  const value =
+    new Date();
+
+  value.setDate(
+    value.getDate() +
+      1,
+  );
+
+  return value
+    .toISOString()
+    .slice(0, 10);
+}
+
+function toDateTimeInput(
+  value: unknown,
+): string | null {
+  if (
+    value &&
+    typeof value ===
+      "object" &&
+    "toDate" in value
+  ) {
+    const timestamp =
+      value as {
+        toDate?: () => Date;
+      };
+
+    if (
+      typeof timestamp.toDate ===
+      "function"
+    ) {
+      const date =
+        timestamp.toDate();
+
+      return Number.isNaN(
+        date.valueOf(),
+      )
+        ? null
+        : date.toISOString();
+    }
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(
+      value.valueOf(),
+    )
+      ? null
+      : value.toISOString();
+  }
+
+  if (
+    typeof value ===
+    "string"
+  ) {
+    const date =
+      new Date(value);
+
+    return Number.isNaN(
+      date.valueOf(),
+    )
+      ? null
+      : date.toISOString();
+  }
+
+  return null;
+}
+
 export function ReservationComposer() {
   const [tab, setTab] =
     useState<Tab>("booking");
 
   const [customerMode, setCustomerMode] =
-    useState<CustomerMode>("existing");
+    useState<CustomerMode>(
+      "existing",
+    );
 
   const [customers, setCustomers] =
     useState<Customer[]>([]);
@@ -194,11 +323,28 @@ export function ReservationComposer() {
   const [rentals, setRentals] =
     useState<Rental[]>([]);
 
+  const [payableRentals, setPayableRentals] =
+    useState<PayableRental[]>([]);
+
   const [bookingMedia, setBookingMedia] =
     useState<CloudinaryMedia[]>([]);
 
   const [returnMedia, setReturnMedia] =
     useState<CloudinaryMedia[]>([]);
+
+  const [customerSignature, setCustomerSignature] =
+    useState<string | null>(null);
+
+  /*
+   * New-customer licence capture state.
+   * The customer must exist first because the
+   * licence is stored under that customer ID.
+   */
+  const [newCustomerId, setNewCustomerId] =
+    useState<string | null>(null);
+
+  const [newCustomerLicencePath, setNewCustomerLicencePath] =
+    useState<string | null>(null);
 
   const [error, setError] =
     useState<string>();
@@ -219,16 +365,22 @@ export function ReservationComposer() {
   useEffect(() => {
     if (
       customerSearchInputRef.current &&
-      customerSearchInputRef.current.value !== customerSearch
+      customerSearchInputRef.current.value !==
+        customerSearch
     ) {
-      customerSearchInputRef.current.value = customerSearch;
+      customerSearchInputRef.current.value =
+        customerSearch;
     }
-  }, [customerSearch]);
+  }, [
+    customerSearch,
+  ]);
 
   const filteredCustomers =
     useMemo(() => {
       const needle =
-        String(customerSearch ?? "")
+        String(
+          customerSearch ?? "",
+        )
           .trim()
           .toLowerCase();
 
@@ -248,7 +400,9 @@ export function ReservationComposer() {
             .some((value) =>
               String(value)
                 .toLowerCase()
-                .includes(needle),
+                .includes(
+                  needle,
+                ),
             ),
       );
     }, [
@@ -261,21 +415,12 @@ export function ReservationComposer() {
    * LOAD BOOKING DATA
    * ---------------------------------------------------------
    *
-   * IMPORTANT:
-   *
    * Vehicles are filtered in Firestore by status only.
-   * We intentionally do NOT use:
+   * We intentionally do NOT combine status filtering
+   * with an orderBy that would require an unnecessary
+   * composite Firestore index.
    *
-   *   orderBy("registrationNumber")
-   *
-   * together with:
-   *
-   *   where("status", "in", [...])
-   *
-   * because that combination requires a composite Firestore
-   * index that is unnecessary for this screen.
-   *
-   * Vehicles are sorted locally after retrieval instead.
+   * Vehicles are sorted locally after retrieval.
    */
   async function load() {
     try {
@@ -379,10 +524,6 @@ export function ReservationComposer() {
         ),
       );
 
-      /*
-       * Sort vehicles locally instead of requiring
-       * a Firestore composite index.
-       */
       setVehicles(
         vehicleDocs.docs
           .map(
@@ -393,17 +534,24 @@ export function ReservationComposer() {
                   "registrationNumber",
                 ),
               make:
-                snapshot.get("make"),
+                snapshot.get(
+                  "make",
+                ),
               model:
-                snapshot.get("model"),
+                snapshot.get(
+                  "model",
+                ),
               status:
-                snapshot.get("status"),
+                snapshot.get(
+                  "status",
+                ),
             }),
           )
-          .sort((a, b) =>
-            a.registrationNumber.localeCompare(
-              b.registrationNumber,
-            ),
+          .sort(
+            (a, b) =>
+              a.registrationNumber.localeCompare(
+                b.registrationNumber,
+              ),
           ),
       );
 
@@ -436,30 +584,102 @@ export function ReservationComposer() {
                 "vehicleRegistrationSnapshot",
               ),
             pickupOdometerKm:
-              snapshot.get(
-                "pickupOdometerKm",
+              Number(
+                snapshot.get(
+                  "pickupOdometerKm",
+                ) ?? 0,
               ),
+            expectedReturnAt:
+              toDateTimeInput(
+                snapshot.get(
+                  "expectedReturnAt",
+                ),
+              ),
+            createdByNameSnapshot:
+              snapshot.get(
+                "createdByNameSnapshot",
+              ) ??
+              null,
+            checkedOutByNameSnapshot:
+              snapshot.get(
+                "checkedOutByNameSnapshot",
+              ) ??
+              null,
             status:
-              snapshot.get("status"),
+              snapshot.get(
+                "status",
+              ),
           }),
         ),
       );
     } catch (cause) {
+      console.error(
+        "[ReservationComposer] load failed:",
+        cause,
+      );
+
       setError(
-        firebaseErrorMessage(cause),
+        firebaseErrorMessage(
+          cause,
+        ),
+      );
+    }
+  }
+
+  async function loadPayableRentals() {
+    try {
+      const records =
+        await callFirestoreOperation<
+          Record<string, never>,
+          PayableRental[]
+        >(
+          "getPayableRentals",
+          {},
+        );
+
+      setPayableRentals(
+        records,
+      );
+    } catch (cause) {
+      console.error(
+        "[ReservationComposer] loadPayableRentals failed:",
+        cause,
+      );
+
+      setError(
+        firebaseErrorMessage(
+          cause,
+        ),
       );
     }
   }
 
   useEffect(() => {
     const timer =
-      window.setTimeout(() => {
-        void load();
-      }, 0);
+      window.setTimeout(
+        () => {
+          void load();
+          void loadPayableRentals();
+        },
+        0,
+      );
 
     return () =>
-      window.clearTimeout(timer);
+      window.clearTimeout(
+        timer,
+      );
   }, []);
+
+  useEffect(() => {
+    if (
+      tab !==
+      "payment"
+    ) {
+      return;
+    }
+
+    void loadPayableRentals();
+  }, [tab]);
 
   async function run(
     task: () => Promise<string>,
@@ -474,12 +694,73 @@ export function ReservationComposer() {
       );
 
       await load();
+      await loadPayableRentals();
     } catch (cause) {
       setError(
-        firebaseErrorMessage(cause),
+        firebaseErrorMessage(
+          cause,
+        ),
       );
     } finally {
       setBusy(false);
+    }
+  }
+
+  /*
+   * New customer licence upload handler.
+   *
+   * CustomerLicenseCapture uploads the actual image
+   * to Storage and gives us the resulting storage path.
+   * We then persist that path against the newly-created
+   * customer document through the existing backend operation.
+   */
+  async function handleNewCustomerLicenceChange(
+    storagePath: string | null,
+  ) {
+    if (!newCustomerId) {
+      return;
+    }
+
+    setNewCustomerLicencePath(
+      storagePath,
+    );
+
+    if (!storagePath) {
+      return;
+    }
+
+    setError(undefined);
+    setNotice(undefined);
+
+    try {
+      await callFirestoreOperation<
+        {
+          customerId: string;
+          licenceStoragePath: string;
+        },
+        {
+          customerId: string;
+          licenceStoragePath: string;
+        }
+      >(
+        "updateCustomerLicenceDocument",
+        {
+          customerId:
+            newCustomerId,
+          licenceStoragePath:
+            storagePath,
+        },
+      );
+
+      setNotice(
+        "Driver's licence photo saved successfully.",
+      );
+    } catch (cause) {
+      setError(
+        firebaseErrorMessage(
+          cause,
+        ),
+      );
     }
   }
 
@@ -488,7 +769,9 @@ export function ReservationComposer() {
   ) {
     event.preventDefault();
 
-    if (!selectedCustomerId) {
+    if (
+      !selectedCustomerId
+    ) {
       setError(
         "Select an existing customer or create a new customer before booking.",
       );
@@ -504,80 +787,165 @@ export function ReservationComposer() {
         formElement,
       );
 
-    void run(async () => {
-      const result =
-        await callFirestoreOperation<
-          {
-            customerId: string;
-            vehicleId: string;
-            pickupAt: string;
-            expectedReturnAt: string;
-            notes: string | null;
-            bookingMedia: CloudinaryMedia[];
-          },
-          {
-            reservationId: string;
-            quote: {
-              baseRentalCents: number;
-              chargedDays: number;
-            };
+    void run(
+      async () => {
+        const result =
+          await callFirestoreOperation<
+            {
+              customerId: string;
+              vehicleId: string;
+              pickupAt: string;
+              expectedReturnAt: string;
+              pickupLocation:
+                | string
+                | null;
+              dropoffLocation:
+                | string
+                | null;
+              notes:
+                | string
+                | null;
+              bookingMedia: CloudinaryMedia[];
+              customerSignatureDataUrl: string;
+            },
+            {
+              reservationId: string;
+              quote: {
+                baseRentalCents: number;
+                chargedDays: number;
+              };
+            }
+          >(
+            "createReservation",
+            {
+              customerId:
+                selectedCustomerId,
+
+              vehicleId:
+                String(
+                  form.get(
+                    "vehicleId",
+                  ),
+                ),
+
+              pickupAt:
+                localToIso(
+                  form.get(
+                    "pickupAt",
+                  ),
+                ),
+
+              expectedReturnAt:
+                localToIso(
+                  form.get(
+                    "expectedReturnAt",
+                  ),
+                ),
+
+              pickupLocation:
+                String(
+                  form.get(
+                    "pickupLocation",
+                  ),
+                ).trim() ||
+                null,
+
+              dropoffLocation:
+                String(
+                  form.get(
+                    "dropoffLocation",
+                  ),
+                ).trim() ||
+                null,
+
+              notes:
+                String(
+                  form.get(
+                    "notes",
+                  ),
+                ).trim() ||
+                null,
+
+              bookingMedia,
+
+              customerSignatureDataUrl:
+                customerSignature ||
+                "",
+            },
+          );
+
+        let contractStatus = "";
+
+        if (
+          selectedCustomer?.email
+        ) {
+          try {
+            await callFirestoreOperation<
+              {
+                reservationId: string;
+              },
+              {
+                emailId: string;
+              }
+            >(
+              "sendReservationContract",
+              {
+                reservationId:
+                  result.reservationId,
+              },
+            );
+
+            contractStatus = ` Rental agreement emailed to ${selectedCustomer.email}.`;
+          } catch (emailError) {
+            console.error(
+              "Rental agreement email failed:",
+              emailError,
+            );
+
+            contractStatus = ` Booking was created, but the rental agreement could not be emailed: ${firebaseErrorMessage(
+              emailError,
+            )}`;
           }
-        >(
-          "createReservation",
-          {
-            customerId:
-              selectedCustomerId,
+        } else {
+          contractStatus =
+            " Booking was created, but no customer email is available for the rental agreement.";
+        }
 
-            vehicleId:
-              String(
-                form.get(
-                  "vehicleId",
-                ),
-              ),
+        formElement.reset();
 
-            pickupAt:
-              localToIso(
-                form.get(
-                  "pickupAt",
-                ),
-              ),
-
-            expectedReturnAt:
-              localToIso(
-                form.get(
-                  "expectedReturnAt",
-                ),
-              ),
-
-            notes:
-              String(
-                form.get(
-                  "notes",
-                ),
-              ).trim() || null,
-
-            bookingMedia,
-          },
+        setSelectedCustomerId(
+          "",
         );
 
-      formElement.reset();
+        setBookingMedia(
+          [],
+        );
 
-      setSelectedCustomerId(
-        "",
-      );
+        setCustomerSignature(
+          null,
+        );
 
-      setBookingMedia([]);
+        setCustomerSearch(
+          "",
+        );
 
-      setCustomerSearch("");
+        setCustomerMode(
+          "existing",
+        );
 
-      setCustomerMode(
-        "existing",
-      );
+        setNewCustomerId(
+          null,
+        );
 
-      return `Booking confirmed · ${result.quote.chargedDays} day(s) · ${formatMoney(
-        result.quote.baseRentalCents,
-      )}.`;
-    });
+        setNewCustomerLicencePath(
+          null,
+        );
+
+        return `Booking confirmed · ${result.quote.chargedDays} day(s) · ${formatMoney(
+          result.quote.baseRentalCents,
+        )}.${contractStatus}`;
+      },
+    );
   }
 
   function checkout(
@@ -593,55 +961,74 @@ export function ReservationComposer() {
         formElement,
       );
 
-    void run(async () => {
-      const result =
-        await callFirestoreOperation<
-          {
-            reservationId: string;
-            pickupFuelLevel: string;
-            pickupOdometerKm: number;
-            notes: string | null;
-          },
-          {
-            rentalId: string;
-          }
-        >(
-          "checkoutReservation",
-          {
-            reservationId:
-              String(
-                form.get(
-                  "reservationId",
+    void run(
+      async () => {
+        const result =
+          await callFirestoreOperation<
+            {
+              reservationId: string;
+              pickupFuelLevel: string;
+              pickupOdometer: {
+                value: number;
+                unit:
+                  | "km"
+                  | "mi";
+              };
+              notes:
+                | string
+                | null;
+            },
+            {
+              rentalId: string;
+            }
+          >(
+            "checkoutReservation",
+            {
+              reservationId:
+                String(
+                  form.get(
+                    "reservationId",
+                  ),
                 ),
-              ),
 
-            pickupFuelLevel:
-              String(
-                form.get(
-                  "pickupFuelLevel",
+              pickupFuelLevel:
+                String(
+                  form.get(
+                    "pickupFuelLevel",
+                  ),
                 ),
-              ),
 
-            pickupOdometerKm:
-              Number(
-                form.get(
-                  "pickupOdometerKm",
+              pickupOdometer: {
+                value: Number(
+                  form.get(
+                    "pickupOdometerValue",
+                  ),
                 ),
-              ),
+                unit:
+                  String(
+                    form.get(
+                      "pickupOdometerUnit",
+                    ),
+                  ) as
+                    | "km"
+                    | "mi",
+              },
 
-            notes:
-              String(
-                form.get(
-                  "notes",
-                ),
-              ).trim() || null,
-          },
-        );
+              notes:
+                String(
+                  form.get(
+                    "notes",
+                  ),
+                ).trim() ||
+                null,
+            },
+          );
 
-      formElement.reset();
+        formElement.reset();
 
-      return `Vehicle checked out · rental ${result.rentalId}.`;
-    });
+        return `Vehicle checked out · rental ${result.rentalId}.`;
+      },
+    );
   }
 
   function extend(
@@ -657,56 +1044,58 @@ export function ReservationComposer() {
         formElement,
       );
 
-    void run(async () => {
-      const result =
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            expectedReturnAt: string;
-            note: string;
-            idempotencyKey: string;
-          },
-          {
-            extensionCents: number;
-            outstandingCents: number;
-          }
-        >(
-          "extendRental",
-          {
-            rentalId:
-              String(
-                form.get(
-                  "rentalId",
+    void run(
+      async () => {
+        const result =
+          await callFirestoreOperation<
+            {
+              rentalId: string;
+              expectedReturnAt: string;
+              note: string;
+              idempotencyKey: string;
+            },
+            {
+              extensionCents: number;
+              outstandingCents: number;
+            }
+          >(
+            "extendRental",
+            {
+              rentalId:
+                String(
+                  form.get(
+                    "rentalId",
+                  ),
                 ),
-              ),
 
-            expectedReturnAt:
-              localToIso(
-                form.get(
-                  "expectedReturnAt",
+              expectedReturnAt:
+                localToIso(
+                  form.get(
+                    "expectedReturnAt",
+                  ),
                 ),
-              ),
 
-            note:
-              String(
-                form.get(
-                  "note",
-                ),
-              ).trim(),
+              note:
+                String(
+                  form.get(
+                    "note",
+                  ),
+                ).trim(),
 
-            idempotencyKey:
-              crypto.randomUUID(),
-          },
-        );
+              idempotencyKey:
+                crypto.randomUUID(),
+            },
+          );
 
-      formElement.reset();
+        formElement.reset();
 
-      return `Rental extended · ${formatMoney(
-        result.extensionCents,
-      )} added · balance ${formatMoney(
-        result.outstandingCents,
-      )}.`;
-    });
+        return `Rental extended · ${formatMoney(
+          result.extensionCents,
+        )} added · balance ${formatMoney(
+          result.outstandingCents,
+        )}.`;
+      },
+    );
   }
 
   function completeReturn(
@@ -722,115 +1111,134 @@ export function ReservationComposer() {
         formElement,
       );
 
-    void run(async () => {
-      const amount =
-        String(
-          form.get(
-            "adjustmentAmount",
-          ),
-        );
+    void run(
+      async () => {
+        const amount =
+          String(
+            form.get(
+              "adjustmentAmount",
+            ),
+          );
 
-      const adjustments =
-        amount
-          ? [
-              {
-                type:
+        const adjustments =
+          amount
+            ? [
+                {
+                  type:
+                    String(
+                      form.get(
+                        "adjustmentType",
+                      ),
+                    ),
+
+                  amountCents:
+                    Math.round(
+                      Number(
+                        amount,
+                      ) * 100,
+                    ),
+
+                  note:
+                    String(
+                      form.get(
+                        "adjustmentNote",
+                      ),
+                    ).trim() ||
+                    "Return adjustment",
+                },
+              ]
+            : [];
+
+        const result =
+          await callFirestoreOperation<
+            {
+              rentalId: string;
+              actualReturnAt: string;
+              returnFuelLevel: string;
+              returnOdometer: {
+                value: number;
+                unit:
+                  | "km"
+                  | "mi";
+              };
+              adjustments: Array<{
+                type: string;
+                amountCents: number;
+                note: string;
+              }>;
+              notes:
+                | string
+                | null;
+              returnMedia: CloudinaryMedia[];
+            },
+            {
+              outstandingCents: number;
+            }
+          >(
+            "returnRental",
+            {
+              rentalId:
+                String(
+                  form.get(
+                    "rentalId",
+                  ),
+                ),
+
+              actualReturnAt:
+                localToIso(
+                  form.get(
+                    "actualReturnAt",
+                  ),
+                ),
+
+              returnFuelLevel:
+                String(
+                  form.get(
+                    "returnFuelLevel",
+                  ),
+                ),
+
+              returnOdometer: {
+                value: Number(
+                  form.get(
+                    "returnOdometerValue",
+                  ),
+                ),
+                unit:
                   String(
                     form.get(
-                      "adjustmentType",
+                      "returnOdometerUnit",
                     ),
-                  ),
-
-                amountCents:
-                  Math.round(
-                    Number(
-                      amount,
-                    ) * 100,
-                  ),
-
-                note:
-                  String(
-                    form.get(
-                      "adjustmentNote",
-                    ),
-                  ).trim() ||
-                  "Return adjustment",
+                  ) as
+                    | "km"
+                    | "mi",
               },
-            ]
-          : [];
 
-      const result =
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            actualReturnAt: string;
-            returnFuelLevel: string;
-            returnOdometerKm: number;
+              adjustments,
 
-            adjustments: Array<{
-              type: string;
-              amountCents: number;
-              note: string;
-            }>;
+              notes:
+                String(
+                  form.get(
+                    "notes",
+                  ),
+                ).trim() ||
+                null,
 
-            notes: string | null;
-            returnMedia: CloudinaryMedia[];
-          },
-          {
-            outstandingCents: number;
-          }
-        >(
-          "returnRental",
-          {
-            rentalId:
-              String(
-                form.get(
-                  "rentalId",
-                ),
-              ),
+              returnMedia,
+            },
+          );
 
-            actualReturnAt:
-              localToIso(
-                form.get(
-                  "actualReturnAt",
-                ),
-              ),
+        formElement.reset();
 
-            returnFuelLevel:
-              String(
-                form.get(
-                  "returnFuelLevel",
-                ),
-              ),
-
-            returnOdometerKm:
-              Number(
-                form.get(
-                  "returnOdometerKm",
-                ),
-              ),
-
-            adjustments,
-
-            notes:
-              String(
-                form.get(
-                  "notes",
-                ),
-              ).trim() || null,
-
-            returnMedia,
-          },
+        setReturnMedia(
+          [],
         );
 
-      formElement.reset();
-
-      setReturnMedia([]);
-
-      return `Return completed · outstanding balance ${formatMoney(
-        result.outstandingCents,
-      )}.`;
-    });
+        return `Return completed · outstanding balance ${formatMoney(
+          result.outstandingCents,
+        )}.`;
+      },
+    );
   }
 
   function recordPayment(
@@ -846,65 +1254,141 @@ export function ReservationComposer() {
         formElement,
       );
 
-    void run(async () => {
-      const result =
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            amountCents: number;
-            method: string;
-            externalReference:
-              | string
-              | null;
-            idempotencyKey: string;
-          },
-          {
-            outstandingCents: number;
-          }
-        >(
-          "recordRentalPayment",
-          {
-            rentalId:
-              String(
+    void run(
+      async () => {
+        const additionalFees =
+          paymentFeeOptions
+            .map((fee) => {
+              const selected =
                 form.get(
-                  "rentalId",
-                ),
-              ),
+                  fee.selectedName,
+                ) === "on";
 
-            amountCents:
-              Math.round(
-                Number(
+              if (!selected) {
+                return null;
+              }
+
+              const rawAmount =
+                String(
                   form.get(
-                    "amount",
+                    fee.amountName,
+                  ) ??
+                    "",
+                ).trim();
+
+              if (!rawAmount) {
+                throw new Error(
+                  `${fee.label} was selected but no amount was entered.`,
+                );
+              }
+
+              const amountCents =
+                Math.round(
+                  Number(
+                    rawAmount,
+                  ) * 100,
+                );
+
+              if (
+                !Number.isFinite(
+                  amountCents,
+                ) ||
+                amountCents <=
+                  0
+              ) {
+                throw new Error(
+                  `${fee.label} amount must be greater than zero.`,
+                );
+              }
+
+              return {
+                type: fee.type,
+                amountCents,
+              };
+            })
+            .filter(
+              (
+                fee,
+              ): fee is {
+                type: (
+                  typeof paymentFeeOptions
+                )[number]["type"];
+                amountCents: number;
+              } =>
+                fee !== null,
+            );
+
+        const result =
+          await callFirestoreOperation<
+            {
+              rentalId: string;
+              amountCents: number;
+              method: string;
+              externalReference:
+                | string
+                | null;
+              additionalFees: Array<{
+                type:
+                  | "car_seat"
+                  | "insurance"
+                  | "cleaning"
+                  | "smoke_fee"
+                  | "refueling";
+                amountCents: number;
+              }>;
+              idempotencyKey: string;
+            },
+            {
+              outstandingCents: number;
+            }
+          >(
+            "recordRentalPayment",
+            {
+              rentalId:
+                String(
+                  form.get(
+                    "rentalId",
                   ),
-                ) * 100,
-              ),
-
-            method:
-              String(
-                form.get(
-                  "method",
                 ),
-              ),
 
-            externalReference:
-              String(
-                form.get(
-                  "reference",
+              amountCents:
+                Math.round(
+                  Number(
+                    form.get(
+                      "amount",
+                    ),
+                  ) * 100,
                 ),
-              ).trim() || null,
 
-            idempotencyKey:
-              crypto.randomUUID(),
-          },
-        );
+              method:
+                String(
+                  form.get(
+                    "method",
+                  ),
+                ),
 
-      formElement.reset();
+              externalReference:
+                String(
+                  form.get(
+                    "reference",
+                  ),
+                ).trim() ||
+                null,
 
-      return `Payment recorded · outstanding balance ${formatMoney(
-        result.outstandingCents,
-      )}.`;
-    });
+              additionalFees,
+
+              idempotencyKey:
+                crypto.randomUUID(),
+            },
+          );
+
+        formElement.reset();
+
+        return `Payment recorded · outstanding balance ${formatMoney(
+          result.outstandingCents,
+        )}.`;
+      },
+    );
   }
 
   return (
@@ -960,7 +1444,8 @@ export function ReservationComposer() {
       )}
 
       <section className="workflow-shell surface">
-        {tab === "booking" && (
+        {tab ===
+          "booking" && (
           <form
             className="form-grid"
             onSubmit={
@@ -994,14 +1479,38 @@ export function ReservationComposer() {
                 <button
                   className="text-button"
                   type="button"
-                  onClick={() =>
-                    setCustomerMode(
+                  onClick={() => {
+                    const nextMode =
                       customerMode ===
-                        "existing"
+                      "existing"
                         ? "new"
-                        : "existing",
-                    )
-                  }
+                        : "existing";
+
+                    setCustomerMode(
+                      nextMode,
+                    );
+
+                    if (
+                      nextMode ===
+                      "existing"
+                    ) {
+                      setNewCustomerId(
+                        null,
+                      );
+
+                      setNewCustomerLicencePath(
+                        null,
+                      );
+                    }
+
+                    setError(
+                      undefined,
+                    );
+
+                    setNotice(
+                      undefined,
+                    );
+                  }}
                 >
                   {customerMode ===
                   "existing"
@@ -1021,12 +1530,18 @@ export function ReservationComposer() {
                     />
 
                     <input
-                      ref={customerSearchInputRef}
+                      ref={
+                        customerSearchInputRef
+                      }
                       type="text"
                       defaultValue=""
-                      onChange={(event) =>
+                      onChange={(
+                        event,
+                      ) =>
                         setCustomerSearch(
-                          event.target.value,
+                          event
+                            .target
+                            .value,
                         )
                       }
                       placeholder="Search name, telephone or licence"
@@ -1054,9 +1569,7 @@ export function ReservationComposer() {
                     <div className="selected-customer">
                       <div className="selected-customer-icon">
                         <UserRound
-                          size={
-                            19
-                          }
+                          size={19}
                         />
                       </div>
 
@@ -1142,9 +1655,7 @@ export function ReservationComposer() {
                               </span>
 
                               <ChevronRight
-                                size={
-                                  16
-                                }
+                                size={16}
                               />
                             </button>
                           ),
@@ -1214,11 +1725,9 @@ export function ReservationComposer() {
                       Issuing country
                     </label>
 
-                    <input
+                    <CountrySelect
                       name="newCustomerCountry"
-                      minLength={2}
-                      maxLength={2}
-                      defaultValue="IN"
+                      required
                     />
                   </div>
 
@@ -1230,6 +1739,8 @@ export function ReservationComposer() {
                     <input
                       name="newCustomerExpiry"
                       type="date"
+                      min={tomorrowDate()}
+                      required
                     />
                   </div>
 
@@ -1244,154 +1755,253 @@ export function ReservationComposer() {
                     />
                   </div>
 
-                  <div className="form-actions">
-                    <button
-                      className="button button-secondary"
-                      type="button"
-                      disabled={busy}
-                      onClick={() => {
-                        const values = {
-                          fullName:
-                            (
-                              document.querySelector<HTMLInputElement>(
-                                'input[name="newCustomerFullName"]',
-                              )?.value ||
-                              ""
-                            ).trim(),
-
-                          telephone:
-                            (
-                              document.querySelector<HTMLInputElement>(
-                                'input[name="newCustomerTelephone"]',
-                              )?.value ||
-                              ""
-                            ).trim(),
-
-                          email:
-                            (
-                              document.querySelector<HTMLInputElement>(
-                                'input[name="newCustomerEmail"]',
-                              )?.value ||
-                              ""
-                            ).trim() ||
-                            null,
-
-                          licenceNumber:
-                            (
-                              document.querySelector<HTMLInputElement>(
-                                'input[name="newCustomerLicence"]',
-                              )?.value ||
-                              ""
-                            ).trim(),
-
-                          licenceCountry:
-                            (
-                              document.querySelector<HTMLInputElement>(
-                                'input[name="newCustomerCountry"]',
-                              )?.value ||
-                              "IN"
-                            )
-                              .trim()
-                              .toUpperCase(),
-
-                          licenceExpiresAt:
-                            document.querySelector<HTMLInputElement>(
-                              'input[name="newCustomerExpiry"]',
-                            )?.value ||
-                            "",
-
-                          address:
-                            (
-                              document.querySelector<HTMLInputElement>(
-                                'input[name="newCustomerAddress"]',
-                              )?.value ||
-                              ""
-                            ).trim() ||
-                            null,
-                        };
-
-                        if (
-                          !values.fullName ||
-                          !values.telephone ||
-                          !values.licenceNumber ||
-                          values
-                            .licenceCountry
-                            .length !==
-                            2 ||
-                          !values.licenceExpiresAt
-                        ) {
-                          setError(
-                            "Complete the required customer details before saving.",
-                          );
-
-                          return;
+                  {newCustomerId ? (
+                    <div className="field full">
+                      <CustomerLicenseCapture
+                        customerId={
+                          newCustomerId
                         }
+                        value={
+                          newCustomerLicencePath
+                        }
+                        onChange={
+                          handleNewCustomerLicenceChange
+                        }
+                      />
 
-                        void run(
-                          async () => {
-                            const result =
-                              await callFirestoreOperation<
-                                {
-                                  fullName: string;
-                                  telephone: string;
-                                  email:
-                                    | string
-                                    | null;
-                                  address:
-                                    | string
-                                    | null;
-                                  licenceNumber: string;
-                                  licenceCountry: string;
-                                  licenceExpiresAt: string;
-                                  dateOfBirth:
-                                    | string
-                                    | null;
-                                  notes:
-                                    | string
-                                    | null;
-                                  licenceStoragePath:
-                                    | string
-                                    | null;
-                                },
-                                {
-                                  customerId: string;
-                                }
-                              >(
-                                "createOrUpdateCustomer",
-                                {
-                                  ...values,
-                                  dateOfBirth:
-                                    null,
-                                  notes:
-                                    null,
-                                  licenceStoragePath:
-                                    null,
-                                },
-                              );
+                      {!newCustomerLicencePath && (
+                        <p className="form-help">
+                          Capture the driver's
+                          licence photo before this
+                          customer can be used on a
+                          booking.
+                        </p>
+                      )}
+
+                      <div className="form-actions">
+                        <button
+                          className="button button-primary"
+                          type="button"
+                          disabled={
+                            busy ||
+                            !newCustomerLicencePath
+                          }
+                          onClick={() => {
+                            if (
+                              !newCustomerId ||
+                              !newCustomerLicencePath
+                            ) {
+                              return;
+                            }
 
                             setCustomerMode(
                               "existing",
                             );
 
                             setSelectedCustomerId(
-                              result.customerId,
+                              newCustomerId,
                             );
 
                             setCustomerSearch(
                               "",
                             );
 
-                            return "Customer saved and selected for this booking.";
-                          },
-                        );
-                      }}
-                    >
-                      <Plus
-                        size={16}
-                      />
-                      Save and use customer
-                    </button>
-                  </div>
+                            setNewCustomerId(
+                              null,
+                            );
+
+                            setNewCustomerLicencePath(
+                              null,
+                            );
+                          }}
+                        >
+                          Use customer
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="form-actions">
+                      <button
+                        className="button button-secondary"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          const values =
+                            {
+                              fullName:
+                                (
+                                  document.querySelector<HTMLInputElement>(
+                                    'input[name="newCustomerFullName"]',
+                                  )?.value ||
+                                  ""
+                                ).trim(),
+
+                              telephone:
+                                (
+                                  document.querySelector<HTMLInputElement>(
+                                    'input[name="newCustomerTelephone"]',
+                                  )?.value ||
+                                  ""
+                                ).trim(),
+
+                              email:
+                                (
+                                  document.querySelector<HTMLInputElement>(
+                                    'input[name="newCustomerEmail"]',
+                                  )?.value ||
+                                  ""
+                                ).trim() ||
+                                null,
+
+                              licenceNumber:
+                                (
+                                  document.querySelector<HTMLInputElement>(
+                                    'input[name="newCustomerLicence"]',
+                                  )?.value ||
+                                  ""
+                                ).trim(),
+
+                              licenceCountry:
+                                (
+                                  document.querySelector<HTMLSelectElement>(
+                                    'select[name="newCustomerCountry"]',
+                                  )?.value ||
+                                  ""
+                                )
+                                  .trim()
+                                  .toUpperCase(),
+
+                              licenceExpiresAt:
+                                document.querySelector<HTMLInputElement>(
+                                  'input[name="newCustomerExpiry"]',
+                                )?.value ||
+                                "",
+
+                              address:
+                                (
+                                  document.querySelector<HTMLInputElement>(
+                                    'input[name="newCustomerAddress"]',
+                                  )?.value ||
+                                  ""
+                                ).trim() ||
+                                null,
+                            };
+
+                          if (
+                            !values.fullName ||
+                            !values.telephone ||
+                            !values.licenceNumber ||
+                            values
+                              .licenceCountry
+                              .length !==
+                              2 ||
+                            !values.licenceExpiresAt
+                          ) {
+                            setError(
+                              "Complete the required customer details before saving.",
+                            );
+
+                            return;
+                          }
+
+                          const today =
+                            new Date();
+
+                          today.setHours(
+                            0,
+                            0,
+                            0,
+                            0,
+                          );
+
+                          const licenceExpiry =
+                            new Date(
+                              `${values.licenceExpiresAt}T00:00:00`,
+                            );
+
+                          licenceExpiry.setHours(
+                            0,
+                            0,
+                            0,
+                            0,
+                          );
+
+                          if (
+                            Number.isNaN(
+                              licenceExpiry.getTime(),
+                            ) ||
+                            licenceExpiry.getTime() <=
+                              today.getTime()
+                          ) {
+                            setError(
+                              "Licence expiry must be after today.",
+                            );
+
+                            return;
+                          }
+
+                          void run(
+                            async () => {
+                              const result =
+                                await callFirestoreOperation<
+                                  {
+                                    fullName: string;
+                                    telephone: string;
+                                    email:
+                                      | string
+                                      | null;
+                                    address:
+                                      | string
+                                      | null;
+                                    licenceNumber: string;
+                                    licenceCountry: string;
+                                    licenceExpiresAt: string;
+                                    dateOfBirth:
+                                      | string
+                                      | null;
+                                    notes:
+                                      | string
+                                      | null;
+                                    licenceStoragePath:
+                                      | string
+                                      | null;
+                                  },
+                                  {
+                                    customerId: string;
+                                  }
+                                >(
+                                  "createOrUpdateCustomer",
+                                  {
+                                    ...values,
+                                    dateOfBirth:
+                                      null,
+                                    notes:
+                                      null,
+                                    licenceStoragePath:
+                                      null,
+                                  },
+                                );
+
+                              setNewCustomerId(
+                                result.customerId,
+                              );
+
+                              setNewCustomerLicencePath(
+                                null,
+                              );
+
+                              return "Customer saved. Capture the driver's licence.";
+                            },
+                          );
+                        }}
+                      >
+                        <Plus
+                          size={16}
+                        />
+                        Save customer
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1421,15 +2031,30 @@ export function ReservationComposer() {
 
                     return (
                       <option
-                        value={vehicle.id}
-                        key={vehicle.id}
-                        disabled={!isBookable}
+                        value={
+                          vehicle.id
+                        }
+                        key={
+                          vehicle.id
+                        }
+                        disabled={
+                          !isBookable
+                        }
                       >
-                        {vehicle.registrationNumber}
+                        {
+                          vehicle.registrationNumber
+                        }
                         {" · "}
-                        {vehicle.make} {vehicle.model}
+                        {
+                          vehicle.make
+                        }{" "}
+                        {
+                          vehicle.model
+                        }
                         {!isBookable
-                          ? ` · ${formatVehicleStatus(vehicle.status)}`
+                          ? ` · ${formatVehicleStatus(
+                              vehicle.status,
+                            )}`
                           : ""}
                       </option>
                     );
@@ -1437,12 +2062,17 @@ export function ReservationComposer() {
                 )}
               </select>
 
-              {vehicles.length > 0 &&
+              {vehicles.length >
+                0 &&
                 !vehicles.some(
                   (vehicle) =>
                     vehicle.status ===
                     "available",
-                
+                ) && (
+                  <p className="form-help">
+                    No vehicles are
+                    currently available.
+                  </p>
                 )}
             </div>
 
@@ -1472,16 +2102,74 @@ export function ReservationComposer() {
               />
             </div>
 
+            <div className="field">
+              <label>
+                Pickup location
+              </label>
+
+              <input
+                name="pickupLocation"
+                type="text"
+                maxLength={300}
+                placeholder="e.g. Downtown office"
+              />
+            </div>
+
+            <div className="field">
+              <label>
+                Drop-off location
+              </label>
+
+              <input
+                name="dropoffLocation"
+                type="text"
+                maxLength={300}
+                placeholder="e.g. Airport terminal"
+              />
+            </div>
+
             <div className="field full">
               <MediaCapture
                 stage="booking"
-                value={bookingMedia}
+                value={
+                  bookingMedia
+                }
                 onChange={
                   setBookingMedia
                 }
                 label="Vehicle condition at booking"
-                hint="Capture exterior and interior photos or video before confirming the booking."
+                hint="Capture exterior and interior photos before confirming the booking."
               />
+            </div>
+
+            <div className="field full">
+              <CustomerSignaturePad
+                value={
+                  customerSignature
+                }
+                onChange={
+                  setCustomerSignature
+                }
+                disabled={busy}
+              />
+            </div>
+
+            <div className="field full">
+              {selectedCustomer?.email ? (
+                <p className="form-help">
+                  The rental agreement will be
+                  emailed automatically to{" "}
+                  {selectedCustomer.email} after
+                  the booking is confirmed.
+                </p>
+              ) : (
+                <p className="form-help">
+                  No customer email is available.
+                  The booking can still be
+                  confirmed, but the rental
+                  agreement cannot be emailed.
+                </p>
+              )}
             </div>
 
             <div className="field full">
@@ -1500,6 +2188,7 @@ export function ReservationComposer() {
                 disabled={
                   busy ||
                   !selectedCustomerId ||
+                  !customerSignature ||
                   !vehicles.some(
                     (vehicle) =>
                       vehicle.status ===
@@ -1513,10 +2202,13 @@ export function ReservationComposer() {
           </form>
         )}
 
-        {tab === "checkout" && (
+        {tab ===
+          "checkout" && (
           <form
             className="form-grid"
-            onSubmit={checkout}
+            onSubmit={
+              checkout
+            }
           >
             <div className="form-section">
               <p className="section-kicker">
@@ -1553,7 +2245,9 @@ export function ReservationComposer() {
                 </option>
 
                 {reservations.map(
-                  (reservation) => (
+                  (
+                    reservation,
+                  ) => (
                     <option
                       value={
                         reservation.id
@@ -1577,17 +2271,41 @@ export function ReservationComposer() {
 
             <div className="field">
               <label>
-                Pickup odometer (km)
+                Pickup odometer
               </label>
 
-              <input
-                name="pickupOdometerKm"
-                type="number"
-                min="0"
-                step="1"
-                inputMode="numeric"
-                required
-              />
+              <div
+                style={{
+                  display:
+                    "grid",
+                  gridTemplateColumns:
+                    "1fr auto",
+                  gap: 12,
+                }}
+              >
+                <input
+                  name="pickupOdometerValue"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  inputMode="decimal"
+                  required
+                />
+
+                <select
+                  name="pickupOdometerUnit"
+                  defaultValue="km"
+                  aria-label="Pickup odometer unit"
+                >
+                  <option value="km">
+                    Kilometers
+                  </option>
+
+                  <option value="mi">
+                    Miles
+                  </option>
+                </select>
+              </div>
             </div>
 
             <div className="field">
@@ -1601,12 +2319,18 @@ export function ReservationComposer() {
                 {fuelLevels.map(
                   (level) => (
                     <option
-                      key={level}
-                      value={level}
+                      key={
+                        level
+                      }
+                      value={
+                        level
+                      }
                     >
-                      {formatFuel(
-                        level,
-                      )}
+                      {
+                        formatFuel(
+                          level,
+                        )
+                      }
                     </option>
                   ),
                 )}
@@ -1637,10 +2361,13 @@ export function ReservationComposer() {
           </form>
         )}
 
-        {tab === "extend" && (
+        {tab ===
+          "extend" && (
           <form
             className="form-grid"
-            onSubmit={extend}
+            onSubmit={
+              extend
+            }
           >
             <div className="form-section">
               <p className="section-kicker">
@@ -1679,8 +2406,12 @@ export function ReservationComposer() {
                 {rentals.map(
                   (rental) => (
                     <option
-                      value={rental.id}
-                      key={rental.id}
+                      value={
+                        rental.id
+                      }
+                      key={
+                        rental.id
+                      }
                     >
                       {
                         rental.vehicleRegistration
@@ -1739,7 +2470,8 @@ export function ReservationComposer() {
           </form>
         )}
 
-        {tab === "return" && (
+        {tab ===
+          "return" && (
           <form
             className="form-grid"
             onSubmit={
@@ -1822,17 +2554,41 @@ export function ReservationComposer() {
 
             <div className="field">
               <label>
-                Return odometer (km)
+                Return odometer
               </label>
 
-              <input
-                name="returnOdometerKm"
-                type="number"
-                min="0"
-                step="1"
-                inputMode="numeric"
-                required
-              />
+              <div
+                style={{
+                  display:
+                    "grid",
+                  gridTemplateColumns:
+                    "1fr auto",
+                  gap: 12,
+                }}
+              >
+                <input
+                  name="returnOdometerValue"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  inputMode="decimal"
+                  required
+                />
+
+                <select
+                  name="returnOdometerUnit"
+                  defaultValue="km"
+                  aria-label="Return odometer unit"
+                >
+                  <option value="km">
+                    Kilometers
+                  </option>
+
+                  <option value="mi">
+                    Miles
+                  </option>
+                </select>
+              </div>
             </div>
 
             <div className="field">
@@ -1846,12 +2602,18 @@ export function ReservationComposer() {
                 {fuelLevels.map(
                   (level) => (
                     <option
-                      key={level}
-                      value={level}
+                      key={
+                        level
+                      }
+                      value={
+                        level
+                      }
                     >
-                      {formatFuel(
-                        level,
-                      )}
+                      {
+                        formatFuel(
+                          level,
+                        )
+                      }
                     </option>
                   ),
                 )}
@@ -1869,18 +2631,23 @@ export function ReservationComposer() {
                 <option value="fuel">
                   Fuel charge
                 </option>
+
                 <option value="cleaning">
                   Cleaning fee
                 </option>
+
                 <option value="damage">
                   Damage charge
                 </option>
+
                 <option value="late_fee">
                   Late fee
                 </option>
+
                 <option value="discount">
                   Discount
                 </option>
+
                 <option value="other">
                   Other
                 </option>
@@ -1915,7 +2682,9 @@ export function ReservationComposer() {
             <div className="field full">
               <MediaCapture
                 stage="return"
-                value={returnMedia}
+                value={
+                  returnMedia
+                }
                 onChange={
                   setReturnMedia
                 }
@@ -1948,7 +2717,8 @@ export function ReservationComposer() {
           </form>
         )}
 
-        {tab === "payment" && (
+        {tab ===
+          "payment" && (
           <form
             className="form-grid"
             onSubmit={
@@ -1986,10 +2756,10 @@ export function ReservationComposer() {
                   value=""
                   disabled
                 >
-                  Select active rental
+                  Select rental with balance
                 </option>
 
-                {rentals.map(
+                {payableRentals.map(
                   (rental) => (
                     <option
                       value={
@@ -2006,6 +2776,11 @@ export function ReservationComposer() {
                       {
                         rental.customerName
                       }
+                      {" · "}
+                      {formatMoney(
+                        rental.outstandingCents,
+                      )}{" "}
+                      due
                     </option>
                   ),
                 )}
@@ -2054,6 +2829,54 @@ export function ReservationComposer() {
 
             <div className="field full">
               <label>
+                Additional fees
+              </label>
+
+              <div
+                className="form-grid"
+                style={{
+                  marginTop: 8,
+                }}
+              >
+                {paymentFeeOptions.map(
+                  (fee) => (
+                    <div
+                      className="field"
+                      key={
+                        fee.type
+                      }
+                    >
+                      <label>
+                        <input
+                          name={
+                            fee.selectedName
+                          }
+                          type="checkbox"
+                        />{" "}
+                        {
+                          fee.label
+                        }
+                      </label>
+
+                      <input
+                        name={
+                          fee.amountName
+                        }
+                        type="number"
+                        min="0.01"
+                        max="100000"
+                        step="0.01"
+                        inputMode="decimal"
+                        placeholder="Amount (USD)"
+                      />
+                    </div>
+                  ),
+                )}
+              </div>
+            </div>
+
+            <div className="field full">
+              <label>
                 Reference
               </label>
 
@@ -2068,7 +2891,7 @@ export function ReservationComposer() {
                 className="button button-primary"
                 disabled={
                   busy ||
-                  !rentals.length
+                  !payableRentals.length
                 }
               >
                 Record payment
