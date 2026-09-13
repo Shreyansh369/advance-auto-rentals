@@ -5737,6 +5737,15 @@ canvas {
   overflow-wrap: anywhere;
 }
 
+/* Qualifier under a metric whose window differs from the
+   filter above it. */
+.metric-note {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .signature-mode {
   display: flex;
   flex-wrap: wrap;

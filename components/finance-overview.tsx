@@ -397,6 +397,13 @@ export function FinanceOverview() {
       value: data?.outstandingCents,
       icon: CircleDollarSign,
       tone: "red",
+
+      /*
+       * The only figure here that is not confined to the
+       * selected dates: it is what is owed today, across every
+       * rental, so it has to say so beside a date filter.
+       */
+      note: "All unpaid rentals, any date",
     },
   ];
 
@@ -525,6 +532,7 @@ export function FinanceOverview() {
             value,
             icon: Icon,
             tone,
+            note,
           }) => (
             <article
               className="metric-card"
@@ -544,6 +552,12 @@ export function FinanceOverview() {
                     ? "—"
                     : formatMoney(value)}
                 </strong>
+
+                {note && (
+                  <small className="metric-note">
+                    {note}
+                  </small>
+                )}
               </div>
             </article>
           ),

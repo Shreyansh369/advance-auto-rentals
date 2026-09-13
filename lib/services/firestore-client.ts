@@ -4902,19 +4902,31 @@ async function getFinancialOverview(
     refundedCents -
     expensesCents;
 
-  const outstandingCents =
-    filteredFinancial.reduce(
-      (
-        sum,
-        record,
-      ) =>
-        sum +
-        Number(
-          record.outstandingCents ??
-            0,
-        ),
-      0,
-    );
+  /*
+   * Outstanding is what is owed right now, so it deliberately
+   * ignores the date window. Filtering it by the date a rental
+   * was created hid every older debt: a rental from two months
+   * ago with money still on it reported as nothing owed while
+   * this month was on screen. The vehicle filter still applies,
+   * because that narrows which debts are being asked about
+   * rather than when they were incurred.
+   */
+  const unsettled = financialRecords.filter(
+    (record) =>
+      matchesVehicle(record) &&
+      Number(
+        record.outstandingCents ?? 0,
+      ) > 0,
+  );
+
+  const outstandingCents = unsettled.reduce(
+    (sum, record) =>
+      sum +
+      Number(
+        record.outstandingCents ?? 0,
+      ),
+    0,
+  );
 
   const vehicleMap =
   new Map<
@@ -5135,13 +5147,7 @@ operatingMarginCents:
       );
 
   const outstandingRentals =
-    filteredFinancial.filter(
-      (record) =>
-        Number(
-          record.outstandingCents ??
-            0,
-        ) > 0,
-    ).length;
+    unsettled.length;
 
   return {
     from:
