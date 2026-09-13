@@ -107,6 +107,72 @@ function statusTone(
 }
 
 /*
+ * The agreement as plain text, for handing to the operator's
+ * own mail client. It is built from the same stored contract
+ * the printed sheet uses, so the customer receives the booking
+ * as it was saved rather than as it was typed.
+ */
+function agreementText(
+  contract: ReservationContract,
+): string {
+  const money = (
+    cents: number | null,
+  ): string =>
+    cents == null
+      ? "Not offered"
+      : formatMoney(cents);
+
+  return [
+    "ADVANCE AUTO RENTAL & REPAIRS",
+    "Rental agreement",
+    `Booking reference ${contract.reservationId}`,
+    "",
+    `Customer: ${contract.customer.fullName}`,
+    `Telephone: ${
+      contract.customer.telephone ||
+      "Not recorded"
+    }`,
+    `Licence: ${contract.customer.licenceNumber} (${contract.customer.licenceCountry})`,
+    "",
+    `Vehicle: ${contract.vehicle.registration} - ${contract.vehicle.make} ${contract.vehicle.model}`.trim(),
+    `Pickup: ${dateTime(contract.pickupAt)}`,
+    `Expected return: ${dateTime(
+      contract.expectedReturnAt,
+    )}`,
+    `Pickup location: ${
+      contract.pickupLocation ||
+      "Not recorded"
+    }`,
+    `Drop-off location: ${
+      contract.dropoffLocation ||
+      "Not recorded"
+    }`,
+    "",
+    `Rental days: ${contract.chargedDays}`,
+    `Daily rate: ${money(
+      contract.rateSnapshot.dailyCents,
+    )}`,
+    `Rental total: ${formatMoney(
+      contract.baseRentalCents,
+    )}`,
+    "",
+    `${
+      contract.customerSignatureMethod ===
+      "typed"
+        ? "Accepted by"
+        : "Signed by"
+    }: ${
+      contract.customerSignatureName ||
+      contract.customer.fullName
+    }`,
+    `Prepared by: ${contract.preparedBy}`,
+    ...(contract.notes
+      ? ["", `Note: ${contract.notes}`]
+      : []),
+  ].join("\n");
+}
+
+/*
  * The agreement is rebuilt from the stored booking every time
  * it is opened, so it always reflects the reservation that was
  * actually saved rather than whatever remains on the form.
@@ -308,6 +374,42 @@ export function RentalAgreement({
     });
   }
 
+  /*
+   * Sending through the mailer endpoint needs that endpoint
+   * deployed. Until it is — and as a fallback whenever it
+   * cannot be reached — the agreement can still be handed to
+   * whatever mail client the operator already has open. It
+   * costs no infrastructure and needs no Firebase plan.
+   */
+  function emailFromMailClient() {
+    if (!contract) {
+      return;
+    }
+
+    const to =
+      contract.customer.email ?? "";
+
+    const subject = `Rental agreement ${contract.reservationId} - ${contract.vehicle.registration}`;
+
+    const href = `mailto:${encodeURIComponent(
+      to,
+    )}?subject=${encodeURIComponent(
+      subject,
+    )}&body=${encodeURIComponent(
+      agreementText(contract),
+    )}`;
+
+    window.location.href = href;
+
+    setError(undefined);
+
+    setNotice(
+      to
+        ? `Opening your mail app with the agreement addressed to ${to}. Send it from there, then print or save a copy for the file.`
+        : "Opening your mail app with the agreement. This customer has no email address on file, so add the recipient yourself.",
+    );
+  }
+
   function emailContract() {
     void run(async () => {
       const result =
@@ -473,22 +575,39 @@ export function RentalAgreement({
                   </>
                 )}
 
-              {status ===
-                "approved" && (
+              {status === "approved" &&
+                mailerConfigured && (
+                  <button
+                    className="button button-primary compact"
+                    type="button"
+                    disabled={
+                      busy ||
+                      !recipientEmail
+                    }
+                    onClick={
+                      emailContract
+                    }
+                  >
+                    <Mail size={15} />
+                    Email to customer
+                  </button>
+                )}
+
+              {status === "approved" && (
                 <button
-                  className="button button-primary compact"
-                  type="button"
-                  disabled={
-                    busy ||
-                    !mailerConfigured ||
-                    !recipientEmail
+                  className={
+                    mailerConfigured
+                      ? "button button-secondary compact"
+                      : "button button-primary compact"
                   }
+                  type="button"
+                  disabled={busy}
                   onClick={
-                    emailContract
+                    emailFromMailClient
                   }
                 >
-                  <Mail size={15} />
-                  Email to customer
+                  <Send size={15} />
+                  Send from my mail app
                 </button>
               )}
             </div>
@@ -528,11 +647,13 @@ export function RentalAgreement({
           {status === "approved" &&
             !mailerConfigured && (
               <p className="form-help">
-                Email delivery is not
-                configured in this
-                deployment. The agreement
-                can still be printed or
-                saved as a PDF.
+                Automatic delivery is not
+                configured in this deployment,
+                so “Send from my mail app”
+                opens the agreement in your own
+                email client instead. It can
+                also be printed or saved as a
+                PDF.
               </p>
             )}
 
@@ -924,6 +1045,19 @@ export function RentalAgreement({
                     }
                     alt="Customer signature"
                   />
+                ) : contract.customerSignatureName ? (
+                  /*
+                   * A typed acceptance. It is shown in the
+                   * same place a drawn signature would be, and
+                   * labelled as typed below, so the agreement
+                   * never implies a signature that was not
+                   * given.
+                   */
+                  <p className="agreement-typed-signature">
+                    {
+                      contract.customerSignatureName
+                    }
+                  </p>
                 ) : (
                   <p className="quiet">
                     No signature was captured
@@ -932,10 +1066,11 @@ export function RentalAgreement({
                 )}
 
                 <small>
-                  {
-                    contract.customer
-                      .fullName
-                  }
+                  {contract.customerSignatureMethod ===
+                  "typed"
+                    ? `Accepted by ${contract.customer.fullName} — name entered, not signed`
+                    : contract.customer
+                        .fullName}
                 </small>
               </div>
 

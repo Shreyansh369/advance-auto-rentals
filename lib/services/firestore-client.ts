@@ -542,6 +542,30 @@ function trimmedOrNull(
 }
 
 /*
+ * Last resort for a staff name. A profile seeded by hand in
+ * the Firestore console often carries only a role and a
+ * status, and a raw user id printed on a rental agreement
+ * tells the reader nothing, so the signed-in account's own
+ * name or address is preferred over it.
+ */
+function signedInAccountName(
+  actorUid: string,
+): string {
+  const user =
+    getFirebaseClient().auth.currentUser;
+
+  if (user && user.uid === actorUid) {
+    return (
+      trimmedOrNull(user.displayName) ??
+      trimmedOrNull(user.email) ??
+      actorUid
+    );
+  }
+
+  return actorUid;
+}
+
+/*
  * The staff name shown on rentals and contracts comes from
  * the signed-in user's own profile document, never from the
  * form, so it cannot be spoofed by the browser.
@@ -573,7 +597,8 @@ async function actorNameSnapshot(
   }
 
   return (
-    trimmedOrNull(profile.email) ?? actorUid
+    trimmedOrNull(profile.email) ??
+    signedInAccountName(actorUid)
   );
 }
 
@@ -1406,6 +1431,8 @@ export type ReservationContract = {
     monthlyCents: number | null;
   };
   customerSignatureDataUrl: string | null;
+  customerSignatureName: string | null;
+  customerSignatureMethod: "drawn" | "typed" | null;
 };
 
 /*
@@ -1643,6 +1670,22 @@ async function getReservationContract(
       "string"
         ? reservation.customerSignatureDataUrl
         : null,
+
+    customerSignatureName: trimmedOrNull(
+      reservation.customerSignatureName,
+    ),
+
+    /*
+     * Bookings taken before the typed-name option existed
+     * carry no method, and every one of those was drawn.
+     */
+    customerSignatureMethod:
+      reservation.customerSignatureMethod ===
+      "typed"
+        ? "typed"
+        : reservation.customerSignatureDataUrl
+          ? "drawn"
+          : null,
   };
 }
 
@@ -1660,7 +1703,8 @@ async function createReservation(
     dropoffLocation: string | null;
     notes: string | null;
     bookingMedia: Array<Record<string, unknown>>;
-    customerSignatureDataUrl: string;
+    customerSignatureDataUrl: string | null;
+    customerSignatureName: string | null;
   },
 ): Promise<{
   reservationId: string;
@@ -1695,30 +1739,53 @@ async function createReservation(
   }
 
   /*
-   * The signature is stored on the booking itself as a PNG
-   * data URL. Firestore documents are limited to 1 MiB, so a
-   * signature large enough to threaten that limit is rejected
-   * rather than silently truncated.
+   * A booking is acknowledged either by a signature drawn on
+   * the device or by the customer's name typed in. Drawing is
+   * no longer required — a counter without a touchscreen, or
+   * a booking taken over the telephone, has no way to produce
+   * one — but one of the two has to be present, so every
+   * agreement records who accepted it.
    */
-  const signatureDataUrl =
-    String(
-      input.customerSignatureDataUrl ??
-        "",
-    );
+  const signatureDataUrl = trimmedOrNull(
+    input.customerSignatureDataUrl,
+  );
 
-  if (
-    !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(
-      signatureDataUrl,
-    )
-  ) {
+  const signatureName = trimmedOrNull(
+    input.customerSignatureName,
+  );
+
+  if (!signatureDataUrl && !signatureName) {
     throw new Error(
-      "Capture the customer signature before confirming the booking.",
+      "Capture the customer signature, or type the customer's name, before confirming the booking.",
     );
   }
 
-  if (signatureDataUrl.length > 400_000) {
+  if (signatureDataUrl) {
+    if (
+      !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(
+        signatureDataUrl,
+      )
+    ) {
+      throw new Error(
+        "The captured signature could not be read. Clear it and sign again.",
+      );
+    }
+
+    /*
+     * Firestore documents are limited to 1 MiB, so a
+     * signature large enough to threaten that limit is
+     * rejected rather than silently truncated.
+     */
+    if (signatureDataUrl.length > 400_000) {
+      throw new Error(
+        "The captured signature is too large. Clear it and sign again.",
+      );
+    }
+  }
+
+  if (signatureName && signatureName.length > 120) {
     throw new Error(
-      "The captured signature is too large. Clear it and sign again.",
+      "The typed name is too long.",
     );
   }
 
@@ -1896,6 +1963,14 @@ async function createReservation(
 
           customerSignatureDataUrl:
             signatureDataUrl,
+
+          customerSignatureName:
+            signatureName,
+
+          customerSignatureMethod:
+            signatureDataUrl
+              ? "drawn"
+              : "typed",
 
           customerSignatureCapturedAt:
             nowTimestamp(),
@@ -4764,16 +4839,32 @@ async function getFinancialOverview(
       0,
     );
 
+  /*
+   * Money received is counted from the ledger entry each
+   * payment writes, dated when the payment was taken.
+   *
+   * It used to be summed from rentalFinancials.paidCents,
+   * which is a running total on the rental and was filtered
+   * by the date the *rental* was created. A payment taken
+   * today against a rental that started last month therefore
+   * never appeared in this month's figures at all, and a
+   * rental created inside the window contributed its whole
+   * lifetime of payments to that window however long ago
+   * they were made.
+   */
+  const paymentEntries =
+    filteredLedger.filter(
+      (entry) =>
+        String(entry.entryType) ===
+        "payment",
+    );
+
   const receivedCents =
-    filteredFinancial.reduce(
-      (
-        sum,
-        record,
-      ) =>
+    paymentEntries.reduce(
+      (sum, entry) =>
         sum +
         Number(
-          record.paidCents ??
-            0,
+          entry.amountCents ?? 0,
         ),
       0,
     );
@@ -4876,26 +4967,56 @@ async function getFinancialOverview(
 
     current.invoicedCents +=
       Number(
-        record.totalCents ??
-          0,
+        record.totalCents ?? 0,
       );
 
-    current.receivedCents +=
+    current.refundedCents +=
       Number(
-        record.paidCents ??
-          0,
+        record.refundedCents ?? 0,
       );
-
-      current.refundedCents +=
-       Number(
-    record.refundedCents ??
-      0,
-  );
 
     vehicleMap.set(
       vehicleId,
       current,
     );
+  }
+
+  /*
+   * Received per vehicle comes from the same payment entries
+   * as the headline figure, so the breakdown always adds up
+   * to it. A payment against a vehicle with no other activity
+   * in the window still opens a row of its own.
+   */
+  for (const entry of paymentEntries) {
+    const vehicleId = String(
+      entry.vehicleId ?? "",
+    );
+
+    if (!vehicleId) {
+      continue;
+    }
+
+    const current =
+      vehicleMap.get(vehicleId) ?? {
+        vehicleRegistration: String(
+          entry.vehicleRegistration ??
+            registrationByVehicle.get(
+              vehicleId,
+            ) ??
+            vehicleId,
+        ),
+
+        invoicedCents: 0,
+        expensesCents: 0,
+        receivedCents: 0,
+        refundedCents: 0,
+      };
+
+    current.receivedCents += Number(
+      entry.amountCents ?? 0,
+    );
+
+    vehicleMap.set(vehicleId, current);
   }
 
   for (
@@ -5288,7 +5409,7 @@ async function actorProfileSnapshot(
     name:
       trimmedOrNull(profile.fullName) ??
       trimmedOrNull(profile.email) ??
-      actorUid,
+      signedInAccountName(actorUid),
 
     role: trimmedOrNull(profile.role),
   };
@@ -5961,10 +6082,17 @@ async function reviewContract(
              * so the snapshot records who signed and when.
              */
             signedByNameSnapshot: String(
-              customer.fullName ??
+              reservation.customerSignatureName ??
+                customer.fullName ??
                 reservation.customerNameSnapshot ??
                 "",
             ),
+
+            signatureMethod:
+              reservation.customerSignatureMethod ===
+              "typed"
+                ? "typed"
+                : "drawn",
 
             signatureCapturedAt:
               reservation.customerSignatureCapturedAt ==
@@ -6316,7 +6444,12 @@ export async function callFirestoreOperation<
             bookingMedia: Array<
               Record<string, unknown>
             >;
-            customerSignatureDataUrl: string;
+            customerSignatureDataUrl:
+              | string
+              | null;
+            customerSignatureName:
+              | string
+              | null;
           },
         )) as TResult
       );

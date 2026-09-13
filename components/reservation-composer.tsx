@@ -343,6 +343,13 @@ export function ReservationComposer() {
   const [payableRentals, setPayableRentals] =
     useState<PayableRental[]>([]);
 
+  /*
+   * Held in state rather than left to the form so a completed
+   * return can hand the rental straight to the payment tab.
+   */
+  const [paymentRentalId, setPaymentRentalId] =
+    useState("");
+
   const [bookingMedia, setBookingMedia] =
     useState<CloudinaryMedia[]>([]);
 
@@ -351,6 +358,17 @@ export function ReservationComposer() {
 
   const [customerSignature, setCustomerSignature] =
     useState<string | null>(null);
+
+  /*
+   * A counter without a touchscreen, or a booking taken over
+   * the telephone, cannot produce a drawn signature, so the
+   * customer's name may be typed instead.
+   */
+  const [signatureMode, setSignatureMode] =
+    useState<"draw" | "type">("draw");
+
+  const [signatureName, setSignatureName] =
+    useState("");
 
   /*
    * New-customer licence capture state.
@@ -1116,7 +1134,12 @@ export function ReservationComposer() {
                 | string
                 | null;
               bookingMedia: CloudinaryMedia[];
-              customerSignatureDataUrl: string;
+              customerSignatureDataUrl:
+                | string
+                | null;
+              customerSignatureName:
+                | string
+                | null;
             },
             {
               reservationId: string;
@@ -1179,8 +1202,15 @@ export function ReservationComposer() {
               bookingMedia,
 
               customerSignatureDataUrl:
-                customerSignature ||
-                "",
+                signatureMode === "draw"
+                  ? customerSignature
+                  : null,
+
+              customerSignatureName:
+                signatureMode === "type"
+                  ? signatureName.trim() ||
+                    null
+                  : null,
             },
           );
 
@@ -1199,6 +1229,8 @@ export function ReservationComposer() {
         setBookingMedia(
           [],
         );
+
+        setSignatureName("");
 
         setCustomerSignature(
           null,
@@ -1392,6 +1424,10 @@ export function ReservationComposer() {
         formElement,
       );
 
+    const returnedRentalId = String(
+      form.get("rentalId") ?? "",
+    );
+
     void run(
       async () => {
         const amount =
@@ -1474,12 +1510,7 @@ export function ReservationComposer() {
           >(
             "returnRental",
             {
-              rentalId:
-                String(
-                  form.get(
-                    "rentalId",
-                  ),
-                ),
+              rentalId: returnedRentalId,
 
               actualReturnAt:
                 localToIso(
@@ -1531,9 +1562,23 @@ export function ReservationComposer() {
           [],
         );
 
-        return `Return completed · outstanding balance ${formatMoney(
-          result.outstandingCents,
-        )}.`;
+        /*
+         * A return that leaves a balance goes straight to the
+         * payment tab with the rental already chosen, so the
+         * desk can settle it while the customer is still at
+         * the counter.
+         */
+        if (result.outstandingCents > 0) {
+          setPaymentRentalId(returnedRentalId);
+
+          setTab("payment");
+
+          return `Return completed · ${formatMoney(
+            result.outstandingCents,
+          )} outstanding. Take the payment below.`;
+        }
+
+        return `Return completed · nothing left to pay.`;
       },
     );
   }
@@ -1696,6 +1741,9 @@ export function ReservationComposer() {
         releaseOperationKey("payment");
 
         formElement.reset();
+
+        /* reset() cannot clear a controlled select. */
+        setPaymentRentalId("");
 
         return `Payment recorded · outstanding balance ${formatMoney(
           result.outstandingCents,
@@ -2813,15 +2861,79 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <CustomerSignaturePad
-                value={
-                  customerSignature
-                }
-                onChange={
-                  setCustomerSignature
-                }
-                disabled={busy}
-              />
+              <div className="signature-mode">
+                <button
+                  type="button"
+                  className={
+                    signatureMode === "draw"
+                      ? "button button-primary compact"
+                      : "button button-secondary compact"
+                  }
+                  aria-pressed={
+                    signatureMode === "draw"
+                  }
+                  onClick={() => {
+                    setSignatureMode("draw");
+                    setSignatureName("");
+                  }}
+                >
+                  Sign on device
+                </button>
+
+                <button
+                  type="button"
+                  className={
+                    signatureMode === "type"
+                      ? "button button-primary compact"
+                      : "button button-secondary compact"
+                  }
+                  aria-pressed={
+                    signatureMode === "type"
+                  }
+                  onClick={() => {
+                    setSignatureMode("type");
+                    setCustomerSignature(null);
+                  }}
+                >
+                  Type the name
+                </button>
+              </div>
+
+              {signatureMode === "draw" ? (
+                <CustomerSignaturePad
+                  value={
+                    customerSignature
+                  }
+                  onChange={
+                    setCustomerSignature
+                  }
+                  disabled={busy}
+                />
+              ) : (
+                <div className="field">
+                  <label htmlFor="signature-name">
+                    Customer name as accepted
+                  </label>
+
+                  <input
+                    id="signature-name"
+                    value={signatureName}
+                    maxLength={120}
+                    disabled={busy}
+                    placeholder="Typed by the customer, or read back and confirmed"
+                    onChange={(event) =>
+                      setSignatureName(
+                        event.target.value,
+                      )
+                    }
+                  />
+
+                  <p className="form-help">
+                    Recorded on the agreement in
+                    place of a drawn signature.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="field full">
@@ -2841,7 +2953,10 @@ export function ReservationComposer() {
                 disabled={
                   busy ||
                   !selectedCustomerId ||
-                  !customerSignature ||
+                  !(
+                    customerSignature ||
+                    signatureName.trim()
+                  ) ||
                   !vehicles.some(
                     (vehicle) =>
                       vehicle.status ===
@@ -3419,7 +3534,12 @@ export function ReservationComposer() {
                 id="rental"
                 name="rentalId"
                 required
-                defaultValue=""
+                value={paymentRentalId}
+                onChange={(event) =>
+                  setPaymentRentalId(
+                    event.target.value,
+                  )
+                }
               >
                 <option
                   value=""
