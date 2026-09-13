@@ -1505,21 +1505,26 @@ async function extendRental(
    Return
    ========================================================= */
 
+/* =========================================================
+   Return
+   ========================================================= */
+
 async function returnRental(
   input: {
     rentalId: string;
     actualReturnAt: string;
     returnFuelLevel: string;
-    returnOdometerKm: number;
+    returnOdometer: {
+      value: number;
+      unit: "km" | "mi";
+    };
     adjustments: Array<{
       type: string;
       amountCents: number;
       note: string;
     }>;
     notes: string | null;
-    returnMedia: Array<
-      Record<string, unknown>
-    >;
+    returnMedia: Array<Record<string, unknown>>;
   },
 ): Promise<{
   outstandingCents: number;
@@ -1607,8 +1612,46 @@ async function returnRental(
         );
       }
 
+      /*
+       * The UI allows the employee to enter either
+       * kilometres or miles. Convert miles to kilometres
+       * before storing the canonical odometer value.
+       */
+      const returnOdometerValue =
+        Number(
+          input.returnOdometer?.value,
+        );
+
+      const returnOdometerUnit =
+        input.returnOdometer?.unit;
+
       if (
-        input.returnOdometerKm <
+        !Number.isFinite(
+          returnOdometerValue,
+        ) ||
+        returnOdometerValue < 0
+      ) {
+        throw new Error(
+          "Return odometer must be a valid non-negative number.",
+        );
+      }
+
+      if (
+        returnOdometerUnit !== "km" &&
+        returnOdometerUnit !== "mi"
+      ) {
+        throw new Error(
+          "Return odometer unit must be km or mi.",
+        );
+      }
+
+      const returnOdometerKm =
+        returnOdometerUnit === "mi"
+          ? returnOdometerValue * 1.609344
+          : returnOdometerValue;
+
+      if (
+        returnOdometerKm <
         Number(
           rental.pickupOdometerKm ??
             0,
@@ -1619,8 +1662,40 @@ async function returnRental(
         );
       }
 
+      const returnFuelLevel =
+        String(
+          input.returnFuelLevel ?? "",
+        ).trim();
+
+      if (!returnFuelLevel) {
+        throw new Error(
+          "Return fuel level is required.",
+        );
+      }
+
+      const returnNotes =
+        input.notes == null
+          ? null
+          : String(
+              input.notes,
+            ).trim() || null;
+
+      const returnMedia =
+        Array.isArray(
+          input.returnMedia,
+        )
+          ? input.returnMedia
+          : [];
+
+      const adjustments =
+        Array.isArray(
+          input.adjustments,
+        )
+          ? input.adjustments
+          : [];
+
       const totalAdjustment =
-        input.adjustments.reduce(
+        adjustments.reduce(
           (
             total,
             adjustment,
@@ -1631,7 +1706,6 @@ async function returnRental(
                 adjustment.amountCents
               : total +
                 adjustment.amountCents,
-
           0,
         );
 
@@ -1649,7 +1723,9 @@ async function returnRental(
         ) +
         adjustmentCents;
 
-      if (totalCents < 0) {
+      if (
+        totalCents < 0
+      ) {
         throw new Error(
           "Adjustments produce an invalid rental total.",
         );
@@ -1658,18 +1734,21 @@ async function returnRental(
       outstandingCents =
         calculateBalance(
           totalCents,
-
           Number(
             financial.paidCents ??
               0,
           ),
-
           Number(
             financial.refundedCents ??
               0,
           ),
         );
 
+      /*
+       * Every value sent to Firestore is now explicitly
+       * defined or null. This prevents Firestore from
+       * rejecting the transaction because of undefined.
+       */
       transaction.update(
         rentalRef,
         {
@@ -1678,20 +1757,19 @@ async function returnRental(
 
           actualReturnAt,
 
-          returnFuelLevel:
-            input.returnFuelLevel,
+          returnFuelLevel,
 
-          returnOdometerKm:
-            input.returnOdometerKm,
+          returnOdometerKm,
 
-          returnNotes:
-            input.notes,
+          returnOdometerValue,
 
-          returnMedia:
-            input.returnMedia,
+          returnOdometerUnit,
 
-          adjustments:
-            input.adjustments,
+          returnNotes,
+
+          returnMedia,
+
+          adjustments,
 
           returnedBy:
             actorUid,
@@ -1742,7 +1820,7 @@ async function returnRental(
 
       for (
         const adjustment of
-        input.adjustments
+        adjustments
       ) {
         if (
           adjustment.amountCents <=
@@ -2762,15 +2840,16 @@ async function getFinancialOverview(
     );
 
   const vehicleMap =
-    new Map<
-      string,
-      {
-        vehicleRegistration: string;
-        invoicedCents: number;
-        expensesCents: number;
-        receivedCents: number;
-      }
-    >();
+  new Map<
+    string,
+    {
+      vehicleRegistration: string;
+      invoicedCents: number;
+      expensesCents: number;
+      receivedCents: number;
+      refundedCents: number;
+    }
+  >();
 
   for (
     const record of
@@ -2802,6 +2881,8 @@ async function getFinancialOverview(
         expensesCents: 0,
 
         receivedCents: 0,
+
+        refundedCents: 0,
       };
 
     current.invoicedCents +=
@@ -2815,6 +2896,12 @@ async function getFinancialOverview(
         record.paidCents ??
           0,
       );
+
+      current.refundedCents +=
+       Number(
+    record.refundedCents ??
+      0,
+  );
 
     vehicleMap.set(
       vehicleId,
@@ -2843,12 +2930,11 @@ async function getFinancialOverview(
         vehicleRegistration:
           vehicleId,
 
-        invoicedCents: 0,
-
-        expensesCents: 0,
-
-        receivedCents: 0,
-      };
+            invoicedCents: 0,
+    expensesCents: 0,
+    receivedCents: 0,
+    refundedCents: 0,
+  };
 
     current.expensesCents +=
       Number(
@@ -2882,11 +2968,12 @@ async function getFinancialOverview(
           item.expensesCents,
 
         receivedCents:
-          item.receivedCents,
+  item.receivedCents,
 
-        operatingMarginCents:
-          item.receivedCents -
-          item.expensesCents,
+operatingMarginCents:
+  item.invoicedCents -
+  item.refundedCents -
+  item.expensesCents,
       }),
     );
 
@@ -2965,9 +3052,9 @@ async function getFinancialOverview(
     netCashCents,
 
     operatingMarginCents:
-      receivedCents -
-      refundedCents -
-      expensesCents,
+  invoicedCents -
+  refundedCents -
+  expensesCents,
 
     outstandingCents,
 
@@ -3105,7 +3192,10 @@ export async function callFirestoreOperation<
             rentalId: string;
             actualReturnAt: string;
             returnFuelLevel: string;
-            returnOdometerKm: number;
+returnOdometer: {
+              value: number;
+              unit: "km" | "mi";
+            };
             adjustments: Array<{
               type: string;
               amountCents: number;

@@ -119,22 +119,22 @@ export function FinanceOverview() {
           fleet,
         ] = await Promise.all([
           callFirestoreOperation<
-  {
-    from: string;
-    to: string;
-    vehicleId: string | null;
-  },
-  FinancialData
->(
-  "getFinancialOverview",
-  {
-    from,
-    to,
-    vehicleId:
-      selectedVehicleId ||
-      null,
-  },
-),
+            {
+              from: string;
+              to: string;
+              vehicleId: string | null;
+            },
+            FinancialData
+          >(
+            "getFinancialOverview",
+            {
+              from,
+              to,
+              vehicleId:
+                selectedVehicleId ||
+                null,
+            },
+          ),
 
           getDocs(
             query(
@@ -193,12 +193,20 @@ export function FinanceOverview() {
   ) {
     event.preventDefault();
 
+    /*
+     * Capture the form before awaiting anything.
+     * React's event.currentTarget is not safe to
+     * access after an awaited async operation.
+     */
+    const formElement =
+      event.currentTarget;
+
+    const form =
+      new FormData(formElement);
+
     setSavingExpense(true);
     setError(undefined);
     setNotice(undefined);
-
-    const form =
-      new FormData(event.currentTarget);
 
     try {
       const amount =
@@ -277,7 +285,11 @@ export function FinanceOverview() {
         "Expense recorded.",
       );
 
-      event.currentTarget.reset();
+      /*
+       * Use the captured form element rather
+       * than event.currentTarget after await.
+       */
+      formElement.reset();
 
       await load();
     } catch (cause) {
@@ -368,6 +380,7 @@ export function FinanceOverview() {
                 : undefined
             }
           />
+
           Refresh
         </button>
       }
@@ -425,14 +438,16 @@ export function FinanceOverview() {
               All vehicles
             </option>
 
-            {vehicles.map((vehicle) => (
-              <option
-                key={vehicle.id}
-                value={vehicle.id}
-              >
-                {vehicle.label}
-              </option>
-            ))}
+            {vehicles.map(
+              (vehicle) => (
+                <option
+                  key={vehicle.id}
+                  value={vehicle.id}
+                >
+                  {vehicle.label}
+                </option>
+              ),
+            )}
           </select>
         </div>
 

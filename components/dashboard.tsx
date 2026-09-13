@@ -40,54 +40,63 @@ const cards: Array<{
   label: string;
   icon: typeof CarFront;
   tone: string;
+  href: "/vehicles" | "/rentals";
 }> = [
   {
     key: "totalFleet",
     label: "Fleet",
     icon: CarFront,
     tone: "navy",
+    href: "/vehicles",
   },
   {
     key: "available",
     label: "Available",
     icon: CheckCircle2,
     tone: "green",
+    href: "/vehicles",
   },
   {
     key: "reserved",
     label: "Reserved",
     icon: CalendarArrowUp,
     tone: "blue",
+    href: "/vehicles",
   },
   {
     key: "todayPickups",
     label: "Pickups today",
     icon: CalendarArrowUp,
     tone: "purple",
+    href: "/rentals",
   },
   {
     key: "todayReturns",
     label: "Returns today",
     icon: CalendarArrowDown,
     tone: "orange",
+    href: "/rentals",
   },
   {
     key: "overdue",
     label: "Overdue",
     icon: Clock3,
     tone: "red",
+    href: "/rentals",
   },
   {
     key: "maintenanceDue",
     label: "Service due",
     icon: Wrench,
     tone: "orange",
+    href: "/vehicles",
   },
   {
     key: "expiringDocuments",
     label: "Documents due",
     icon: AlertTriangle,
     tone: "yellow",
+    href: "/vehicles",
   },
 ];
 
@@ -185,10 +194,19 @@ export function Dashboard() {
             label,
             icon: Icon,
             tone,
+            href,
           }) => (
-            <article
-              className="metric-card"
+            <Link
+              className="metric-card metric-card-link"
               key={key}
+              href={href}
+              aria-label={`${label}: ${
+                summary ? summary[key] : "—"
+              }. Open ${
+                href === "/vehicles"
+                  ? "fleet"
+                  : "rentals"
+              }.`}
             >
               <div
                 className={`metric-icon ${tone}`}
@@ -205,7 +223,7 @@ export function Dashboard() {
                     : "—"}
                 </strong>
               </div>
-            </article>
+            </Link>
           ),
         )}
       </section>
@@ -408,7 +426,11 @@ export function Dashboard() {
           </div>
 
           <div className="attention-list">
-            <div>
+            <Link
+              href="/rentals"
+              className="attention-link"
+              aria-label="View overdue rentals"
+            >
               <span
                 className={
                   summary?.overdue
@@ -431,9 +453,13 @@ export function Dashboard() {
                   day
                 </span>
               </p>
-            </div>
+            </Link>
 
-            <div>
+            <Link
+              href="/vehicles"
+              className="attention-link"
+              aria-label="View vehicles needing service"
+            >
               <span
                 className={
                   summary?.maintenanceDue
@@ -456,9 +482,13 @@ export function Dashboard() {
                   Review fleet readiness
                 </span>
               </p>
-            </div>
+            </Link>
 
-            <div>
+            <Link
+              href="/vehicles"
+              className="attention-link"
+              aria-label="View vehicle compliance documents"
+            >
               <span
                 className={
                   summary?.expiringDocuments
@@ -483,7 +513,7 @@ export function Dashboard() {
                   Registration or insurance
                 </span>
               </p>
-            </div>
+            </Link>
           </div>
         </article>
       </section>
