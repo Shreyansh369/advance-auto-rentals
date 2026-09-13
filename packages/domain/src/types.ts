@@ -50,6 +50,17 @@ export interface Quote {
   currency: "USD";
 }
 
+/** Cloudinary image reference stored against a fleet record. */
+export interface VehiclePhoto {
+  url: string;
+  publicId: string;
+  format: string;
+  bytes: number;
+  originalFilename: string;
+  width?: number;
+  height?: number;
+}
+
 export interface VehicleDocument {
   registrationNumber: string;
   make: string;
@@ -65,6 +76,7 @@ export interface VehicleDocument {
   status: VehicleStatus;
   notes: string | null;
   photoPaths: string[];
+  photos?: VehiclePhoto[];
   createdAt: unknown;
   updatedAt: unknown;
 }

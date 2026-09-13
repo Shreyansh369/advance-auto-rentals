@@ -96,21 +96,44 @@ export function FirebaseProvider({
         >
       | undefined;
 
+    let initializationError:
+      | string
+      | undefined;
+
     try {
       firebaseClient =
         getFirebaseClient();
     } catch (error) {
-      setState({
-        status: "config-error",
-        user: null,
-        role: null,
-        message:
-          error instanceof Error
-            ? error.message
-            : "Firebase could not initialize.",
+      initializationError =
+        error instanceof Error
+          ? error.message
+          : "Firebase could not initialize.";
+    }
+
+    /*
+     * A failed initialization is reported from a task of its
+     * own so the provider never re-renders synchronously from
+     * inside this effect.
+     */
+    if (!firebaseClient) {
+      queueMicrotask(() => {
+        if (cancelled) {
+          return;
+        }
+
+        setState({
+          status: "config-error",
+          user: null,
+          role: null,
+          message:
+            initializationError ??
+            "Firebase could not initialize.",
+        });
       });
 
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
 
     const {

@@ -5,9 +5,11 @@ Secure operations software for Advance Auto Rentals. It is a separate applicatio
 ## Included
 
 - Next.js operations dashboard with Firebase Authentication gate
-- Firestore/Storage security rules, indexes, App Check-aware callable functions
-- Transactional reservation, checkout, return, pricing, payment and rate-change workflows
-- Immutable audit and financial ledger records
+- Firestore/Storage security rules and indexes
+- Transactional reservation, checkout, extension, return, pricing and payment workflows that run in the browser against Firestore, so no Blaze-plan Cloud Functions are required
+- Cloudinary media capture for vehicle condition photos, fleet photos and driver's licence images
+- Printable rental agreement rebuilt from the stored booking
+- Append-only audit and financial ledger records
 - Spreadsheet import that defaults to dry-run and produces a validation report
 - Emulator configuration, security-rule tests, unit tests, CI, and deployment/recovery documentation
 
@@ -39,7 +41,6 @@ pnpm lint
 pnpm typecheck
 pnpm test
 pnpm test:rules
-pnpm functions:build
 pnpm verify
 ```
 

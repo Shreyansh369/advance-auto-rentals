@@ -131,6 +131,20 @@ allow list: if isAdmin();
 
 
     /* =========================================================
+       VEHICLE UNIQUENESS CLAIMS
+       ========================================================= */
+
+    match /vehicleRegistry/{key} {
+
+      /* One document per registration number and VIN. Two
+         concurrent vehicle writes contend on the same claim,
+         so exactly one of them can take it. Staff may release
+         a claim when a vehicle is renamed. */
+      allow read, create, update, delete: if isStaff();
+    }
+
+
+    /* =========================================================
        CUSTOMERS
        ========================================================= */
 
@@ -179,6 +193,17 @@ allow list: if isAdmin();
       allow create, update: if isStaff();
 
       allow delete: if isAdmin();
+    }
+
+
+    match /rentals/{rentalId}/extensions/{extensionId} {
+
+      /* One record per extension, keyed by its idempotency
+         key. Append-only: an extension that has been priced
+         and charged cannot be rewritten from a browser. */
+      allow read, create: if isStaff();
+
+      allow update, delete: if false;
     }
 
 
@@ -270,7 +295,12 @@ allow list: if isAdmin();
 
     match /idempotencyKeys/{key} {
 
-      allow read, write: if isStaff();
+      /* Records are create-only so a completed payment,
+         refund or expense cannot be replayed by clearing
+         its key. */
+      allow read, create: if isStaff();
+
+      allow update, delete: if false;
     }
 
 

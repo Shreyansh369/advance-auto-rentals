@@ -79,19 +79,43 @@ export function AppShell({
   const router = useRouter();
   const pathname = usePathname();
 
-  const [open, setOpen] =
-    useState(false);
+  /*
+   * The menu records the route it was opened on so a route
+   * change closes it without an extra render pass.
+   */
+  const [menu, setMenu] =
+    useState<{
+      open: boolean;
+      path: string;
+    }>({
+      open: false,
+      path: pathname,
+    });
+
+  const open =
+    menu.open &&
+    menu.path === pathname;
+
+  function setOpen(
+    next: boolean | ((value: boolean) => boolean),
+  ) {
+    setMenu((current) => {
+      const currentlyOpen =
+        current.open &&
+        current.path === pathname;
+
+      return {
+        open:
+          typeof next === "function"
+            ? next(currentlyOpen)
+            : next,
+        path: pathname,
+      };
+    });
+  }
 
   const [loggingOut, setLoggingOut] =
     useState(false);
-
-  /*
-   * Close the mobile navigation whenever
-   * the route changes.
-   */
-  useEffect(() => {
-    setOpen(false);
-  }, [pathname]);
 
   /*
    * Prevent the mobile menu from scrolling

@@ -292,8 +292,8 @@ export function LoginForm() {
       <main className="auth-page-clean auth-status-page">
         <section className="auth-status-card">
           <img
-            src="/brand/logo.svg"
-            alt="Advance Auto Rentals"
+            src="/brand/advance-auto-rentals-logo.png"
+            alt="Advance Auto Rental &amp; Repairs"
             className="auth-status-logo"
           />
 
@@ -404,8 +404,8 @@ export function LoginForm() {
       <main className="auth-page-clean auth-status-page">
         <section className="auth-status-card">
           <img
-            src="/brand/logo.svg"
-            alt="Advance Auto Rentals"
+            src="/brand/advance-auto-rentals-logo.png"
+            alt="Advance Auto Rental &amp; Repairs"
             className="auth-status-logo"
           />
 
@@ -517,8 +517,8 @@ export function LoginForm() {
         <div className="auth-visual-top">
           <div className="auth-brand">
             <img
-              src="/brand/logo.svg"
-              alt="Advance Auto Rentals"
+              src="/brand/advance-auto-rentals-logo.png"
+              alt="Advance Auto Rental &amp; Repairs"
               className="auth-brand-logo"
             />
 
@@ -564,8 +564,8 @@ export function LoginForm() {
         <div className="auth-form-card">
           <div className="auth-mobile-brand">
             <img
-              src="/brand/logo.svg"
-              alt="Advance Auto Rentals"
+              src="/brand/advance-auto-rentals-logo.png"
+              alt="Advance Auto Rental &amp; Repairs"
               className="auth-brand-logo"
             />
 

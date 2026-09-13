@@ -3,17 +3,17 @@
 import {
   collection,
   doc,
+  getDoc,
   getDocs,
   limit,
   orderBy,
   query,
   runTransaction,
   serverTimestamp,
+  startAfter,
   Timestamp,
   where,
 } from "firebase/firestore";
-
-import { httpsCallable } from "firebase/functions";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 import {
@@ -90,18 +90,6 @@ export type FinancialOverview = {
   }>;
 };
 
-export type StaffRegistrationInput = {
-  fullName: string;
-  mobile: string;
-  age: number;
-  requestedRole: "admin" | "operations";
-};
-
-export type StaffRegistrationResult = {
-  uid: string;
-  status: "pending";
-};
-
 /*
  * Firestore documents returned by the Web SDK are intentionally
  * represented as flexible records in this migration layer.
@@ -127,25 +115,6 @@ function getActorUid(): string {
   }
 
   return user.uid;
-}
-
-async function callTrustedFunction<
-  TInput extends Record<string, unknown>,
-  TResult,
->(
-  name: string,
-  data: TInput,
-): Promise<TResult> {
-  const callable = httpsCallable<
-    TInput,
-    TResult
-  >(
-    getFirebaseClient().functions,
-    name,
-  );
-
-  const result = await callable(data);
-  return result.data;
 }
 
 function toIso(value: unknown): string {
@@ -182,71 +151,430 @@ function nowTimestamp() {
   return serverTimestamp();
 }
 
-/* =========================================================
-   Staff registration
-   ========================================================= */
+/*
+ * The browser is the only writer now that the workflows run
+ * directly against Firestore, so every value is validated
+ * here before it reaches a document. Firestore rejects an
+ * undefined field outright, and a NaN would silently corrupt
+ * a monetary total, so both are refused explicitly.
+ */
+const MAX_MONEY_CENTS = 10_000_000;
 
-export async function registerStaffProfile(
-  input: StaffRegistrationInput,
-): Promise<StaffRegistrationResult> {
-  const { auth, db } = getFirebaseClient();
+const FUEL_LEVELS = [
+  "empty",
+  "one_eighth",
+  "quarter",
+  "three_eighths",
+  "half",
+  "five_eighths",
+  "three_quarters",
+  "seven_eighths",
+  "full",
+] as const;
 
-  const user = auth.currentUser;
+function assertMoneyCents(
+  value: unknown,
+  label: string,
+): number {
+  const cents = Number(value);
 
-  if (!user) {
+  if (
+    !Number.isInteger(cents) ||
+    cents < 0 ||
+    cents > MAX_MONEY_CENTS
+  ) {
     throw new Error(
-      "Your account could not be verified. Please sign in again.",
+      `${label} must be a whole amount between $0 and $${(
+        MAX_MONEY_CENTS / 100
+      ).toLocaleString("en-US")}.`,
     );
   }
 
-  if (!user.email) {
+  return cents;
+}
+
+function assertFuelLevel(
+  value: unknown,
+): (typeof FUEL_LEVELS)[number] {
+  const level = String(value ?? "").trim();
+
+  if (
+    !(FUEL_LEVELS as readonly string[]).includes(
+      level,
+    )
+  ) {
     throw new Error(
-      "The authenticated account does not have an email address.",
+      "Select a valid fuel level.",
     );
   }
 
-  const profileRef = doc(
-    db,
-    "users",
-    user.uid,
+  return level as (typeof FUEL_LEVELS)[number];
+}
+
+function odometerToKm(
+  reading: unknown,
+): {
+  km: number;
+  value: number;
+  unit: "km" | "mi";
+} {
+  const source =
+    (reading ?? {}) as {
+      value?: unknown;
+      unit?: unknown;
+    };
+
+  const value = Number(source.value);
+  const unit = source.unit;
+
+  if (
+    !Number.isFinite(value) ||
+    value < 0
+  ) {
+    throw new Error(
+      "Odometer reading must be a non-negative number.",
+    );
+  }
+
+  if (unit !== "km" && unit !== "mi") {
+    throw new Error(
+      "Odometer unit must be km or mi.",
+    );
+  }
+
+  const km =
+    unit === "mi"
+      ? value * 1.609344
+      : value;
+
+  if (
+    !Number.isFinite(km) ||
+    km > 10_000_000
+  ) {
+    throw new Error(
+      "Odometer reading is outside the permitted range.",
+    );
+  }
+
+  return { km, value, unit };
+}
+
+/*
+ * Firestore rejects a write containing undefined anywhere in
+ * the document, including inside a nested object, and the
+ * whole transaction fails with it. Media records arrive from
+ * an external upload response, so every entry is stripped of
+ * undefined before it is stored.
+ */
+function sanitizeMediaList(
+  value: unknown,
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(
+      (item): item is Record<string, unknown> =>
+        Boolean(item) &&
+        typeof item === "object",
+    )
+    .map((item) =>
+      Object.fromEntries(
+        Object.entries(item).filter(
+          ([, entry]) =>
+            entry !== undefined,
+        ),
+      ),
+    );
+}
+
+/*
+ * Date.parse returns NaN for an unparseable string, and every
+ * comparison against NaN is false, so an expiry of "soon" would
+ * slip past an `expiry < pickup` guard as though it were valid.
+ * Compliance dates are therefore parsed through here, where a
+ * non-finite result is an error rather than a silent pass.
+ */
+function complianceDateMs(
+  value: unknown,
+  label: string,
+): number {
+  const parsed = Date.parse(
+    String(value ?? ""),
   );
 
-  await runTransaction(
+  if (!Number.isFinite(parsed)) {
+    throw new Error(
+      `${label} is missing or is not a valid date.`,
+    );
+  }
+
+  return parsed;
+}
+
+/*
+ * The same check for a value that is allowed to be absent, used
+ * when a date is being stored rather than enforced.
+ */
+function optionalDateOrNull(
+  value: unknown,
+  label: string,
+): string | null {
+  const raw = trimmedOrNull(value);
+
+  if (raw === null) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(
+      Date.parse(raw),
+    )
+  ) {
+    throw new Error(
+      `${label} is not a valid date.`,
+    );
+  }
+
+  return raw;
+}
+
+/*
+ * Registration numbers and VINs have to be unique across the
+ * fleet, but a query cannot be made part of a Firestore
+ * transaction from the browser, and two vehicle creations share
+ * no document, so neither would ever be forced to retry. The
+ * uniqueness is therefore claimed as a document whose id is
+ * derived from the value: both attempts then contend on the
+ * same document and exactly one of them wins.
+ */
+function vehicleKeyRef(
+  kind: "reg" | "vin",
+  value: string,
+) {
+  const { db } = getFirebaseClient();
+
+  return doc(
     db,
-    async (transaction) => {
-      const existing =
-        await transaction.get(profileRef);
-
-      if (existing.exists()) {
-        throw new Error(
-          "A staff profile already exists for this account.",
-        );
-      }
-
-      transaction.set(profileRef, {
-        fullName:
-          input.fullName.trim(),
-        mobile:
-          input.mobile.trim(),
-        age: input.age,
-        email:
-          user.email!.trim().toLowerCase(),
-        requestedRole:
-          input.requestedRole,
-        role: null,
-        status: "pending",
-        createdAt:
-          nowTimestamp(),
-        updatedAt:
-          nowTimestamp(),
-      });
-    },
+    "vehicleRegistry",
+    `${kind}_${value.replaceAll("/", "%2F")}`,
   );
+}
+
+type VehicleKeyClaim = {
+  ref: ReturnType<typeof vehicleKeyRef>;
+  heldBy: string | null;
+};
+
+/*
+ * Reads a claim. Firestore requires every read in a transaction
+ * to happen before the first write, so claims are resolved up
+ * front and written later.
+ */
+async function readVehicleKeyClaim(
+  transaction: {
+    get: (
+      reference: ReturnType<typeof doc>,
+    ) => Promise<{
+      exists: () => boolean;
+      get: (field: string) => unknown;
+    }>;
+  },
+  kind: "reg" | "vin",
+  value: string,
+  claimantId: string,
+): Promise<VehicleKeyClaim> {
+  const { db } = getFirebaseClient();
+
+  const ref = vehicleKeyRef(kind, value);
+
+  const snapshot =
+    await transaction.get(ref);
+
+  if (!snapshot.exists()) {
+    return { ref, heldBy: null };
+  }
+
+  const owner = String(
+    snapshot.get("vehicleId") ?? "",
+  );
+
+  if (!owner || owner === claimantId) {
+    return { ref, heldBy: null };
+  }
+
+  /*
+   * A claim left behind by a vehicle that has since been
+   * removed, or renamed away from this value, must not block a
+   * legitimate reuse of the registration.
+   */
+  const ownerSnapshot =
+    await transaction.get(
+      doc(db, "vehicles", owner),
+    );
+
+  if (!ownerSnapshot.exists()) {
+    return { ref, heldBy: null };
+  }
+
+  const field =
+    kind === "reg"
+      ? "registrationNumber"
+      : "vin";
+
+  const stillHeld =
+    String(
+      ownerSnapshot.get(field) ?? "",
+    ) === value;
 
   return {
-    uid: user.uid,
-    status: "pending",
+    ref,
+    heldBy: stillHeld ? owner : null,
   };
+}
+
+const CONFLICT_PAGE_SIZE = 200;
+
+/*
+ * Finds a confirmed or checked-out booking for the vehicle that
+ * overlaps the given window.
+ *
+ * A booking that starts at or after the window ends cannot
+ * overlap it, so the search is bounded by the window rather
+ * than by an arbitrary row count, and it pages to the end: a
+ * vehicle with a long history would otherwise push the
+ * conflicting booking out of a capped result set.
+ */
+async function overlappingReservation(
+  input: {
+    vehicleId: string;
+    from: Timestamp;
+    to: Timestamp;
+    ignoreReservationId?: string;
+  },
+): Promise<string | null> {
+  const { db } = getFirebaseClient();
+
+  let cursor:
+    | Awaited<
+        ReturnType<typeof getDocs>
+      >["docs"][number]
+    | undefined;
+
+  for (;;) {
+    const page = await getDocs(
+      query(
+        collection(
+          db,
+          "reservations",
+        ),
+        where(
+          "vehicleId",
+          "==",
+          input.vehicleId,
+        ),
+        where(
+          "status",
+          "in",
+          [
+            "confirmed",
+            "checked_out",
+          ],
+        ),
+        where(
+          "pickupAt",
+          "<",
+          input.to,
+        ),
+        orderBy("pickupAt"),
+        ...(cursor
+          ? [startAfter(cursor)]
+          : []),
+        limit(CONFLICT_PAGE_SIZE),
+      ),
+    );
+
+    for (const candidate of page.docs) {
+      if (
+        candidate.id ===
+        input.ignoreReservationId
+      ) {
+        continue;
+      }
+
+      const existingReturn =
+        asTimestamp(
+          toIso(
+            candidate.get(
+              "expectedReturnAt",
+            ),
+          ),
+        ).toMillis();
+
+      if (
+        existingReturn >
+        input.from.toMillis()
+      ) {
+        return candidate.id;
+      }
+    }
+
+    if (
+      page.size < CONFLICT_PAGE_SIZE
+    ) {
+      return null;
+    }
+
+    cursor =
+      page.docs[page.docs.length - 1];
+  }
+}
+
+function trimmedOrNull(
+  value: unknown,
+): string | null {
+  if (value == null) {
+    return null;
+  }
+
+  return String(value).trim() || null;
+}
+
+/*
+ * The staff name shown on rentals and contracts comes from
+ * the signed-in user's own profile document, never from the
+ * form, so it cannot be spoofed by the browser.
+ */
+async function actorNameSnapshot(
+  transaction: {
+    get: (
+      reference: ReturnType<typeof doc>,
+    ) => Promise<{
+      data: () => Record<string, unknown> | undefined;
+    }>;
+  },
+  actorUid: string,
+): Promise<string> {
+  const { db } = getFirebaseClient();
+
+  const snapshot = await transaction.get(
+    doc(db, "users", actorUid),
+  );
+
+  const profile = snapshot.data() ?? {};
+
+  const fullName = trimmedOrNull(
+    profile.fullName,
+  );
+
+  if (fullName) {
+    return fullName;
+  }
+
+  return (
+    trimmedOrNull(profile.email) ?? actorUid
+  );
 }
 
 /* =========================================================
@@ -690,128 +1018,206 @@ async function createOrUpdateCustomer(
   const { db } =
     getFirebaseClient();
 
-  const customerRef = doc(
-    collection(
-      db,
-      "customers",
-    ),
-  );
+  const actorUid =
+    getActorUid();
 
-await runTransaction(
-  db,
-  async (transaction) => {
-    const licenceExpiresAt =
-      input.licenceExpiresAt
-        ? String(
-            input.licenceExpiresAt,
-          )
-        : null;
+  /*
+   * An explicit customerId means the employee opened an
+   * existing record from the Customers screen and pressed
+   * Edit. That record is updated in place; creating a second
+   * document here would silently duplicate the customer and
+   * detach their existing bookings.
+   */
+  const existingCustomerId =
+    trimmedOrNull(
+      input.customerId,
+    );
 
-    if (licenceExpiresAt) {
-      const today =
-        new Date();
-
-      today.setHours(
-        0,
-        0,
-        0,
-        0,
-      );
-
-      const expiryDate =
-        new Date(
-          `${licenceExpiresAt}T00:00:00`,
+  const customerRef =
+    existingCustomerId
+      ? doc(
+          db,
+          "customers",
+          existingCustomerId,
+        )
+      : doc(
+          collection(
+            db,
+            "customers",
+          ),
         );
 
-      expiryDate.setHours(
-        0,
-        0,
-        0,
-        0,
+  const fullName =
+    String(
+      input.fullName ?? "",
+    ).trim();
+
+  const telephone =
+    String(
+      input.telephone ?? "",
+    ).trim();
+
+  const licenceNumber =
+    String(
+      input.licenceNumber ?? "",
+    )
+      .trim()
+      .toUpperCase();
+
+  const licenceCountry =
+    String(
+      input.licenceCountry ?? "",
+    )
+      .trim()
+      .toUpperCase();
+
+  if (
+    !fullName ||
+    !telephone ||
+    !licenceNumber
+  ) {
+    throw new Error(
+      "Complete all required customer details.",
+    );
+  }
+
+  if (licenceCountry.length !== 2) {
+    throw new Error(
+      "Select a valid licence issuing country.",
+    );
+  }
+
+  const licenceExpiresAt =
+    input.licenceExpiresAt
+      ? String(
+          input.licenceExpiresAt,
+        )
+      : null;
+
+  if (licenceExpiresAt) {
+    const today =
+      new Date();
+
+    today.setHours(
+      0,
+      0,
+      0,
+      0,
+    );
+
+    const expiryDate =
+      new Date(
+        `${licenceExpiresAt}T00:00:00`,
       );
+
+    expiryDate.setHours(
+      0,
+      0,
+      0,
+      0,
+    );
+
+    if (
+      Number.isNaN(
+        expiryDate.getTime(),
+      ) ||
+      expiryDate.getTime() <=
+        today.getTime()
+    ) {
+      throw new Error(
+        "Licence expiry must be after today.",
+      );
+    }
+  }
+
+  const details = {
+    fullName,
+
+    telephone,
+
+    email:
+      trimmedOrNull(
+        input.email,
+      ),
+
+    address:
+      trimmedOrNull(
+        input.address,
+      ),
+
+    licenceNumber,
+
+    licenceCountry,
+
+    licenceExpiresAt,
+
+    dateOfBirth:
+      input.dateOfBirth == null
+        ? null
+        : String(
+            input.dateOfBirth,
+          ),
+
+    notes:
+      trimmedOrNull(
+        input.notes,
+      ),
+
+    licenceStoragePath:
+      input.licenceStoragePath ==
+      null
+        ? null
+        : String(
+            input.licenceStoragePath,
+          ),
+  };
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const existing =
+        existingCustomerId
+          ? await transaction.get(
+              customerRef,
+            )
+          : null;
 
       if (
-        Number.isNaN(
-          expiryDate.getTime(),
-        ) ||
-        expiryDate.getTime() <=
-          today.getTime()
+        existing &&
+        !existing.exists()
       ) {
         throw new Error(
-          "Licence expiry must be after today.",
+          "Customer was not found.",
         );
       }
-    }
 
-    transaction.set(
-      customerRef,
-      {
-          fullName:
-            String(
-              input.fullName ??
-                "",
-            ).trim(),
+      if (existing) {
+        transaction.update(
+          customerRef,
+          {
+            ...details,
 
-          telephone:
-            String(
-              input.telephone ??
-                "",
-            ).trim(),
+            updatedBy:
+              actorUid,
 
-          email:
-            input.email == null
-              ? null
-              : String(
-                  input.email,
-                ).trim() || null,
+            updatedAt:
+              nowTimestamp(),
+          },
+        );
 
-          address:
-            input.address == null
-              ? null
-              : String(
-                  input.address,
-                ).trim() || null,
+        return;
+      }
 
-          licenceNumber:
-            String(
-              input.licenceNumber ??
-                "",
-            )
-              .trim()
-              .toUpperCase(),
+      transaction.set(
+        customerRef,
+        {
+          ...details,
 
-          licenceCountry:
-            String(
-              input.licenceCountry ??
-                "IN",
-            )
-              .trim()
-              .toUpperCase(),
+          createdBy:
+            actorUid,
 
-          licenceExpiresAt:
-  licenceExpiresAt,
-
-          dateOfBirth:
-            input.dateOfBirth == null
-              ? null
-              : String(
-                  input.dateOfBirth,
-                ),
-
-          notes:
-            input.notes == null
-              ? null
-              : String(
-                  input.notes,
-                ).trim() || null,
-
-          licenceStoragePath:
-            input.licenceStoragePath ==
-            null
-              ? null
-              : String(
-                  input.licenceStoragePath,
-                ),
+          updatedBy:
+            actorUid,
 
           createdAt:
             nowTimestamp(),
@@ -838,38 +1244,349 @@ async function updateCustomerLicenceDocument(
   customerId: string;
   licenceStoragePath: string;
 }> {
-  const callable =
-    httpsCallable<
-      typeof input,
-      {
-        customerId: string;
-        licenceStoragePath: string;
-      }
-    >(
-      getFirebaseClient().functions,
-      "updateCustomerLicenceDocument",
+  const { db } =
+    getFirebaseClient();
+
+  const actorUid =
+    getActorUid();
+
+  const customerId =
+    trimmedOrNull(
+      input.customerId,
     );
 
-  const result =
-    await callable(input);
+  const licenceStoragePath =
+    trimmedOrNull(
+      input.licenceStoragePath,
+    );
 
-  return result.data;
+  if (
+    !customerId ||
+    !licenceStoragePath
+  ) {
+    throw new Error(
+      "A customer and a licence image are both required.",
+    );
+  }
+
+  const customerRef =
+    doc(
+      db,
+      "customers",
+      customerId,
+    );
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const snapshot =
+        await transaction.get(
+          customerRef,
+        );
+
+      if (!snapshot.exists()) {
+        throw new Error(
+          "Customer was not found.",
+        );
+      }
+
+      transaction.update(
+        customerRef,
+        {
+          licenceStoragePath,
+
+          licenceCapturedAt:
+            nowTimestamp(),
+
+          updatedBy:
+            actorUid,
+
+          updatedAt:
+            nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return {
+    customerId,
+    licenceStoragePath,
+  };
 }
 
-async function sendReservationContract(
+export type ReservationContract = {
+  reservationId: string;
+  status: string;
+  createdAt: string;
+  customer: {
+    fullName: string;
+    telephone: string;
+    email: string | null;
+    address: string | null;
+    licenceNumber: string;
+    licenceCountry: string;
+    licenceExpiresAt: string | null;
+  };
+  vehicle: {
+    registration: string;
+    make: string;
+    model: string;
+    year: number | null;
+    color: string | null;
+    vin: string | null;
+  };
+  pickupAt: string;
+  expectedReturnAt: string;
+  pickupLocation: string | null;
+  dropoffLocation: string | null;
+  notes: string | null;
+  preparedBy: string;
+  chargedDays: number;
+  baseRentalCents: number;
+  rateSnapshot: {
+    dailyCents: number | null;
+    weeklyCents: number | null;
+    monthlyCents: number | null;
+  };
+  customerSignatureDataUrl: string | null;
+};
+
+/*
+ * The rental agreement is rebuilt from the stored reservation
+ * snapshot rather than from whatever is currently on screen,
+ * so a contract can never show a stale price or a vehicle the
+ * booking was not made against.
+ */
+async function getReservationContract(
   input: { reservationId: string },
-): Promise<{ emailId: string }> {
-  const callable =
-    httpsCallable<
-      typeof input,
-      { emailId: string }
-    >(
-      getFirebaseClient().functions,
-      "sendReservationContract",
+): Promise<ReservationContract> {
+  const { db } =
+    getFirebaseClient();
+
+  const reservationSnapshot =
+    await getDoc(
+      doc(
+        db,
+        "reservations",
+        String(
+          input.reservationId,
+        ),
+      ),
     );
 
-  const result = await callable(input);
-  return result.data;
+  if (!reservationSnapshot.exists()) {
+    throw new Error(
+      "Booking was not found.",
+    );
+  }
+
+  const reservation =
+    reservationSnapshot.data();
+
+  const [
+    customerSnapshot,
+    vehicleSnapshot,
+  ] = await Promise.all([
+    getDoc(
+      doc(
+        db,
+        "customers",
+        String(
+          reservation.customerId,
+        ),
+      ),
+    ),
+
+    getDoc(
+      doc(
+        db,
+        "vehicles",
+        String(
+          reservation.vehicleId,
+        ),
+      ),
+    ),
+  ]);
+
+  const customer =
+    customerSnapshot.data() ?? {};
+
+  const vehicle =
+    vehicleSnapshot.data() ?? {};
+
+  const rateSnapshot =
+    (reservation.rateSnapshot ??
+      {}) as Record<string, unknown>;
+
+  const quote =
+    (reservation.quote ??
+      {}) as Record<string, unknown>;
+
+  return {
+    reservationId:
+      reservationSnapshot.id,
+
+    status:
+      String(
+        reservation.status ??
+          "confirmed",
+      ),
+
+    createdAt:
+      toIso(
+        reservation.createdAt,
+      ),
+
+    customer: {
+      fullName:
+        String(
+          customer.fullName ??
+            reservation.customerNameSnapshot ??
+            "Unknown customer",
+        ),
+
+      telephone:
+        String(
+          customer.telephone ?? "",
+        ),
+
+      email:
+        trimmedOrNull(
+          customer.email,
+        ),
+
+      address:
+        trimmedOrNull(
+          customer.address,
+        ),
+
+      licenceNumber:
+        String(
+          customer.licenceNumber ?? "",
+        ),
+
+      licenceCountry:
+        String(
+          customer.licenceCountry ?? "",
+        ),
+
+      licenceExpiresAt:
+        trimmedOrNull(
+          customer.licenceExpiresAt,
+        ),
+    },
+
+    vehicle: {
+      /*
+       * The registration captured at booking time wins over the
+       * fleet record, so renaming a vehicle later cannot change
+       * what an already-signed agreement says it was for.
+       */
+      registration:
+        String(
+          reservation.vehicleRegistrationSnapshot ??
+            vehicle.registrationNumber ??
+            "Unknown vehicle",
+        ),
+
+      make:
+        String(
+          vehicle.make ?? "",
+        ),
+
+      model:
+        String(
+          vehicle.model ?? "",
+        ),
+
+      year:
+        vehicle.year == null
+          ? null
+          : Number(
+              vehicle.year,
+            ),
+
+      color:
+        trimmedOrNull(
+          vehicle.color,
+        ),
+
+      vin:
+        trimmedOrNull(
+          vehicle.vin,
+        ),
+    },
+
+    pickupAt:
+      toIso(
+        reservation.pickupAt,
+      ),
+
+    expectedReturnAt:
+      toIso(
+        reservation.expectedReturnAt,
+      ),
+
+    pickupLocation:
+      trimmedOrNull(
+        reservation.pickupLocation,
+      ),
+
+    dropoffLocation:
+      trimmedOrNull(
+        reservation.dropoffLocation,
+      ),
+
+    notes:
+      trimmedOrNull(
+        reservation.notes,
+      ),
+
+    preparedBy:
+      String(
+        reservation.createdByNameSnapshot ??
+          "—",
+      ),
+
+    chargedDays:
+      Number(
+        quote.chargedDays ?? 0,
+      ),
+
+    baseRentalCents:
+      Number(
+        quote.baseRentalCents ?? 0,
+      ),
+
+    rateSnapshot: {
+      dailyCents:
+        rateSnapshot.dailyCents == null
+          ? null
+          : Number(
+              rateSnapshot.dailyCents,
+            ),
+
+      weeklyCents:
+        rateSnapshot.weeklyCents == null
+          ? null
+          : Number(
+              rateSnapshot.weeklyCents,
+            ),
+
+      monthlyCents:
+        rateSnapshot.monthlyCents == null
+          ? null
+          : Number(
+              rateSnapshot.monthlyCents,
+            ),
+    },
+
+    customerSignatureDataUrl:
+      typeof reservation.customerSignatureDataUrl ===
+      "string"
+        ? reservation.customerSignatureDataUrl
+        : null,
+  };
 }
 
 /* =========================================================
@@ -895,23 +1612,360 @@ async function createReservation(
     chargedDays: number;
   };
 }> {
-  const callable =
-    httpsCallable<
-      typeof input,
-      {
-        reservationId: string;
-        quote: {
-          baseRentalCents: number;
-          chargedDays: number;
-        };
-      }
-    >(
-      getFirebaseClient().functions,
-      "createReservation",
+  const { db } =
+    getFirebaseClient();
+
+  const actorUid =
+    getActorUid();
+
+  const pickupAt =
+    asTimestamp(
+      input.pickupAt,
     );
 
-  const result = await callable(input);
-  return result.data;
+  const expectedReturnAt =
+    asTimestamp(
+      input.expectedReturnAt,
+    );
+
+  if (
+    expectedReturnAt.toMillis() <=
+    pickupAt.toMillis()
+  ) {
+    throw new Error(
+      "Expected return must be after pickup.",
+    );
+  }
+
+  /*
+   * The signature is stored on the booking itself as a PNG
+   * data URL. Firestore documents are limited to 1 MiB, so a
+   * signature large enough to threaten that limit is rejected
+   * rather than silently truncated.
+   */
+  const signatureDataUrl =
+    String(
+      input.customerSignatureDataUrl ??
+        "",
+    );
+
+  if (
+    !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(
+      signatureDataUrl,
+    )
+  ) {
+    throw new Error(
+      "Capture the customer signature before confirming the booking.",
+    );
+  }
+
+  if (signatureDataUrl.length > 400_000) {
+    throw new Error(
+      "The captured signature is too large. Clear it and sign again.",
+    );
+  }
+
+  const bookingMedia =
+    sanitizeMediaList(
+      input.bookingMedia,
+    );
+
+  const reservationRef =
+    doc(
+      collection(
+        db,
+        "reservations",
+      ),
+    );
+
+  const vehicleRef =
+    doc(
+      db,
+      "vehicles",
+      String(
+        input.vehicleId,
+      ),
+    );
+
+  const customerRef =
+    doc(
+      db,
+      "customers",
+      String(
+        input.customerId,
+      ),
+    );
+
+  let quote: ReturnType<typeof quoteRental>;
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const [
+        vehicleSnapshot,
+        customerSnapshot,
+      ] = await Promise.all([
+        transaction.get(
+          vehicleRef,
+        ),
+
+        transaction.get(
+          customerRef,
+        ),
+      ]);
+
+      const staffNameSnapshot =
+        await actorNameSnapshot(
+          transaction,
+          actorUid,
+        );
+
+      if (!vehicleSnapshot.exists()) {
+        throw new Error(
+          "Vehicle was not found.",
+        );
+      }
+
+      if (!customerSnapshot.exists()) {
+        throw new Error(
+          "Customer was not found.",
+        );
+      }
+
+      const vehicle =
+        vehicleSnapshot.data() as VehicleDocument;
+
+      if (
+        ![
+          "available",
+          "reserved",
+        ].includes(
+          String(
+            vehicle.status,
+          ),
+        )
+      ) {
+        throw new Error(
+          "Vehicle cannot be reserved in its current status.",
+        );
+      }
+
+      const pickupMillis =
+        pickupAt.toMillis();
+
+      if (
+        pickupMillis <
+        Timestamp.now().toMillis()
+      ) {
+        throw new Error(
+          "Pickup time cannot be in the past.",
+        );
+      }
+
+      if (
+        complianceDateMs(
+          vehicle.insuranceExpiresAt,
+          "Vehicle insurance expiry",
+        ) < pickupMillis ||
+        complianceDateMs(
+          vehicle.registrationExpiresAt,
+          "Vehicle registration expiry",
+        ) < pickupMillis
+      ) {
+        throw new Error(
+          "Vehicle registration and insurance must be recorded and valid through pickup.",
+        );
+      }
+
+      const licenceExpiresAt =
+        Date.parse(
+          String(
+            customerSnapshot.get(
+              "licenceExpiresAt",
+            ) ?? "",
+          ),
+        );
+
+      if (
+        !Number.isFinite(
+          licenceExpiresAt,
+        ) ||
+        licenceExpiresAt < pickupMillis
+      ) {
+        throw new Error(
+          "Customer licence is missing or expires before pickup.",
+        );
+      }
+
+      /*
+       * The browser SDK cannot run a query through the
+       * transaction, so this is an ordinary read. Running it
+       * inside the callback is still what makes the check
+       * sound: every reservation also writes its vehicle
+       * document, so a competing booking forces this
+       * transaction to retry, and the retry re-runs this
+       * search and sees the reservation that was just
+       * committed.
+       */
+      const conflictId =
+        await overlappingReservation({
+          vehicleId: vehicleRef.id,
+          from: pickupAt,
+          to: expectedReturnAt,
+        });
+
+      if (conflictId) {
+        throw new Error(
+          "Vehicle has an overlapping reservation.",
+        );
+      }
+
+      quote = quoteRental(
+        {
+          pickupAt:
+            input.pickupAt,
+
+          expectedReturnAt:
+            input.expectedReturnAt,
+        },
+
+        vehicle.rates,
+      );
+
+      transaction.set(
+        reservationRef,
+        {
+          bookingMedia,
+
+          customerSignatureDataUrl:
+            signatureDataUrl,
+
+          customerSignatureCapturedAt:
+            nowTimestamp(),
+
+          customerId:
+            customerRef.id,
+
+          customerNameSnapshot:
+            String(
+              customerSnapshot.get(
+                "fullName",
+              ) ?? "",
+            ),
+
+          vehicleId:
+            vehicleRef.id,
+
+          vehicleRegistrationSnapshot:
+            vehicle.registrationNumber,
+
+          pickupAt,
+
+          expectedReturnAt,
+
+          pickupLocation:
+            trimmedOrNull(
+              input.pickupLocation,
+            ),
+
+          dropoffLocation:
+            trimmedOrNull(
+              input.dropoffLocation,
+            ),
+
+          status:
+            "confirmed",
+
+          rateSnapshot: {
+            ...vehicle.rates,
+
+            quotedAt:
+              new Date().toISOString(),
+
+            vehicleId:
+              vehicleRef.id,
+
+            vehicleRegistration:
+              vehicle.registrationNumber,
+          },
+
+          quote,
+
+          notes:
+            trimmedOrNull(
+              input.notes,
+            ),
+
+          createdBy:
+            actorUid,
+
+          createdByNameSnapshot:
+            staffNameSnapshot,
+
+          createdAt:
+            nowTimestamp(),
+
+          updatedAt:
+            nowTimestamp(),
+        },
+      );
+
+      transaction.update(
+        vehicleRef,
+        {
+          status:
+            "reserved",
+
+          updatedAt:
+            nowTimestamp(),
+        },
+      );
+
+      transaction.set(
+        doc(
+          collection(
+            db,
+            "auditLogs",
+          ),
+        ),
+        {
+          actorUid,
+
+          action:
+            "reservation.created",
+
+          resource: {
+            collection:
+              "reservations",
+
+            id:
+              reservationRef.id,
+          },
+
+          details: {
+            vehicleId:
+              vehicleRef.id,
+
+            customerId:
+              customerRef.id,
+
+            pickupAt:
+              input.pickupAt,
+          },
+
+          createdAt:
+            nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return {
+    reservationId:
+      reservationRef.id,
+
+    quote: quote!,
+  };
 }
 
 /* =========================================================
@@ -922,7 +1976,10 @@ async function checkoutReservation(
   input: {
     reservationId: string;
     pickupFuelLevel: string;
-    pickupOdometerKm: number;
+    pickupOdometer: {
+      value: number;
+      unit: "km" | "mi";
+    };
     notes: string | null;
   },
 ): Promise<{
@@ -934,11 +1991,31 @@ async function checkoutReservation(
   const actorUid =
     getActorUid();
 
+  /*
+   * The employee may record the odometer in kilometres or
+   * miles. Only the converted kilometre value is treated as
+   * canonical; the entered number and its unit are kept
+   * alongside it so the reading can be shown exactly as it
+   * was taken, and so the return comparison never converts
+   * an already-converted value a second time.
+   */
+  const pickupOdometer =
+    odometerToKm(
+      input.pickupOdometer,
+    );
+
+  const pickupFuelLevel =
+    assertFuelLevel(
+      input.pickupFuelLevel,
+    );
+
   const reservationRef =
     doc(
       db,
       "reservations",
-      input.reservationId,
+      String(
+        input.reservationId,
+      ),
     );
 
   const rentalRef =
@@ -991,6 +2068,12 @@ async function checkoutReservation(
           vehicleRef,
         );
 
+      const checkedOutByNameSnapshot =
+        await actorNameSnapshot(
+          transaction,
+          actorUid,
+        );
+
       if (
         !vehicleSnapshot.exists()
       ) {
@@ -1009,6 +2092,22 @@ async function checkoutReservation(
         );
       }
 
+      const baseRentalCents =
+        assertMoneyCents(
+          reservation.quote
+            ?.baseRentalCents,
+          "Booking total",
+        );
+
+      const vehicleRegistration =
+        String(
+          reservation.vehicleRegistrationSnapshot ??
+            vehicleSnapshot.get(
+              "registrationNumber",
+            ) ??
+            "",
+        );
+
       const financialRef =
         doc(
           db,
@@ -1026,14 +2125,21 @@ async function checkoutReservation(
 
           status: "active",
 
-          pickupFuelLevel:
-            input.pickupFuelLevel,
+          pickupFuelLevel,
 
           pickupOdometerKm:
-            input.pickupOdometerKm,
+            pickupOdometer.km,
+
+          pickupOdometerValue:
+            pickupOdometer.value,
+
+          pickupOdometerUnit:
+            pickupOdometer.unit,
 
           checkoutNotes:
-            input.notes,
+            trimmedOrNull(
+              input.notes,
+            ),
 
           actualReturnAt:
             null,
@@ -1046,6 +2152,8 @@ async function checkoutReservation(
 
           checkedOutBy:
             actorUid,
+
+          checkedOutByNameSnapshot,
         },
       );
 
@@ -1056,13 +2164,22 @@ async function checkoutReservation(
             rentalRef.id,
 
           vehicleId:
-            reservation.vehicleId,
+            String(
+              reservation.vehicleId,
+            ),
 
-          vehicleRegistration:
-            reservation.vehicleRegistrationSnapshot,
+          vehicleRegistration,
 
           customerId:
-            reservation.customerId,
+            String(
+              reservation.customerId,
+            ),
+
+          customerNameSnapshot:
+            String(
+              reservation.customerNameSnapshot ??
+                "",
+            ),
 
           rentalStatus:
             "active",
@@ -1070,15 +2187,12 @@ async function checkoutReservation(
           pickupAt:
             reservation.pickupAt,
 
-          baseRentalCents:
-            reservation.quote
-              .baseRentalCents,
+          baseRentalCents,
 
           adjustmentCents: 0,
 
           totalCents:
-            reservation.quote
-              .baseRentalCents,
+            baseRentalCents,
 
           paidCents: 0,
 
@@ -1093,8 +2207,7 @@ async function checkoutReservation(
             0,
 
           outstandingCents:
-            reservation.quote
-              .baseRentalCents,
+            baseRentalCents,
 
           currency:
             "USD",
@@ -1112,6 +2225,9 @@ async function checkoutReservation(
         {
           status:
             "checked_out",
+
+          rentalId:
+            rentalRef.id,
 
           updatedAt:
             nowTimestamp(),
@@ -1144,20 +2260,22 @@ async function checkoutReservation(
             rentalRef.id,
 
           vehicleId:
-            reservation.vehicleId,
+            String(
+              reservation.vehicleId,
+            ),
 
-          vehicleRegistration:
-            reservation.vehicleRegistrationSnapshot,
+          vehicleRegistration,
 
           customerId:
-            reservation.customerId,
+            String(
+              reservation.customerId,
+            ),
 
           entryType:
             "rental_checkout",
 
           amountCents:
-            reservation.quote
-              .baseRentalCents,
+            baseRentalCents,
 
           occurredAt:
             nowTimestamp(),
@@ -1305,6 +2423,34 @@ async function extendRental(
         );
       }
 
+      /*
+       * Extending through a later booking would leave the next
+       * checkout with a vehicle that is still out, so the same
+       * overlap search the booking screen uses runs here too,
+       * ignoring this rental's own reservation.
+       */
+      const conflictId =
+        await overlappingReservation({
+          vehicleId:
+            String(
+              rental.vehicleId,
+            ),
+
+          from: currentExpectedReturn,
+          to: newExpectedReturn,
+
+          ignoreReservationId:
+            String(
+              rental.reservationId ?? "",
+            ),
+        });
+
+      if (conflictId) {
+        throw new Error(
+          "The vehicle is reserved again before that date. Shorten the extension or move the other booking.",
+        );
+      }
+
       const updatedQuote =
         quoteRental(
           {
@@ -1342,18 +2488,28 @@ async function extendRental(
         ) +
         extensionCents;
 
+      if (
+        !Number.isFinite(totalCents) ||
+        totalCents > MAX_MONEY_CENTS
+      ) {
+        throw new Error(
+          "This extension would take the rental past the permitted total.",
+        );
+      }
+
       const outstandingCents =
         calculateBalance(
-          totalCents,
+          Math.round(totalCents),
 
-          Number(
-            financial.paidCents ??
-              0,
+          assertMoneyCents(
+            financial.paidCents ?? 0,
+            "Amount received",
           ),
 
-          Number(
+          assertMoneyCents(
             financial.refundedCents ??
               0,
+            "Amount refunded",
           ),
         );
 
@@ -1505,10 +2661,6 @@ async function extendRental(
    Return
    ========================================================= */
 
-/* =========================================================
-   Return
-   ========================================================= */
-
 async function returnRental(
   input: {
     rentalId: string;
@@ -1535,18 +2687,85 @@ async function returnRental(
   const actorUid =
     getActorUid();
 
+  /*
+   * Everything that can be judged without reading the rental
+   * is validated before the transaction opens, so a bad entry
+   * fails fast and never leaves a partially applied return.
+   */
+  const returnOdometer =
+    odometerToKm(
+      input.returnOdometer,
+    );
+
+  const returnFuelLevel =
+    assertFuelLevel(
+      input.returnFuelLevel,
+    );
+
+  const returnNotes =
+    trimmedOrNull(
+      input.notes,
+    );
+
+  const returnMedia =
+    sanitizeMediaList(
+      input.returnMedia,
+    );
+
+  const adjustments =
+    (Array.isArray(
+      input.adjustments,
+    )
+      ? input.adjustments
+      : []
+    ).map(
+      (adjustment) => ({
+        type:
+          String(
+            adjustment?.type ?? "",
+          ).trim(),
+
+        amountCents:
+          assertMoneyCents(
+            adjustment?.amountCents,
+            "Adjustment amount",
+          ),
+
+        note:
+          trimmedOrNull(
+            adjustment?.note,
+          ) ??
+          "Return adjustment",
+      }),
+    );
+
+  if (
+    adjustments.some(
+      (adjustment) =>
+        !adjustment.type,
+    )
+  ) {
+    throw new Error(
+      "Select an adjustment type.",
+    );
+  }
+
   const rentalRef =
     doc(
       db,
       "rentals",
-      input.rentalId,
+      String(
+        input.rentalId,
+      ),
     );
 
   const financialRef =
     doc(
       db,
       "rentalFinancials",
-      input.rentalId,
+      String(
+        input.rentalId,
+      ),
     );
 
   let outstandingCents = 0;
@@ -1579,6 +2798,12 @@ async function returnRental(
       const financial =
         financialSnapshot.data();
 
+      /*
+       * Re-reading the status inside the transaction is what
+       * makes a repeated submission safe: the second attempt
+       * sees "returned" and aborts instead of applying the
+       * adjustments twice.
+       */
       if (
         ![
           "active",
@@ -1612,46 +2837,8 @@ async function returnRental(
         );
       }
 
-      /*
-       * The UI allows the employee to enter either
-       * kilometres or miles. Convert miles to kilometres
-       * before storing the canonical odometer value.
-       */
-      const returnOdometerValue =
-        Number(
-          input.returnOdometer?.value,
-        );
-
-      const returnOdometerUnit =
-        input.returnOdometer?.unit;
-
       if (
-        !Number.isFinite(
-          returnOdometerValue,
-        ) ||
-        returnOdometerValue < 0
-      ) {
-        throw new Error(
-          "Return odometer must be a valid non-negative number.",
-        );
-      }
-
-      if (
-        returnOdometerUnit !== "km" &&
-        returnOdometerUnit !== "mi"
-      ) {
-        throw new Error(
-          "Return odometer unit must be km or mi.",
-        );
-      }
-
-      const returnOdometerKm =
-        returnOdometerUnit === "mi"
-          ? returnOdometerValue * 1.609344
-          : returnOdometerValue;
-
-      if (
-        returnOdometerKm <
+        returnOdometer.km <
         Number(
           rental.pickupOdometerKm ??
             0,
@@ -1661,38 +2848,6 @@ async function returnRental(
           "Return odometer cannot be lower than pickup odometer.",
         );
       }
-
-      const returnFuelLevel =
-        String(
-          input.returnFuelLevel ?? "",
-        ).trim();
-
-      if (!returnFuelLevel) {
-        throw new Error(
-          "Return fuel level is required.",
-        );
-      }
-
-      const returnNotes =
-        input.notes == null
-          ? null
-          : String(
-              input.notes,
-            ).trim() || null;
-
-      const returnMedia =
-        Array.isArray(
-          input.returnMedia,
-        )
-          ? input.returnMedia
-          : [];
-
-      const adjustments =
-        Array.isArray(
-          input.adjustments,
-        )
-          ? input.adjustments
-          : [];
 
       const totalAdjustment =
         adjustments.reduce(
@@ -1724,7 +2879,11 @@ async function returnRental(
         adjustmentCents;
 
       if (
-        totalCents < 0
+        !Number.isFinite(
+          totalCents,
+        ) ||
+        totalCents < 0 ||
+        totalCents > MAX_MONEY_CENTS
       ) {
         throw new Error(
           "Adjustments produce an invalid rental total.",
@@ -1733,21 +2892,49 @@ async function returnRental(
 
       outstandingCents =
         calculateBalance(
-          totalCents,
-          Number(
-            financial.paidCents ??
-              0,
+          Math.round(
+            totalCents,
           ),
-          Number(
+          assertMoneyCents(
+            financial.paidCents ?? 0,
+            "Amount received",
+          ),
+          assertMoneyCents(
             financial.refundedCents ??
               0,
+            "Amount refunded",
           ),
         );
 
+      const vehicleId =
+        trimmedOrNull(
+          rental.vehicleId,
+        );
+
+      if (!vehicleId) {
+        throw new Error(
+          "This rental is not linked to a vehicle.",
+        );
+      }
+
+      const vehicleRegistration =
+        String(
+          rental.vehicleRegistrationSnapshot ??
+            financial.vehicleRegistration ??
+            "",
+        );
+
+      const customerId =
+        String(
+          rental.customerId ??
+            financial.customerId ??
+            "",
+        );
+
       /*
-       * Every value sent to Firestore is now explicitly
-       * defined or null. This prevents Firestore from
-       * rejecting the transaction because of undefined.
+       * Every value below is explicitly defined or null.
+       * Firestore rejects an undefined field outright, which
+       * previously aborted the whole return.
        */
       transaction.update(
         rentalRef,
@@ -1759,11 +2946,14 @@ async function returnRental(
 
           returnFuelLevel,
 
-          returnOdometerKm,
+          returnOdometerKm:
+            returnOdometer.km,
 
-          returnOdometerValue,
+          returnOdometerValue:
+            returnOdometer.value,
 
-          returnOdometerUnit,
+          returnOdometerUnit:
+            returnOdometer.unit,
 
           returnNotes,
 
@@ -1798,20 +2988,23 @@ async function returnRental(
         },
       );
 
-      const vehicleRef =
+      /*
+       * A returned vehicle always goes to cleaning before it
+       * can be offered again, which is also the only valid
+       * transition out of rented or overdue.
+       */
+      transaction.update(
         doc(
           db,
           "vehicles",
-          String(
-            rental.vehicleId,
-          ),
-        );
-
-      transaction.update(
-        vehicleRef,
+          vehicleId,
+        ),
         {
           status:
             "cleaning",
+
+          statusNote:
+            "Awaiting cleaning and detailing after return.",
 
           updatedAt:
             nowTimestamp(),
@@ -1843,14 +3036,11 @@ async function returnRental(
             rentalId:
               rentalRef.id,
 
-            vehicleId:
-              rental.vehicleId,
+            vehicleId,
 
-            vehicleRegistration:
-              rental.vehicleRegistrationSnapshot,
+            vehicleRegistration,
 
-            customerId:
-              rental.customerId,
+            customerId,
 
             entryType:
               adjustment.type ===
@@ -1890,6 +3080,17 @@ async function returnRental(
    Payment
    ========================================================= */
 
+const ADDITIONAL_FEE_TYPES = [
+  "car_seat",
+  "insurance",
+  "cleaning",
+  "smoke_fee",
+  "refueling",
+] as const;
+
+export type AdditionalFeeType =
+  (typeof ADDITIONAL_FEE_TYPES)[number];
+
 async function recordRentalPayment(
   input: {
     rentalId: string;
@@ -1898,6 +3099,10 @@ async function recordRentalPayment(
     externalReference:
       | string
       | null;
+    additionalFees?: Array<{
+      type: string;
+      amountCents: number;
+    }>;
     idempotencyKey: string;
   },
 ): Promise<{
@@ -1909,16 +3114,78 @@ async function recordRentalPayment(
   const actorUid =
     getActorUid();
 
-  if (
-    !Number.isFinite(
+  const amountCents =
+    assertMoneyCents(
       input.amountCents,
-    ) ||
-    input.amountCents <= 0
-  ) {
+      "Payment amount",
+    );
+
+  if (amountCents <= 0) {
     throw new Error(
       "Payment amount must be greater than zero.",
     );
   }
+
+  const additionalFees =
+    (Array.isArray(
+      input.additionalFees,
+    )
+      ? input.additionalFees
+      : []
+    ).map(
+      (fee) => {
+        const type =
+          String(
+            fee?.type ?? "",
+          ).trim();
+
+        if (
+          !(
+            ADDITIONAL_FEE_TYPES as readonly string[]
+          ).includes(type)
+        ) {
+          throw new Error(
+            "An unsupported additional fee was submitted.",
+          );
+        }
+
+        const feeCents =
+          assertMoneyCents(
+            fee?.amountCents,
+            "Additional fee amount",
+          );
+
+        if (feeCents <= 0) {
+          throw new Error(
+            "Additional fee amounts must be greater than zero.",
+          );
+        }
+
+        return {
+          type: type as AdditionalFeeType,
+          amountCents: feeCents,
+        };
+      },
+    );
+
+  if (
+    new Set(
+      additionalFees.map(
+        (fee) => fee.type,
+      ),
+    ).size !== additionalFees.length
+  ) {
+    throw new Error(
+      "Each additional fee can only be selected once.",
+    );
+  }
+
+  const additionalFeesCents =
+    additionalFees.reduce(
+      (sum, fee) =>
+        sum + fee.amountCents,
+      0,
+    );
 
   const operationRef =
     doc(
@@ -1936,7 +3203,9 @@ async function recordRentalPayment(
     doc(
       db,
       "rentalFinancials",
-      input.rentalId,
+      String(
+        input.rentalId,
+      ),
     );
 
   let outstandingCents = 0;
@@ -1949,6 +3218,10 @@ async function recordRentalPayment(
           operationRef,
         );
 
+      /*
+       * A repeated submission replays the stored result
+       * instead of charging the customer a second time.
+       */
       if (previous.exists()) {
         const previousResponse =
           previous.get(
@@ -1958,8 +3231,10 @@ async function recordRentalPayment(
           };
 
         outstandingCents =
-          previousResponse
-            .outstandingCents;
+          Number(
+            previousResponse
+              ?.outstandingCents ?? 0,
+          );
 
         return;
       }
@@ -1973,7 +3248,9 @@ async function recordRentalPayment(
         doc(
           db,
           "rentals",
-          input.rentalId,
+          String(
+            input.rentalId,
+          ),
         );
 
       const rentalSnapshot =
@@ -1993,40 +3270,105 @@ async function recordRentalPayment(
       const financial =
         financialSnapshot.data();
 
+      const rental =
+        rentalSnapshot.data();
+
       const paidCents =
+        assertMoneyCents(
+          financial.paidCents ?? 0,
+          "Amount received",
+        ) + amountCents;
+
+      /*
+       * Additional fees raise what the rental is worth, so
+       * they are added to the invoiced total once, here, and
+       * nowhere else. The return workflow recomputes the
+       * total from baseRentalCents plus adjustmentCents, so
+       * keeping both in step prevents a fee being counted a
+       * second time when the vehicle comes back.
+       */
+      const adjustmentCents =
         Number(
-          financial.paidCents ??
+          financial.adjustmentCents ??
             0,
-        ) +
-        input.amountCents;
+        ) + additionalFeesCents;
+
+      const totalCents =
+        Number(
+          financial.totalCents ?? 0,
+        ) + additionalFeesCents;
+
+      if (
+        !Number.isFinite(
+          totalCents,
+        ) ||
+        totalCents > MAX_MONEY_CENTS
+      ) {
+        throw new Error(
+          "Additional fees exceed the permitted rental total.",
+        );
+      }
 
       outstandingCents =
         calculateBalance(
-          Number(
-            financial.totalCents ??
-              0,
+          Math.round(
+            totalCents,
           ),
           paidCents,
-          Number(
+          assertMoneyCents(
             financial.refundedCents ??
               0,
+            "Amount refunded",
           ),
+        );
+
+      const vehicleId =
+        String(
+          financial.vehicleId ??
+            rental.vehicleId ??
+            "",
+        );
+
+      const vehicleRegistration =
+        String(
+          financial.vehicleRegistration ??
+            rental.vehicleRegistrationSnapshot ??
+            "",
+        );
+
+      const customerId =
+        String(
+          financial.customerId ??
+            rental.customerId ??
+            "",
         );
 
       transaction.set(
         paymentRef,
         {
           rentalId:
-            input.rentalId,
+            String(
+              input.rentalId,
+            ),
 
-          amountCents:
-            input.amountCents,
+          amountCents,
+
+          additionalFees,
 
           method:
-            input.method,
+            String(
+              input.method ?? "other",
+            ),
 
           externalReference:
-            input.externalReference,
+            trimmedOrNull(
+              input.externalReference,
+            ),
+
+          idempotencyKey:
+            String(
+              input.idempotencyKey,
+            ),
 
           recordedBy:
             actorUid,
@@ -2036,10 +3378,57 @@ async function recordRentalPayment(
         },
       );
 
+      for (
+        const fee of additionalFees
+      ) {
+        transaction.set(
+          doc(
+            collection(
+              db,
+              "financialLedger",
+            ),
+          ),
+          {
+            rentalId:
+              String(
+                input.rentalId,
+              ),
+
+            vehicleId,
+
+            vehicleRegistration,
+
+            customerId,
+
+            entryType:
+              "rental_fee",
+
+            feeType:
+              fee.type,
+
+            amountCents:
+              fee.amountCents,
+
+            paymentId:
+              paymentRef.id,
+
+            occurredAt:
+              nowTimestamp(),
+
+            recordedBy:
+              actorUid,
+          },
+        );
+      }
+
       transaction.update(
         financialRef,
         {
           paidCents,
+
+          adjustmentCents,
+
+          totalCents,
 
           outstandingCents,
 
@@ -2047,9 +3436,6 @@ async function recordRentalPayment(
             nowTimestamp(),
         },
       );
-
-      const rental =
-        rentalSnapshot.data();
 
       const ledgerRef =
         doc(
@@ -2063,22 +3449,20 @@ async function recordRentalPayment(
         ledgerRef,
         {
           rentalId:
-            input.rentalId,
+            String(
+              input.rentalId,
+            ),
 
-          vehicleId:
-            rental.vehicleId,
+          vehicleId,
 
-          vehicleRegistration:
-            rental.vehicleRegistrationSnapshot,
+          vehicleRegistration,
 
-          customerId:
-            rental.customerId,
+          customerId,
 
           entryType:
             "payment",
 
-          amountCents:
-            input.amountCents,
+          amountCents,
 
           paymentId:
             paymentRef.id,
@@ -2132,21 +3516,346 @@ async function createVehicle(
     weeklyCents: number | null;
     monthlyCents: number | null;
     notes: string | null;
+    photos?: Array<Record<string, unknown>>;
   },
 ): Promise<{
   vehicleId: string;
   registrationNumber: string;
 }> {
-  return callTrustedFunction<
-    typeof input,
-    {
-      vehicleId: string;
-      registrationNumber: string;
+  const { db } =
+    getFirebaseClient();
+
+  const actorUid =
+    getActorUid();
+
+  const registrationNumber =
+    String(
+      input.registrationNumber ?? "",
+    )
+      .trim()
+      .toUpperCase();
+
+  const make =
+    String(
+      input.make ?? "",
+    )
+      .trim()
+      .toUpperCase();
+
+  const model =
+    String(
+      input.model ?? "",
+    ).trim();
+
+  if (!registrationNumber) {
+    throw new Error(
+      "Registration number is required.",
+    );
+  }
+
+  if (!make) {
+    throw new Error(
+      "Vehicle make is required.",
+    );
+  }
+
+  if (!model) {
+    throw new Error(
+      "Vehicle model is required.",
+    );
+  }
+
+  const vin =
+    trimmedOrNull(
+      input.vin,
+    )?.toUpperCase() ?? null;
+
+  if (
+    vin !== null &&
+    vin.length !== 17
+  ) {
+    throw new Error(
+      "VIN must contain exactly 17 characters.",
+    );
+  }
+
+  const rates = {
+    currency: "USD" as const,
+
+    dailyCents:
+      input.dailyCents == null
+        ? null
+        : assertMoneyCents(
+            input.dailyCents,
+            "Daily rate",
+          ),
+
+    weeklyCents:
+      input.weeklyCents == null
+        ? null
+        : assertMoneyCents(
+            input.weeklyCents,
+            "Weekly rate",
+          ),
+
+    monthlyCents:
+      input.monthlyCents == null
+        ? null
+        : assertMoneyCents(
+            input.monthlyCents,
+            "Monthly rate",
+          ),
+  };
+
+  if (
+    rates.dailyCents === null &&
+    rates.weeklyCents === null &&
+    rates.monthlyCents === null
+  ) {
+    throw new Error(
+      "At least one vehicle rate is required.",
+    );
+  }
+
+  /*
+   * Availability and booking both compare these dates. An
+   * unparseable string would compare as NaN and read as though
+   * it had not expired, so it is refused here rather than
+   * relying on the form to be the only way in.
+   */
+  const registrationExpiresAt =
+    optionalDateOrNull(
+      input.registrationExpiresAt,
+      "Registration expiry",
+    );
+
+  const insuranceExpiresAt =
+    optionalDateOrNull(
+      input.insuranceExpiresAt,
+      "Insurance expiry",
+    );
+
+  const lastServiceAt =
+    optionalDateOrNull(
+      input.lastServiceAt,
+      "Last service date",
+    );
+
+  const nextServiceDueAt =
+    optionalDateOrNull(
+      input.nextServiceDueAt,
+      "Next service date",
+    );
+
+  /*
+   * Registration numbers and VINs identify a vehicle across
+   * the whole system, so a duplicate is refused before the
+   * record is created rather than discovered later from two
+   * fleet rows describing the same car.
+   */
+  const duplicateRegistration =
+    await getDocs(
+      query(
+        collection(
+          db,
+          "vehicles",
+        ),
+        where(
+          "registrationNumber",
+          "==",
+          registrationNumber,
+        ),
+        limit(1),
+      ),
+    );
+
+  if (!duplicateRegistration.empty) {
+    throw new Error(
+      `Registration number ${registrationNumber} is already assigned to another vehicle.`,
+    );
+  }
+
+  if (vin !== null) {
+    const duplicateVin =
+      await getDocs(
+        query(
+          collection(
+            db,
+            "vehicles",
+          ),
+          where(
+            "vin",
+            "==",
+            vin,
+          ),
+          limit(1),
+        ),
+      );
+
+    if (!duplicateVin.empty) {
+      throw new Error(
+        `VIN ${vin} is already assigned to another vehicle.`,
+      );
     }
-  >(
-    "createVehicleRecord",
-    input,
+  }
+
+  const vehicleRef =
+    doc(
+      collection(
+        db,
+        "vehicles",
+      ),
+    );
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const registrationClaim =
+        await readVehicleKeyClaim(
+          transaction,
+          "reg",
+          registrationNumber,
+          vehicleRef.id,
+        );
+
+      if (registrationClaim.heldBy) {
+        throw new Error(
+          `Registration number ${registrationNumber} is already assigned to another vehicle.`,
+        );
+      }
+
+      const vinClaim =
+        vin === null
+          ? null
+          : await readVehicleKeyClaim(
+              transaction,
+              "vin",
+              vin,
+              vehicleRef.id,
+            );
+
+      if (vinClaim?.heldBy) {
+        throw new Error(
+          `VIN ${vin} is already assigned to another vehicle.`,
+        );
+      }
+
+      transaction.set(
+        registrationClaim.ref,
+        {
+          vehicleId: vehicleRef.id,
+          value: registrationNumber,
+          updatedAt: nowTimestamp(),
+        },
+      );
+
+      if (vinClaim && vin !== null) {
+        transaction.set(
+          vinClaim.ref,
+          {
+            vehicleId: vehicleRef.id,
+            value: vin,
+            updatedAt: nowTimestamp(),
+          },
+        );
+      }
+
+      transaction.set(
+        vehicleRef,
+        {
+          registrationNumber,
+
+          make,
+
+          model,
+
+          year:
+            input.year == null
+              ? null
+              : Number(
+                  input.year,
+                ),
+
+          color:
+            trimmedOrNull(
+              input.color,
+            ),
+
+          vin,
+
+          registrationExpiresAt,
+
+          insuranceExpiresAt,
+
+          lastServiceAt,
+
+          nextServiceDueAt,
+
+          rates,
+
+          notes:
+            trimmedOrNull(
+              input.notes,
+            ),
+
+          photos:
+            sanitizeMediaList(
+              input.photos,
+            ),
+
+          status:
+            "available" as const,
+
+          createdBy:
+            actorUid,
+
+          createdAt:
+            nowTimestamp(),
+
+          updatedAt:
+            nowTimestamp(),
+        },
+      );
+
+      transaction.set(
+        doc(
+          collection(
+            db,
+            "auditLogs",
+          ),
+        ),
+        {
+          actorUid,
+
+          action:
+            "vehicle.created",
+
+          resource: {
+            collection:
+              "vehicles",
+
+            id:
+              vehicleRef.id,
+          },
+
+          details: {
+            registrationNumber,
+            vin,
+          },
+
+          createdAt:
+            nowTimestamp(),
+        },
+      );
+    },
   );
+
+  return {
+    vehicleId:
+      vehicleRef.id,
+
+    registrationNumber,
+  };
 }
 
 /* =========================================================
@@ -2188,6 +3897,73 @@ async function updateVehicleDetails(
       const current =
         snapshot.data() as VehicleDocument;
 
+      /*
+       * Renaming a vehicle moves its uniqueness claim: the new
+       * value is claimed under the same contention rules as a
+       * creation, and the old one is released so the previous
+       * registration can be issued again.
+       */
+      const nextRegistration =
+        String(
+          input.registrationNumber ??
+            current.registrationNumber,
+        )
+          .trim()
+          .toUpperCase();
+
+      const nextVin =
+        trimmedOrNull(
+          input.vin,
+        )?.toUpperCase() ?? null;
+
+      if (
+        nextVin !== null &&
+        nextVin.length !== 17
+      ) {
+        throw new Error(
+          "VIN must contain exactly 17 characters.",
+        );
+      }
+
+      const registrationChanged =
+        nextRegistration !==
+        current.registrationNumber;
+
+      const vinChanged =
+        nextVin !== (current.vin ?? null);
+
+      const registrationClaim =
+        registrationChanged
+          ? await readVehicleKeyClaim(
+              transaction,
+              "reg",
+              nextRegistration,
+              vehicleRef.id,
+            )
+          : null;
+
+      if (registrationClaim?.heldBy) {
+        throw new Error(
+          `Registration number ${nextRegistration} is already assigned to another vehicle.`,
+        );
+      }
+
+      const vinClaim =
+        vinChanged && nextVin !== null
+          ? await readVehicleKeyClaim(
+              transaction,
+              "vin",
+              nextVin,
+              vehicleRef.id,
+            )
+          : null;
+
+      if (vinClaim?.heldBy) {
+        throw new Error(
+          `VIN ${nextVin} is already assigned to another vehicle.`,
+        );
+      }
+
       const rates = {
         currency:
           "USD" as const,
@@ -2196,37 +3972,86 @@ async function updateVehicleDetails(
           input.dailyCents ==
           null
             ? null
-            : Number(
+            : assertMoneyCents(
                 input.dailyCents,
+                "Daily rate",
               ),
 
         weeklyCents:
           input.weeklyCents ==
           null
             ? null
-            : Number(
+            : assertMoneyCents(
                 input.weeklyCents,
+                "Weekly rate",
               ),
 
         monthlyCents:
           input.monthlyCents ==
           null
             ? null
-            : Number(
+            : assertMoneyCents(
                 input.monthlyCents,
+                "Monthly rate",
               ),
       };
+
+      if (
+        rates.dailyCents === null &&
+        rates.weeklyCents === null &&
+        rates.monthlyCents === null
+      ) {
+        throw new Error(
+          "At least one vehicle rate is required.",
+        );
+      }
+
+      if (registrationClaim) {
+        transaction.set(
+          registrationClaim.ref,
+          {
+            vehicleId: vehicleRef.id,
+            value: nextRegistration,
+            updatedAt: nowTimestamp(),
+          },
+        );
+
+        transaction.delete(
+          vehicleKeyRef(
+            "reg",
+            current.registrationNumber,
+          ),
+        );
+      }
+
+      if (vinClaim && nextVin !== null) {
+        transaction.set(
+          vinClaim.ref,
+          {
+            vehicleId: vehicleRef.id,
+            value: nextVin,
+            updatedAt: nowTimestamp(),
+          },
+        );
+      }
+
+      if (
+        vinChanged &&
+        current.vin
+      ) {
+        transaction.delete(
+          vehicleKeyRef(
+            "vin",
+            current.vin,
+          ),
+        );
+      }
 
       transaction.update(
         vehicleRef,
         {
           registrationNumber:
-            String(
-              input.registrationNumber ??
-                current.registrationNumber,
-            )
-              .trim()
-              .toUpperCase(),
+            nextRegistration,
 
           make:
             String(
@@ -2257,41 +4082,53 @@ async function updateVehicleDetails(
                 ).trim() ||
                 null,
 
-          vin:
-            input.vin == null
-              ? null
-              : String(
-                  input.vin,
-                )
-                  .trim()
-                  .toUpperCase() ||
-                null,
+          vin: nextVin,
 
           registrationExpiresAt:
-            input.registrationExpiresAt ??
-            null,
+            optionalDateOrNull(
+              input.registrationExpiresAt,
+              "Registration expiry",
+            ),
 
           insuranceExpiresAt:
-            input.insuranceExpiresAt ??
-            null,
+            optionalDateOrNull(
+              input.insuranceExpiresAt,
+              "Insurance expiry",
+            ),
 
           lastServiceAt:
-            input.lastServiceAt ??
-            null,
+            optionalDateOrNull(
+              input.lastServiceAt,
+              "Last service date",
+            ),
 
           nextServiceDueAt:
-            input.nextServiceDueAt ??
-            null,
+            optionalDateOrNull(
+              input.nextServiceDueAt,
+              "Next service date",
+            ),
 
           rates,
 
           notes:
-            input.notes == null
-              ? null
-              : String(
-                  input.notes,
-                ).trim() ||
-                null,
+            trimmedOrNull(
+              input.notes,
+            ),
+
+          photos:
+            Array.isArray(
+              input.photos,
+            )
+              ? sanitizeMediaList(
+                  input.photos,
+                )
+              : sanitizeMediaList(
+                  (
+                    current as unknown as {
+                      photos?: unknown;
+                    }
+                  ).photos,
+                ),
 
           updatedAt:
             nowTimestamp(),
@@ -2396,13 +4233,13 @@ async function changeVehicleStatus(
           Date.now();
 
         if (
-          !vehicle.insuranceExpiresAt ||
-          !vehicle.registrationExpiresAt ||
-          Date.parse(
+          complianceDateMs(
             vehicle.insuranceExpiresAt,
+            "Vehicle insurance expiry",
           ) <= now ||
-          Date.parse(
+          complianceDateMs(
             vehicle.registrationExpiresAt,
+            "Vehicle registration expiry",
           ) <= now
         ) {
           throw new Error(
@@ -2488,6 +4325,34 @@ async function recordVehicleExpense(
   const actorUid =
     getActorUid();
 
+  const amountCents =
+    assertMoneyCents(
+      input.amountCents,
+      "Expense amount",
+    );
+
+  if (amountCents <= 0) {
+    throw new Error(
+      "Expense amount must be greater than zero.",
+    );
+  }
+
+  const occurredAt =
+    asTimestamp(
+      input.occurredAt,
+    );
+
+  const vehicleId =
+    trimmedOrNull(
+      input.vehicleId,
+    );
+
+  if (!vehicleId) {
+    throw new Error(
+      "Select the vehicle this expense belongs to.",
+    );
+  }
+
   const operationRef =
     doc(
       db,
@@ -2507,8 +4372,11 @@ async function recordVehicleExpense(
     doc(
       db,
       "vehicles",
-      input.vehicleId,
+      vehicleId,
     );
+
+  let recordedExpenseId =
+    expenseRef.id;
 
   await runTransaction(
     db,
@@ -2518,7 +4386,23 @@ async function recordVehicleExpense(
           operationRef,
         );
 
+      /*
+       * Replaying a submission returns the expense that was
+       * actually written the first time rather than the id of
+       * a document this attempt never created.
+       */
       if (previous.exists()) {
+        const previousResponse =
+          previous.get(
+            "response",
+          ) as {
+            expenseId?: string;
+          };
+
+        recordedExpenseId =
+          previousResponse?.expenseId ??
+          recordedExpenseId;
+
         return;
       }
 
@@ -2535,28 +4419,38 @@ async function recordVehicleExpense(
         );
       }
 
+      const vehicleRegistration =
+        String(
+          vehicleSnapshot.get(
+            "registrationNumber",
+          ) ?? "",
+        );
+
       transaction.set(
         expenseRef,
         {
-          vehicleId:
-            input.vehicleId,
+          vehicleId,
+
+          vehicleRegistration,
 
           category:
-            input.category,
+            String(
+              input.category ?? "other",
+            ),
 
-          amountCents:
-            input.amountCents,
+          amountCents,
 
-          occurredAt:
-  asTimestamp(
-    input.occurredAt,
-  ),
+          occurredAt,
 
           vendor:
-            input.vendor,
+            trimmedOrNull(
+              input.vendor,
+            ),
 
           note:
-            input.note,
+            trimmedOrNull(
+              input.note,
+            ) ?? "",
 
           recordedBy:
             actorUid,
@@ -2577,25 +4471,20 @@ async function recordVehicleExpense(
       transaction.set(
         ledgerRef,
         {
-          vehicleId:
-            input.vehicleId,
+          vehicleId,
 
-          vehicleRegistration:
-            vehicleSnapshot.get(
-              "registrationNumber",
-            ),
+          vehicleRegistration,
 
           entryType:
             "expense",
 
           amountCents:
-            -input.amountCents,
+            -amountCents,
 
           expenseId:
             expenseRef.id,
 
-          occurredAt:
-            nowTimestamp(),
+          occurredAt,
 
           recordedBy:
             actorUid,
@@ -2621,7 +4510,7 @@ async function recordVehicleExpense(
 
   return {
     expenseId:
-      expenseRef.id,
+      recordedExpenseId,
   };
 }
 
@@ -2701,6 +4590,46 @@ async function getFinancialOverview(
         ...snapshot.data(),
       }),
     );
+
+  /*
+   * Expenses recorded before the registration was stored on
+   * them would otherwise be listed under a raw document id, so
+   * the label is resolved from whichever record carries it.
+   */
+  const registrationByVehicle =
+    new Map<string, string>();
+
+  for (
+    const record of [
+      ...financialRecords,
+      ...ledgerEntries,
+      ...expenses,
+    ]
+  ) {
+    const vehicleId =
+      String(
+        record.vehicleId ?? "",
+      );
+
+    const registration =
+      trimmedOrNull(
+        record.vehicleRegistration ??
+          record.vehicleRegistrationSnapshot,
+      );
+
+    if (
+      vehicleId &&
+      registration &&
+      !registrationByVehicle.has(
+        vehicleId,
+      )
+    ) {
+      registrationByVehicle.set(
+        vehicleId,
+        registration,
+      );
+    }
+  }
 
   const matchesVehicle =
     (record: FirestoreDoc): boolean =>
@@ -2873,6 +4802,9 @@ async function getFinancialOverview(
           String(
             record.vehicleRegistration ??
               record.vehicleRegistrationSnapshot ??
+              registrationByVehicle.get(
+                vehicleId,
+              ) ??
               vehicleId,
           ),
 
@@ -2928,13 +4860,15 @@ async function getFinancialOverview(
         vehicleId,
       ) ?? {
         vehicleRegistration:
-          vehicleId,
+          registrationByVehicle.get(
+            vehicleId,
+          ) ?? vehicleId,
 
-            invoicedCents: 0,
-    expensesCents: 0,
-    receivedCents: 0,
-    refundedCents: 0,
-  };
+        invoicedCents: 0,
+        expensesCents: 0,
+        receivedCents: 0,
+        refundedCents: 0,
+      };
 
     current.expensesCents +=
       Number(
@@ -3134,9 +5068,9 @@ export async function callFirestoreOperation<
         )) as TResult
       );
 
-    case "sendReservationContract":
+    case "getReservationContract":
       return (
-        (await sendReservationContract(
+        (await getReservationContract(
           data as { reservationId: string },
         )) as TResult
       );
@@ -3166,7 +5100,10 @@ export async function callFirestoreOperation<
           data as {
             reservationId: string;
             pickupFuelLevel: string;
-            pickupOdometerKm: number;
+            pickupOdometer: {
+              value: number;
+              unit: "km" | "mi";
+            };
             notes: string | null;
           },
         )) as TResult
@@ -3174,8 +5111,7 @@ export async function callFirestoreOperation<
 
     case "extendRental":
       return (
-        (await callTrustedFunction(
-          "extendRental",
+        (await extendRental(
           data as {
             rentalId: string;
             expectedReturnAt: string;
@@ -3192,7 +5128,7 @@ export async function callFirestoreOperation<
             rentalId: string;
             actualReturnAt: string;
             returnFuelLevel: string;
-returnOdometer: {
+            returnOdometer: {
               value: number;
               unit: "km" | "mi";
             };
@@ -3219,6 +5155,10 @@ returnOdometer: {
             externalReference:
               | string
               | null;
+            additionalFees?: Array<{
+              type: string;
+              amountCents: number;
+            }>;
             idempotencyKey: string;
           },
         )) as TResult
@@ -3242,6 +5182,9 @@ returnOdometer: {
             weeklyCents: number | null;
             monthlyCents: number | null;
             notes: string | null;
+            photos?: Array<
+              Record<string, unknown>
+            >;
           },
         )) as TResult
       );

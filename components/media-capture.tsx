@@ -17,6 +17,7 @@ import {
 import {
   uploadVehicleMedia,
   type CloudinaryMedia,
+  type MediaStage,
 } from "@/lib/cloudinary";
 
 type CameraMode =
@@ -31,7 +32,7 @@ export function MediaCapture({
   hint = "Capture photos of the vehicle.",
   maxFiles = 20,
 }: {
-  stage: "booking" | "return";
+  stage: MediaStage;
   value: CloudinaryMedia[];
   onChange: (
     media: CloudinaryMedia[],
