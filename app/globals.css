@@ -681,6 +681,34 @@ a {
   font-size: 12px;
 }
 
+/* A history row is a button, so the office can open the
+   agreement a renter signed straight from the list. */
+.history-row {
+  width: 100%;
+  padding: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-row:hover,
+.history-row:focus-visible {
+  background: rgb(20 30 55 / 3%);
+}
+
+.history-open {
+  font-size: 13px;
+  font-weight: 750;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
 .pickup-time {
   display: grid;
   flex: 0 0 76px;
@@ -6106,6 +6134,53 @@ canvas {
   object-fit: cover;
 }
 
+/* The four damage views, arranged as they are on the paper
+   form: front and back side by side, then the two profiles
+   across the full width. */
+.sheet-diagrams {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid #131a24;
+}
+
+.sheet-diagram-grid {
+  display: grid;
+  gap: 6px 10px;
+  margin-top: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.sheet-diagram {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin: 0;
+}
+
+.sheet-diagram-left,
+.sheet-diagram-right {
+  grid-column: 1 / -1;
+}
+
+.sheet-diagram img {
+  width: 100%;
+  max-width: 190px;
+  height: auto;
+}
+
+.sheet-diagram-left img,
+.sheet-diagram-right img {
+  max-width: 420px;
+}
+
+.sheet-diagram figcaption {
+  color: #4a5568;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
 .sheet-clauses {
   display: grid;
   gap: 8px;
@@ -6334,5 +6409,10 @@ canvas {
   .agreement-sheet {
     border: 0;
     background: #fff;
+  }
+
+  .sheet-diagrams,
+  .sheet-diagram {
+    break-inside: avoid;
   }
 }
