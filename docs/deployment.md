@@ -1,5 +1,21 @@
 # Deployment and recovery
 
+## Rules are not deployed by merging
+
+Firestore and Storage rules ship separately from the web build. Merging a pull request, and deploying hosting, both leave the rules in the live project exactly as they were.
+
+The symptom when they fall behind is specific and misleading: a screen reports **"Your account does not have permission for this action."** to a user who has every permission, because the application is reading a collection the deployed rules do not mention and the default deny catches it. It is not an account problem and re-granting a role will not fix it.
+
+So whenever a release adds or renames a collection, deploy the rules with it:
+
+```bash
+pnpm exec firebase deploy --only firestore:rules,firestore:indexes,storage
+```
+
+`tests/rules/firestore.rules.test.ts` asserts that every collection the client reads is matched by a rule in this repository, which catches the rule that was never written. It cannot see what is actually deployed, so the deploy step above is still yours to run.
+
+Releases that have needed it so far: `reservationContracts` and its `versions`/`deliveries` subcollections, and `rentals/{id}/extensions`.
+
 ## Environment separation
 
 Create three separate Firebase projects: development, staging and production. Register a web app in each and give only its public configuration to the matching environment file. Never set `NEXT_PUBLIC_USE_FIREBASE_EMULATORS=true` outside local development.
@@ -32,6 +48,7 @@ Miss step 4 and the browser is blocked before the request leaves the page — by
 - dependency audit and secret scan
 - staging workflow: customer → reservation → checkout → inspection → payment → return → final balance; test a duplicate payment and conflicting reservation
 - contract workflow: submit for review → reject with a note → resubmit → approve → email, and confirm the delivery receipt records the provider message ID
+- rules deployed before hosting, and the booking, customers and dashboard screens loaded once against the deployed rules with no permission error
 - mobile browser verification for sign-in, photo capture and return inspection
 
 ## Recovery

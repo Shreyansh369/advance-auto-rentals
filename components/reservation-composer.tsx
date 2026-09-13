@@ -384,6 +384,9 @@ export function ReservationComposer() {
   const [contractQueue, setContractQueue] =
     useState<ContractQueueEntry[]>([]);
 
+  const [contractQueueError, setContractQueueError] =
+    useState<string>();
+
   const [error, setError] =
     useState<string>();
 
@@ -641,16 +644,6 @@ export function ReservationComposer() {
           ),
       );
 
-      setContractQueue(
-        await callFirestoreOperation<
-          undefined,
-          ContractQueueEntry[]
-        >(
-          "listContractsForReview",
-          undefined,
-        ),
-      );
-
       setReservations(
         reservationDocs.docs.map(
           (snapshot) => ({
@@ -722,6 +715,46 @@ export function ReservationComposer() {
     }
   }
 
+  /*
+   * The review queue is a convenience panel, not part of
+   * taking a booking, so it is read on its own and its
+   * failure is confined to the panel. Folding it into load()
+   * meant one unreadable collection — most likely security
+   * rules that have not been deployed yet — left the desk
+   * with no vehicles, no reservations and no way to work.
+   */
+  async function loadContractQueue(
+    isCancelled: () => boolean = () => false,
+  ) {
+    try {
+      const entries =
+        await callFirestoreOperation<
+          undefined,
+          ContractQueueEntry[]
+        >(
+          "listContractsForReview",
+          undefined,
+        );
+
+      if (isCancelled()) {
+        return;
+      }
+
+      setContractQueue(entries);
+      setContractQueueError(undefined);
+    } catch (cause) {
+      if (isCancelled()) {
+        return;
+      }
+
+      setContractQueue([]);
+
+      setContractQueueError(
+        firebaseErrorMessage(cause),
+      );
+    }
+  }
+
   async function loadPayableRentals(
     isCancelled: () => boolean = () => false,
   ) {
@@ -762,6 +795,7 @@ export function ReservationComposer() {
         () => {
           void load();
           void loadPayableRentals();
+          void loadContractQueue();
         },
         0,
       );
@@ -1746,17 +1780,28 @@ export function ReservationComposer() {
 
               /* A decision taken in the dialog changes what
                  is still waiting for review. */
-              void load();
+              void loadContractQueue();
             }}
           />
         )}
 
       {tab === "booking" &&
-        contractQueue.length > 0 && (
+        (contractQueue.length > 0 ||
+          contractQueueError) && (
           <section className="surface contract-queue">
             <p className="section-kicker">
               Contracts awaiting a decision
             </p>
+
+            {contractQueueError && (
+              <p className="form-help">
+                The review queue could not be
+                loaded, so contracts waiting for
+                a decision are not listed here.
+                Bookings are unaffected.{" "}
+                {contractQueueError}
+              </p>
+            )}
 
             <ul>
               {contractQueue.map(

@@ -5,7 +5,18 @@ import {
   initializeTestEnvironment,
   type RulesTestEnvironment,
 } from "@firebase/rules-unit-testing";
-import { doc, getDoc, setDoc, updateDoc, deleteDoc } from "firebase/firestore";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  query,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  where,
+} from "firebase/firestore";
 import { afterAll, beforeAll, describe, it } from "vitest";
 
 /*
@@ -340,6 +351,81 @@ describe("Firestore access policy", () => {
         status: "in_review",
         version: 1,
       }),
+    );
+  });
+
+  /*
+   * A collection the application reads but the rules never
+   * match falls through to the default deny, and the screen
+   * that reads it reports a permission error to a user who
+   * has every permission. That has happened twice now — the
+   * rental extensions subcollection, and the contract review
+   * queue — so every path the client touches is asserted to
+   * be matched by a rule rather than reaching the fallthrough.
+   *
+   * Keep this list in step with lib/services/firestore-client.ts.
+   */
+  const CLIENT_PATHS: string[][] = [
+    ["users", ADMIN],
+    ["vehicles", "vehicle_001"],
+    ["vehicles", "vehicle_001", "serviceRecords", "service_001"],
+    ["vehicleRegistry", "reg_RT-001"],
+    ["customers", "customer_001"],
+    ["reservations", "reservation_001"],
+    ["reservationContracts", "contract_approved"],
+    ["reservationContracts", "contract_approved", "versions", "v1"],
+    ["reservationContracts", "contract_approved", "deliveries", "delivery_001"],
+    ["rentals", "rental_001"],
+    ["rentals", "rental_001", "inspections", "inspection_001"],
+    ["rentals", "rental_001", "extensions", "ext_001"],
+    ["rentalFinancials", "rental_001"],
+    ["payments", "payment_001"],
+    ["refunds", "refund_001"],
+    ["financialLedger", "entry_001"],
+    ["vehicleExpenses", "expense_001"],
+    ["auditLogs", "audit_001"],
+    ["idempotencyKeys", "payment_001"],
+  ];
+
+  it("matches every collection the application reads with a rule", async () => {
+    const db = asUser(ADMIN);
+
+    for (const path of CLIENT_PATHS) {
+      const [first, ...rest] = path;
+
+      await assertSucceeds(
+        getDoc(doc(db, first, ...rest)),
+      );
+    }
+  });
+
+  it("lets staff run the review queue query the booking screen issues", async () => {
+    /* A get() passing is not evidence that a list() passes: the
+       rules engine evaluates a query without a document. This is
+       the exact query components/reservation-composer.tsx runs. */
+    for (const uid of [OPS, ADMIN]) {
+      await assertSucceeds(
+        getDocs(
+          query(
+            collection(asUser(uid), "reservationContracts"),
+            where("status", "in", ["in_review", "rejected"]),
+            limit(50),
+          ),
+        ),
+      );
+    }
+
+    await assertFails(
+      getDocs(
+        query(
+          collection(
+            testEnv.unauthenticatedContext().firestore(),
+            "reservationContracts",
+          ),
+          where("status", "in", ["in_review", "rejected"]),
+          limit(50),
+        ),
+      ),
     );
   });
 

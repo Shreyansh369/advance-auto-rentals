@@ -14,6 +14,7 @@ import {
 import { useCallback, useEffect, useState } from "react";
 
 import { AppShell } from "./app-shell";
+import { RentalHistory } from "./rental-history";
 
 import {
   callFirestoreOperation,
@@ -541,6 +542,36 @@ export function Dashboard() {
             </Link>
           </div>
         </article>
+      </section>
+
+      <section className="surface history-panel">
+        <div className="section-heading">
+          <div>
+            <p className="section-kicker">
+              Recent activity
+            </p>
+
+            <h2>Rental history</h2>
+          </div>
+
+          <Link
+            className="text-link"
+            href="/customers?view=history"
+          >
+            Full history
+          </Link>
+        </div>
+
+        {/*
+          * Its own read, so a history that cannot be loaded
+          * costs the dashboard its bottom panel and nothing
+          * else.
+          */}
+        <RentalHistory
+          compact
+          limit={8}
+          reloadToken={reloadToken}
+        />
       </section>
     </AppShell>
   );

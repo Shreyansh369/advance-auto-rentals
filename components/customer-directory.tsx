@@ -12,6 +12,7 @@ import {
 
 import {
   CarFront,
+  History,
   Pencil,
   Plus,
   Search,
@@ -30,6 +31,7 @@ import {
 import { AppShell } from "./app-shell";
 import { CountrySelect } from "./country-select";
 import { useFirebaseAuth } from "./firebase-provider";
+import { RentalHistory } from "./rental-history";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
@@ -78,7 +80,8 @@ type ActiveRental = {
 
 type CustomerTab =
   | "customers"
-  | "active-rentals";
+  | "active-rentals"
+  | "history";
 
 function tomorrowDate(): string {
   const value = new Date();
@@ -202,14 +205,40 @@ function formatRentalDate(
   );
 }
 
-export function CustomerDirectory() {
+export function CustomerDirectory({
+  initialView,
+}: {
+  initialView?: string | null;
+} = {}) {
   const { role } =
     useFirebaseAuth();
 
-  const [tab, setTab] =
-    useState<CustomerTab>(
-      "customers",
-    );
+  /*
+   * The tab follows the URL rather than only its first value:
+   * following the dashboard's history link while /customers is
+   * already mounted changes the query without remounting, and
+   * the linked tab would otherwise not open.
+   */
+  const [manualTab, setManualTab] =
+    useState<{
+      view: string | null;
+      tab: CustomerTab;
+    } | null>(null);
+
+  const tab: CustomerTab =
+    manualTab &&
+    manualTab.view === (initialView ?? null)
+      ? manualTab.tab
+      : initialView === "history"
+        ? "history"
+        : "customers";
+
+  function setTab(next: CustomerTab) {
+    setManualTab({
+      view: initialView ?? null,
+      tab: next,
+    });
+  }
 
   const [customers, setCustomers] =
     useState<Customer[]>([]);
@@ -1136,31 +1165,42 @@ export function CustomerDirectory() {
               placeholder={
                 tab === "customers"
                   ? "Search name, telephone or licence"
-                  : "Search customer, vehicle or staff"
+                  : tab === "history"
+                    ? "Search customer or vehicle"
+                    : "Search customer, vehicle or staff"
               }
               aria-label={
                 tab === "customers"
                   ? "Search customers"
-                  : "Search active rentals"
+                  : tab === "history"
+                    ? "Search rental history"
+                    : "Search active rentals"
               }
             />
           </div>
 
-          <span className="customer-count">
-            {tab === "customers"
-              ? `${filteredCustomers.length} customer${
-                  filteredCustomers.length ===
-                  1
-                    ? ""
-                    : "s"
-                }`
-              : `${filteredRentals.length} active rental${
-                  filteredRentals.length ===
-                  1
-                    ? ""
-                    : "s"
-                }`}
-          </span>
+          {/*
+            * The history list owns its own records, so there is
+            * no count to state here without duplicating the
+            * query behind it.
+            */}
+          {tab !== "history" && (
+            <span className="customer-count">
+              {tab === "customers"
+                ? `${filteredCustomers.length} customer${
+                    filteredCustomers.length ===
+                    1
+                      ? ""
+                      : "s"
+                  }`
+                : `${filteredRentals.length} active rental${
+                    filteredRentals.length ===
+                    1
+                      ? ""
+                      : "s"
+                  }`}
+            </span>
+          )}
 
           {tab === "customers" && (
             <button
@@ -1258,6 +1298,25 @@ export function CustomerDirectory() {
               size={15}
             />
             Active rentals
+          </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={
+              tab === "history"
+            }
+            className={
+              tab === "history"
+                ? "button button-primary compact"
+                : "button button-secondary compact"
+            }
+            onClick={() =>
+              setTab("history")
+            }
+          >
+            <History size={15} />
+            History
           </button>
         </div>
 
@@ -2054,6 +2113,13 @@ export function CustomerDirectory() {
               </div>
             )}
           </>
+        )}
+
+        {tab === "history" && (
+          <RentalHistory
+            limit={200}
+            search={rentalSearch}
+          />
         )}
       </section>
     </AppShell>

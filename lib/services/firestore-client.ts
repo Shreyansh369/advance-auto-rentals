@@ -6029,6 +6029,158 @@ async function reviewContract(
 }
 
 /* =========================================================
+   Rental history
+   ========================================================= */
+
+export type RentalHistoryEntry = {
+  rentalId: string;
+  customerId: string;
+  customerName: string;
+  vehicleId: string;
+  vehicleRegistration: string;
+  status: string;
+  pickupAt: string | null;
+  actualReturnAt: string | null;
+  baseRentalCents: number;
+  adjustmentCents: number;
+  totalCents: number;
+  paidCents: number;
+  outstandingCents: number;
+};
+
+/*
+ * History is read from rentalFinancials rather than by joining
+ * rentals to their totals: that one document already carries
+ * the vehicle, the customer, the dates and the money, so a
+ * page of history is a single query instead of one read per
+ * row.
+ *
+ * Neither shape below needs a composite index. The whole-fleet
+ * view orders on a single field; the per-customer view filters
+ * on a single field and is ordered here, which keeps the
+ * feature from requiring an index deployment to work.
+ */
+async function listRentalHistory(
+  input: {
+    customerId?: string | null;
+    limit?: number;
+  },
+): Promise<RentalHistoryEntry[]> {
+  const { db } = getFirebaseClient();
+
+  const customerId = trimmedOrNull(
+    input.customerId,
+  );
+
+  const cap = Math.min(
+    Math.max(
+      Number(input.limit ?? 50) || 50,
+      1,
+    ),
+    200,
+  );
+
+  const snapshot = await getDocs(
+    customerId
+      ? query(
+          collection(db, "rentalFinancials"),
+          where(
+            "customerId",
+            "==",
+            customerId,
+          ),
+          limit(cap),
+        )
+      : query(
+          collection(db, "rentalFinancials"),
+          orderBy("createdAt", "desc"),
+          limit(cap),
+        ),
+  );
+
+  return snapshot.docs
+    .map((entry) => {
+      const pickupAt =
+        entry.get("pickupAt") == null
+          ? null
+          : toIso(entry.get("pickupAt"));
+
+      const actualReturnAt =
+        entry.get("actualReturnAt") == null
+          ? null
+          : toIso(
+              entry.get("actualReturnAt"),
+            );
+
+      return {
+        rentalId: String(
+          entry.get("rentalId") ?? entry.id,
+        ),
+
+        customerId: String(
+          entry.get("customerId") ?? "",
+        ),
+
+        customerName: String(
+          entry.get("customerNameSnapshot") ??
+            "Unknown customer",
+        ),
+
+        vehicleId: String(
+          entry.get("vehicleId") ?? "",
+        ),
+
+        vehicleRegistration: String(
+          entry.get("vehicleRegistration") ??
+            "Unknown vehicle",
+        ),
+
+        status: String(
+          entry.get("rentalStatus") ?? "active",
+        ),
+
+        pickupAt,
+
+        actualReturnAt,
+
+        baseRentalCents: Number(
+          entry.get("baseRentalCents") ?? 0,
+        ),
+
+        adjustmentCents: Number(
+          entry.get("adjustmentCents") ?? 0,
+        ),
+
+        totalCents: Number(
+          entry.get("totalCents") ?? 0,
+        ),
+
+        paidCents: Number(
+          entry.get("paidCents") ?? 0,
+        ),
+
+        outstandingCents: Number(
+          entry.get("outstandingCents") ?? 0,
+        ),
+
+        /* Sort key only; not part of the result. */
+        sortAt: new Date(
+          actualReturnAt ??
+            pickupAt ??
+            0,
+        ).getTime(),
+      };
+    })
+    .sort((a, b) => b.sortAt - a.sortAt)
+    .map(
+      ({
+        sortAt: _sortAt,
+        ...entry
+      }) => entry,
+    );
+}
+
+/* =========================================================
    Compatibility dispatcher
    ========================================================= */
 
@@ -6100,6 +6252,16 @@ export async function callFirestoreOperation<
       return (
         (await deleteCustomer(
           data as { customerId: string },
+        )) as TResult
+      );
+
+    case "listRentalHistory":
+      return (
+        (await listRentalHistory(
+          data as {
+            customerId?: string | null;
+            limit?: number;
+          },
         )) as TResult
       );
 
