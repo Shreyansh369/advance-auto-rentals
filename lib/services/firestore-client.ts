@@ -1240,6 +1240,17 @@ async function createOrUpdateCustomer(
         input.address,
       ),
 
+    /* Printed on the agreement beside the address. */
+    state:
+      trimmedOrNull(
+        input.state,
+      ),
+
+    localAddress:
+      trimmedOrNull(
+        input.localAddress,
+      ),
+
     licenceNumber,
 
     licenceCountry,
@@ -1723,6 +1734,389 @@ async function getReservationContract(
   };
 }
 
+export type RentalAgreementView = {
+  rentalId: string;
+  reservationId: string;
+  status: string;
+  createdAt: string;
+  renter: {
+    fullName: string;
+    address: string | null;
+    state: string | null;
+    localAddress: string | null;
+    dateOfBirth: string | null;
+    licenceNumber: string;
+    licenceCountry: string;
+    licenceExpiresAt: string | null;
+    telephone: string;
+    email: string | null;
+  };
+  additionalDriver: {
+    fullName: string;
+    address: string | null;
+    state: string | null;
+    localAddress: string | null;
+    dateOfBirth: string | null;
+    licenceNumber: string | null;
+    licenceExpiresAt: string | null;
+    telephone: string | null;
+  } | null;
+  vehicle: {
+    registration: string;
+    make: string;
+    model: string;
+    year: number | null;
+    color: string | null;
+  };
+  dateOut: string;
+  dateIn: string;
+  actualTimeIn: string | null;
+  extraHours: number;
+  odometerOut: {
+    value: number;
+    unit: string;
+  } | null;
+  odometerIn: {
+    value: number;
+    unit: string;
+  } | null;
+  totalDistance: number | null;
+  gasOut: string | null;
+  gasIn: string | null;
+  waivers: {
+    liabilityWaiver: boolean;
+    windscreenWaiver: boolean;
+    personalAccidentInsurance: boolean;
+  };
+  depositCents: number;
+  payment: {
+    method: string | null;
+    referenceLast4: string | null;
+    cardHolder: string | null;
+  };
+  charges: Record<string, number>;
+  chargeTotalCents: number;
+  specialInstructions: string | null;
+  preparedBy: string;
+  checkedOutBy: string;
+  customerSignatureDataUrl: string | null;
+  customerSignatureName: string | null;
+  customerSignatureMethod: "drawn" | "typed" | null;
+  additionalDriverSignatureDataUrl: string | null;
+  additionalDriverSignatureName: string | null;
+  media: Array<Record<string, unknown>>;
+};
+
+function fuelToGas(
+  value: unknown,
+): string | null {
+  /*
+   * The workshop records fuel in eighths; the printed form has
+   * five boxes. The reading is mapped to the nearest box the
+   * form actually offers rather than inventing a sixth.
+   */
+  const map: Record<string, string> = {
+    empty: "empty",
+    one_eighth: "quarter",
+    quarter: "quarter",
+    three_eighths: "half",
+    half: "half",
+    five_eighths: "half",
+    three_quarters: "three_quarters",
+    seven_eighths: "full",
+    full: "full",
+  };
+
+  const key = trimmedOrNull(value);
+
+  return key ? (map[key] ?? null) : null;
+}
+
+/*
+ * The agreement is rebuilt from the rental every time it is
+ * opened. It is issued at checkout, so the rental — not the
+ * booking — is what holds the signature, the condition photos
+ * and the charge rows the renter agreed to.
+ */
+async function getRentalAgreement(
+  input: { rentalId: string },
+): Promise<RentalAgreementView> {
+  const { db } = getFirebaseClient();
+
+  const rentalId = trimmedOrNull(
+    input.rentalId,
+  );
+
+  if (!rentalId) {
+    throw new Error(
+      "A rental reference is required.",
+    );
+  }
+
+  const rentalSnapshot = await getDoc(
+    doc(db, "rentals", rentalId),
+  );
+
+  if (!rentalSnapshot.exists()) {
+    throw new Error("Rental was not found.");
+  }
+
+  const rental = rentalSnapshot.data();
+
+  const [customerSnapshot, vehicleSnapshot] =
+    await Promise.all([
+      getDoc(
+        doc(
+          db,
+          "customers",
+          String(rental.customerId),
+        ),
+      ),
+
+      getDoc(
+        doc(
+          db,
+          "vehicles",
+          String(rental.vehicleId),
+        ),
+      ),
+    ]);
+
+  const customer = customerSnapshot.data() ?? {};
+  const vehicle = vehicleSnapshot.data() ?? {};
+
+  const agreement = (rental.agreement ??
+    {}) as Record<string, unknown>;
+
+  const driver = (agreement.additionalDriver ??
+    null) as Record<string, unknown> | null;
+
+  const waivers = (agreement.waivers ??
+    {}) as Record<string, unknown>;
+
+  const chargeInput = (agreement.charges ??
+    {}) as Record<string, unknown>;
+
+  const charges: Record<string, number> = {};
+
+  for (const key of CHARGE_KEYS) {
+    charges[key] = Number(
+      chargeInput[key] ?? 0,
+    );
+  }
+
+  const odometerOutValue =
+    rental.pickupOdometerValue == null
+      ? null
+      : Number(rental.pickupOdometerValue);
+
+  const odometerInValue =
+    rental.returnOdometerValue == null
+      ? null
+      : Number(rental.returnOdometerValue);
+
+  return {
+    rentalId: rentalSnapshot.id,
+
+    reservationId: String(
+      rental.reservationId ?? "",
+    ),
+
+    status: String(rental.status ?? "active"),
+
+    createdAt: toIso(rental.createdAt),
+
+    renter: {
+      fullName: String(
+        customer.fullName ??
+          rental.customerNameSnapshot ??
+          "",
+      ),
+      address: trimmedOrNull(customer.address),
+      state: trimmedOrNull(customer.state),
+      localAddress: trimmedOrNull(
+        customer.localAddress,
+      ),
+      dateOfBirth: trimmedOrNull(
+        customer.dateOfBirth,
+      ),
+      licenceNumber: String(
+        customer.licenceNumber ?? "",
+      ),
+      licenceCountry: String(
+        customer.licenceCountry ?? "",
+      ),
+      licenceExpiresAt: trimmedOrNull(
+        customer.licenceExpiresAt,
+      ),
+      telephone: String(
+        customer.telephone ?? "",
+      ),
+      email: trimmedOrNull(customer.email),
+    },
+
+    additionalDriver: driver
+      ? {
+          fullName: String(
+            driver.fullName ?? "",
+          ),
+          address: trimmedOrNull(driver.address),
+          state: trimmedOrNull(driver.state),
+          localAddress: trimmedOrNull(
+            driver.localAddress,
+          ),
+          dateOfBirth: trimmedOrNull(
+            driver.dateOfBirth,
+          ),
+          licenceNumber: trimmedOrNull(
+            driver.licenceNumber,
+          ),
+          licenceExpiresAt: trimmedOrNull(
+            driver.licenceExpiresAt,
+          ),
+          telephone: trimmedOrNull(
+            driver.telephone,
+          ),
+        }
+      : null,
+
+    vehicle: {
+      registration: String(
+        rental.vehicleRegistrationSnapshot ??
+          vehicle.registrationNumber ??
+          "",
+      ),
+      make: String(vehicle.make ?? ""),
+      model: String(vehicle.model ?? ""),
+      year:
+        vehicle.year == null
+          ? null
+          : Number(vehicle.year),
+      color: trimmedOrNull(vehicle.color),
+    },
+
+    dateOut: toIso(rental.pickupAt),
+
+    dateIn: toIso(rental.expectedReturnAt),
+
+    actualTimeIn:
+      rental.actualReturnAt == null
+        ? null
+        : toIso(rental.actualReturnAt),
+
+    extraHours: Number(
+      agreement.extraHours ?? 0,
+    ),
+
+    odometerOut:
+      odometerOutValue == null
+        ? null
+        : {
+            value: odometerOutValue,
+            unit: String(
+              rental.pickupOdometerUnit ?? "km",
+            ),
+          },
+
+    odometerIn:
+      odometerInValue == null
+        ? null
+        : {
+            value: odometerInValue,
+            unit: String(
+              rental.returnOdometerUnit ?? "km",
+            ),
+          },
+
+    totalDistance:
+      rental.returnOdometerKm == null
+        ? null
+        : Number(rental.returnOdometerKm) -
+          Number(rental.pickupOdometerKm ?? 0),
+
+    gasOut: fuelToGas(rental.pickupFuelLevel),
+
+    gasIn: fuelToGas(rental.returnFuelLevel),
+
+    waivers: {
+      liabilityWaiver:
+        waivers.liabilityWaiver === true,
+      windscreenWaiver:
+        waivers.windscreenWaiver === true,
+      personalAccidentInsurance:
+        waivers.personalAccidentInsurance ===
+        true,
+    },
+
+    depositCents: Number(
+      agreement.depositCents ?? 0,
+    ),
+
+    payment: {
+      method: trimmedOrNull(
+        agreement.paymentMethod,
+      ),
+      referenceLast4: trimmedOrNull(
+        agreement.paymentReferenceLast4,
+      ),
+      cardHolder: trimmedOrNull(
+        agreement.paymentCardHolder,
+      ),
+    },
+
+    charges,
+
+    chargeTotalCents: Number(
+      agreement.chargeTotalCents ?? 0,
+    ),
+
+    specialInstructions: trimmedOrNull(
+      agreement.specialInstructions ??
+        rental.checkoutNotes,
+    ),
+
+    preparedBy: String(
+      rental.createdByNameSnapshot ?? "",
+    ),
+
+    checkedOutBy: String(
+      rental.checkedOutByNameSnapshot ?? "",
+    ),
+
+    customerSignatureDataUrl:
+      typeof agreement.customerSignatureDataUrl ===
+      "string"
+        ? agreement.customerSignatureDataUrl
+        : null,
+
+    customerSignatureName: trimmedOrNull(
+      agreement.customerSignatureName,
+    ),
+
+    customerSignatureMethod:
+      agreement.customerSignatureMethod ===
+      "typed"
+        ? "typed"
+        : agreement.customerSignatureDataUrl
+          ? "drawn"
+          : null,
+
+    additionalDriverSignatureDataUrl:
+      typeof agreement.additionalDriverSignatureDataUrl ===
+      "string"
+        ? agreement.additionalDriverSignatureDataUrl
+        : null,
+
+    additionalDriverSignatureName: trimmedOrNull(
+      agreement.additionalDriverSignatureName,
+    ),
+
+    media: sanitizeMediaList(
+      rental.checkoutMedia,
+    ) as Array<Record<string, unknown>>,
+  };
+}
+
 /* =========================================================
    Reservation
    ========================================================= */
@@ -1737,8 +2131,6 @@ async function createReservation(
     dropoffLocation: string | null;
     notes: string | null;
     bookingMedia: Array<Record<string, unknown>>;
-    customerSignatureDataUrl: string | null;
-    customerSignatureName: string | null;
   },
 ): Promise<{
   reservationId: string;
@@ -1773,55 +2165,11 @@ async function createReservation(
   }
 
   /*
-   * A booking is acknowledged either by a signature drawn on
-   * the device or by the customer's name typed in. Drawing is
-   * no longer required — a counter without a touchscreen, or
-   * a booking taken over the telephone, has no way to produce
-   * one — but one of the two has to be present, so every
-   * agreement records who accepted it.
+   * The agreement is signed at checkout, when the customer is
+   * at the counter and the car is in front of them, so a
+   * booking no longer captures a signature. Taking one here
+   * meant signing for a vehicle nobody had inspected yet.
    */
-  const signatureDataUrl = trimmedOrNull(
-    input.customerSignatureDataUrl,
-  );
-
-  const signatureName = trimmedOrNull(
-    input.customerSignatureName,
-  );
-
-  if (!signatureDataUrl && !signatureName) {
-    throw new Error(
-      "Capture the customer signature, or type the customer's name, before confirming the booking.",
-    );
-  }
-
-  if (signatureDataUrl) {
-    if (
-      !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(
-        signatureDataUrl,
-      )
-    ) {
-      throw new Error(
-        "The captured signature could not be read. Clear it and sign again.",
-      );
-    }
-
-    /*
-     * Firestore documents are limited to 1 MiB, so a
-     * signature large enough to threaten that limit is
-     * rejected rather than silently truncated.
-     */
-    if (signatureDataUrl.length > 400_000) {
-      throw new Error(
-        "The captured signature is too large. Clear it and sign again.",
-      );
-    }
-  }
-
-  if (signatureName && signatureName.length > 120) {
-    throw new Error(
-      "The typed name is too long.",
-    );
-  }
 
   const bookingMedia =
     sanitizeMediaList(
@@ -1994,20 +2342,6 @@ async function createReservation(
         reservationRef,
         {
           bookingMedia,
-
-          customerSignatureDataUrl:
-            signatureDataUrl,
-
-          customerSignatureName:
-            signatureName,
-
-          customerSignatureMethod:
-            signatureDataUrl
-              ? "drawn"
-              : "typed",
-
-          customerSignatureCapturedAt:
-            nowTimestamp(),
 
           customerId:
             customerRef.id,
@@ -2321,6 +2655,256 @@ async function cancelReservation(
    Checkout
    ========================================================= */
 
+export type AgreementInput = {
+  /** Drawn signature, or null when the name was typed. */
+  customerSignatureDataUrl: string | null;
+  customerSignatureName: string | null;
+  additionalDriverSignatureDataUrl: string | null;
+  additionalDriverSignatureName: string | null;
+  additionalDriver: Record<string, unknown> | null;
+  waivers: Record<string, unknown> | null;
+  depositCents: number | null;
+  paymentMethod: string | null;
+  /* Never the full number: only what is needed to identify a
+     payment afterwards. The printed form leaves the rest to be
+     completed by hand. */
+  paymentReferenceLast4: string | null;
+  paymentCardHolder: string | null;
+  charges: Record<string, unknown> | null;
+  specialInstructions: string | null;
+  extraHours: number | null;
+};
+
+const WAIVER_KEYS = [
+  "liabilityWaiver",
+  "windscreenWaiver",
+  "personalAccidentInsurance",
+] as const;
+
+const CHARGE_KEYS = [
+  "daily",
+  "weekly",
+  "monthly",
+  "extraHours",
+  "fuel",
+  "detailing",
+  "liabilityWaiver",
+  "windscreenWaiver",
+  "insurance",
+  "other",
+] as const;
+
+const PAYMENT_METHODS = [
+  "cash",
+  "check",
+  "credit",
+] as const;
+
+/*
+ * The agreement block captured at checkout. Everything is
+ * normalised to a stored shape here, because it is printed on
+ * a document the renter signs: an undefined or a stray string
+ * would show up as a blank on a legal form.
+ */
+function agreementRecord(
+  input: Partial<AgreementInput>,
+): Record<string, unknown> {
+  const signatureDataUrl = trimmedOrNull(
+    input.customerSignatureDataUrl,
+  );
+
+  const signatureName = trimmedOrNull(
+    input.customerSignatureName,
+  );
+
+  if (!signatureDataUrl && !signatureName) {
+    throw new Error(
+      "Capture the renter's signature, or type their name, before completing the checkout.",
+    );
+  }
+
+  if (
+    signatureDataUrl &&
+    !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(
+      signatureDataUrl,
+    )
+  ) {
+    throw new Error(
+      "The captured signature could not be read. Clear it and sign again.",
+    );
+  }
+
+  if (
+    signatureDataUrl &&
+    signatureDataUrl.length > 400_000
+  ) {
+    throw new Error(
+      "The captured signature is too large. Clear it and sign again.",
+    );
+  }
+
+  const driverSignatureDataUrl = trimmedOrNull(
+    input.additionalDriverSignatureDataUrl,
+  );
+
+  if (
+    driverSignatureDataUrl &&
+    (!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(
+      driverSignatureDataUrl,
+    ) ||
+      driverSignatureDataUrl.length > 400_000)
+  ) {
+    throw new Error(
+      "The additional driver's signature could not be read. Clear it and sign again.",
+    );
+  }
+
+  const driver = (input.additionalDriver ??
+    {}) as Record<string, unknown>;
+
+  const additionalDriverName = trimmedOrNull(
+    driver.fullName,
+  );
+
+  const waiverInput = (input.waivers ??
+    {}) as Record<string, unknown>;
+
+  const waivers: Record<string, boolean> = {};
+
+  for (const key of WAIVER_KEYS) {
+    waivers[key] = waiverInput[key] === true;
+  }
+
+  const chargeInput = (input.charges ??
+    {}) as Record<string, unknown>;
+
+  const charges: Record<string, number> = {};
+
+  let chargeTotalCents = 0;
+
+  for (const key of CHARGE_KEYS) {
+    const cents = assertMoneyCents(
+      chargeInput[key] ?? 0,
+      "Charge amount",
+    );
+
+    charges[key] = cents;
+    chargeTotalCents += cents;
+  }
+
+  assertMoneyCents(
+    chargeTotalCents,
+    "Agreement total",
+  );
+
+  const method = trimmedOrNull(
+    input.paymentMethod,
+  );
+
+  if (
+    method &&
+    !(PAYMENT_METHODS as readonly string[]).includes(
+      method,
+    )
+  ) {
+    throw new Error(
+      "Select a valid payment method.",
+    );
+  }
+
+  const last4 = trimmedOrNull(
+    input.paymentReferenceLast4,
+  );
+
+  if (last4 && !/^[0-9]{4}$/.test(last4)) {
+    throw new Error(
+      "Record only the last four digits of the card or check number.",
+    );
+  }
+
+  const extraHours = Number(
+    input.extraHours ?? 0,
+  );
+
+  if (
+    !Number.isFinite(extraHours) ||
+    extraHours < 0 ||
+    extraHours > 999
+  ) {
+    throw new Error(
+      "Extra hours must be a whole number of hours.",
+    );
+  }
+
+  return {
+    customerSignatureDataUrl: signatureDataUrl,
+
+    customerSignatureName: signatureName,
+
+    customerSignatureMethod: signatureDataUrl
+      ? "drawn"
+      : "typed",
+
+    additionalDriverSignatureDataUrl:
+      driverSignatureDataUrl,
+
+    additionalDriverSignatureName:
+      trimmedOrNull(
+        input.additionalDriverSignatureName,
+      ),
+
+    additionalDriver: additionalDriverName
+      ? {
+          fullName: additionalDriverName,
+          address: trimmedOrNull(driver.address),
+          state: trimmedOrNull(driver.state),
+          dateOfBirth: trimmedOrNull(
+            driver.dateOfBirth,
+          ),
+          licenceNumber: trimmedOrNull(
+            driver.licenceNumber,
+          ),
+          licenceExpiresAt: trimmedOrNull(
+            driver.licenceExpiresAt,
+          ),
+          telephone: trimmedOrNull(
+            driver.telephone,
+          ),
+          localAddress: trimmedOrNull(
+            driver.localAddress,
+          ),
+        }
+      : null,
+
+    waivers,
+
+    depositCents: assertMoneyCents(
+      input.depositCents ?? 0,
+      "Deposit",
+    ),
+
+    paymentMethod: method,
+
+    paymentReferenceLast4: last4,
+
+    paymentCardHolder: trimmedOrNull(
+      input.paymentCardHolder,
+    ),
+
+    charges,
+
+    chargeTotalCents,
+
+    specialInstructions: trimmedOrNull(
+      input.specialInstructions,
+    ),
+
+    extraHours: Math.trunc(extraHours),
+
+    capturedAt: nowTimestamp(),
+  };
+}
+
 async function checkoutReservation(
   input: {
     reservationId: string;
@@ -2330,7 +2914,8 @@ async function checkoutReservation(
       unit: "km" | "mi";
     };
     notes: string | null;
-  },
+    checkoutMedia?: Array<Record<string, unknown>>;
+  } & Partial<AgreementInput>,
 ): Promise<{
   rentalId: string;
 }> {
@@ -2339,6 +2924,44 @@ async function checkoutReservation(
 
   const actorUid =
     getActorUid();
+
+  /*
+   * The signature and the condition photos are taken here now,
+   * not at booking: this is the moment the renter is at the
+   * counter with the car in front of them, and it is what the
+   * agreement they sign has to describe.
+   */
+  const agreement = agreementRecord(input);
+
+  /*
+   * The daily, weekly and monthly rows restate the booking's
+   * own quote, which the rental already carries as its base.
+   * Only the rest of the table is new money, so only the rest
+   * is added to the balance; counting the whole table would
+   * charge the rental days twice.
+   */
+  const agreementCharges = agreement.charges as Record<
+    string,
+    number
+  >;
+
+  const agreementAdjustmentCents = [
+    "extraHours",
+    "fuel",
+    "detailing",
+    "liabilityWaiver",
+    "windscreenWaiver",
+    "insurance",
+    "other",
+  ].reduce(
+    (sum, key) =>
+      sum + Number(agreementCharges[key] ?? 0),
+    0,
+  );
+
+  const checkoutMedia = sanitizeMediaList(
+    input.checkoutMedia,
+  );
 
   /*
    * The employee may record the odometer in kilometres or
@@ -2490,6 +3113,10 @@ async function checkoutReservation(
               input.notes,
             ),
 
+          agreement,
+
+          checkoutMedia,
+
           actualReturnAt:
             null,
 
@@ -2538,10 +3165,19 @@ async function checkoutReservation(
 
           baseRentalCents,
 
-          adjustmentCents: 0,
+          /*
+           * The agreement's charge rows — waivers, insurance,
+           * detailing and the rest — are part of what the
+           * renter signs for, so they land on the balance as
+           * adjustments rather than being printed on the form
+           * and then forgotten by the till.
+           */
+          adjustmentCents:
+            agreementAdjustmentCents,
 
           totalCents:
-            baseRentalCents,
+            baseRentalCents +
+            agreementAdjustmentCents,
 
           paidCents: 0,
 
@@ -2556,7 +3192,8 @@ async function checkoutReservation(
             0,
 
           outstandingCents:
-            baseRentalCents,
+            baseRentalCents +
+            agreementAdjustmentCents,
 
           currency:
             "USD",
@@ -5832,6 +6469,7 @@ async function getContractWorkflow(
 
 export type ContractQueueEntry = {
   reservationId: string;
+  rentalId: string | null;
   status: ContractStatus;
   version: number;
   customerName: string;
@@ -5865,6 +6503,10 @@ async function listContractsForReview(): Promise<
   return snapshot.docs
     .map((entry) => ({
       reservationId: entry.id,
+
+      rentalId: trimmedOrNull(
+        entry.get("rentalId"),
+      ),
 
       status: contractStatusOf(
         entry.get("status"),
@@ -5907,7 +6549,10 @@ async function listContractsForReview(): Promise<
  * of review produced the approved text.
  */
 async function submitContractForReview(
-  input: { reservationId: string },
+  input: {
+    reservationId: string;
+    rentalId?: string | null;
+  },
 ): Promise<{
   reservationId: string;
   version: number;
@@ -5983,6 +6628,19 @@ async function submitContractForReview(
 
       const review = {
         reservationId,
+
+        /*
+         * The agreement is issued at checkout, so the queue
+         * has to reopen the rental's document rather than the
+         * booking's.
+         */
+        rentalId:
+          trimmedOrNull(input.rentalId) ??
+          trimmedOrNull(
+            existing.exists()
+              ? existing.get("rentalId")
+              : null,
+          ),
 
         status: "in_review",
 
@@ -6678,7 +7336,10 @@ export async function callFirestoreOperation<
     case "submitContractForReview":
       return (
         (await submitContractForReview(
-          data as { reservationId: string },
+          data as {
+            reservationId: string;
+            rentalId?: string | null;
+          },
         )) as TResult
       );
 
@@ -6700,6 +7361,13 @@ export async function callFirestoreOperation<
         )) as TResult
       );
 
+    case "getRentalAgreement":
+      return (
+        (await getRentalAgreement(
+          data as { rentalId: string },
+        )) as TResult
+      );
+
     case "createReservation":
       return (
         (await createReservation(
@@ -6714,12 +7382,6 @@ export async function callFirestoreOperation<
             bookingMedia: Array<
               Record<string, unknown>
             >;
-            customerSignatureDataUrl:
-              | string
-              | null;
-            customerSignatureName:
-              | string
-              | null;
           },
         )) as TResult
       );

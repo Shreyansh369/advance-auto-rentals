@@ -12,6 +12,8 @@ import {
   formatMoney,
 } from "@/lib/presentation";
 
+import { RentalAgreement } from "./rental-agreement";
+
 /*
  * One history list, shown on the dashboard as a recent-activity
  * panel and on the customers screen as a full table. Both read
@@ -103,6 +105,13 @@ export function RentalHistory({
 
   const [loading, setLoading] =
     useState(true);
+
+  /*
+   * The agreement the office is looking at. Opening a history
+   * row is how staff pull up the paperwork a renter signed.
+   */
+  const [openRentalId, setOpenRentalId] =
+    useState<string>();
 
   useEffect(() => {
     let cancelled = false;
@@ -204,13 +213,28 @@ export function RentalHistory({
     );
   }
 
+  const sheet = openRentalId ? (
+    <RentalAgreement
+      rentalId={openRentalId}
+      onClose={() =>
+        setOpenRentalId(undefined)
+      }
+    />
+  ) : null;
+
   if (compact) {
     return (
       <div className="list-table">
         {visible.map((entry) => (
-          <div
-            className="pickup-row"
+          <button
+            type="button"
+            className="pickup-row history-row"
             key={entry.rentalId}
+            onClick={() =>
+              setOpenRentalId(entry.rentalId)
+            }
+            aria-label={`Open the agreement for ${entry.customerName}`}
+            title={`Open the agreement for ${entry.customerName}`}
           >
             <div className="pickup-time">
               <strong>
@@ -253,8 +277,10 @@ export function RentalHistory({
             >
               {statusLabel(entry.status)}
             </span>
-          </div>
+          </button>
         ))}
+
+        {sheet}
       </div>
     );
   }
@@ -284,9 +310,18 @@ export function RentalHistory({
               </td>
 
               <td>
-                <strong>
+                <button
+                  type="button"
+                  className="text-button history-open"
+                  title={`Open the agreement for ${entry.customerName}`}
+                  onClick={() =>
+                    setOpenRentalId(
+                      entry.rentalId,
+                    )
+                  }
+                >
                   {entry.customerName}
-                </strong>
+                </button>
               </td>
 
               <td>{day(entry.pickupAt)}</td>
@@ -341,6 +376,8 @@ export function RentalHistory({
           ))}
         </tbody>
       </table>
+
+      {sheet}
     </div>
   );
 }

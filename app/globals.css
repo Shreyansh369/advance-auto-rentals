@@ -126,6 +126,90 @@ a {
   gap: 8px;
 }
 
+/* The running balance on the payment screen, so the amount due
+   can be read off while the fees are still being typed. */
+.payment-due {
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--subtle);
+}
+
+.payment-due dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.payment-due dl > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.payment-due dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.payment-due dd {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.payment-due-total {
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.payment-due-total dt,
+.payment-due-total dd {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 780;
+}
+
+/* Grouped agreement inputs on the checkout form. */
+.checkout-block {
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.checkout-block legend {
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.checkout-charges {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.checkout-waivers,
+.checkout-methods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 10px;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+}
+
 /* Confirmed bookings that have not gone out yet, with the
    control that releases the vehicle they are holding. */
 .booking-list {
@@ -595,6 +679,34 @@ a {
   margin-top: 3px;
   color: var(--muted);
   font-size: 12px;
+}
+
+/* A history row is a button, so the office can open the
+   agreement a renter signed straight from the list. */
+.history-row {
+  width: 100%;
+  padding: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-row:hover,
+.history-row:focus-visible {
+  background: rgb(20 30 55 / 3%);
+}
+
+.history-open {
+  font-size: 13px;
+  font-weight: 750;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
 }
 
 .pickup-time {
@@ -5653,10 +5765,8 @@ canvas {
 }
 
 .agreement-sheet {
-  padding: 20px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--subtle);
+  display: grid;
+  gap: 16px;
 }
 
 .agreement-brand {
@@ -5810,6 +5920,323 @@ canvas {
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 11px;
+}
+
+/* =========================================================
+   Printed rental agreement
+   =========================================================
+   Laid out to match the paper form the office already uses:
+   boxed fields with a ruled value under a small caps label. */
+
+.sheet-page {
+  padding: 18px;
+  border: 2px solid #131a24;
+  border-radius: 4px;
+  background: #fff;
+  color: #131a24;
+}
+
+.sheet-page + .sheet-page {
+  margin-top: 16px;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid #131a24;
+}
+
+.sheet-head img {
+  width: min(230px, 45%);
+  height: auto;
+}
+
+.sheet-head-title {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  text-align: right;
+}
+
+.sheet-head-title strong {
+  font-size: 17px;
+  letter-spacing: 0.02em;
+}
+
+.sheet-head-title span {
+  color: #4a5568;
+  font-size: 12px;
+}
+
+.sheet-contact {
+  margin: 6px 0 12px;
+  color: #2b364d;
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.sheet-renters,
+.sheet-columns {
+  display: grid;
+  gap: 10px;
+}
+
+.sheet-renters {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.sheet-columns {
+  margin-top: 10px;
+  grid-template-columns:
+    minmax(0, 1.1fr)
+    minmax(0, 1fr)
+    minmax(0, 1fr);
+}
+
+.sheet-box {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 9px 10px;
+  border: 1px solid #131a24;
+}
+
+.sheet-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.sheet-field {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sheet-field-label {
+  color: #4a5568;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sheet-field-value {
+  min-height: 15px;
+  border-bottom: 1px solid #9aa4b2;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.sheet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10.5px;
+}
+
+.sheet-table th,
+.sheet-table td {
+  padding: 3px 5px;
+  border: 1px solid #131a24;
+  text-align: left;
+}
+
+.sheet-table th {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sheet-table th:not(:first-child),
+.sheet-table td:not(:first-child) {
+  width: 46px;
+  text-align: center;
+}
+
+.sheet-charges th:not(:first-child),
+.sheet-charges td:not(:first-child) {
+  width: 74px;
+  text-align: right;
+}
+
+.sheet-total td {
+  font-weight: 760;
+}
+
+.sheet-tick {
+  display: inline-block;
+  min-width: 12px;
+  font-weight: 760;
+}
+
+.sheet-tick-on {
+  color: #131a24;
+}
+
+.sheet-methods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 4px 0 6px;
+  font-size: 11px;
+}
+
+.sheet-payment,
+.sheet-instructions {
+  display: grid;
+  gap: 4px;
+}
+
+.sheet-instructions p {
+  min-height: 46px;
+  margin: 0;
+  padding: 4px 0;
+  border-bottom: 1px solid #9aa4b2;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.sheet-ocean {
+  display: grid;
+  gap: 2px;
+  margin: 2px 0 0;
+  font-size: 10.5px;
+}
+
+.sheet-notice {
+  margin: 10px 0 0;
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.sheet-photos {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid #131a24;
+}
+
+.sheet-photo-grid {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.sheet-photo-grid img {
+  width: 100%;
+  height: 74px;
+  border: 1px solid #9aa4b2;
+  object-fit: cover;
+}
+
+/* The four damage views, arranged as they are on the paper
+   form: front and back side by side, then the two profiles
+   across the full width. */
+.sheet-diagrams {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid #131a24;
+}
+
+.sheet-diagram-grid {
+  display: grid;
+  gap: 6px 10px;
+  margin-top: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.sheet-diagram {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin: 0;
+}
+
+.sheet-diagram-left,
+.sheet-diagram-right {
+  grid-column: 1 / -1;
+}
+
+.sheet-diagram img {
+  width: 100%;
+  max-width: 190px;
+  height: auto;
+}
+
+.sheet-diagram-left img,
+.sheet-diagram-right img {
+  max-width: 420px;
+}
+
+.sheet-diagram figcaption {
+  color: #4a5568;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.sheet-clauses {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding-left: 18px;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.sheet-acknowledgement {
+  margin: 18px 0 0;
+  font-size: 11px;
+}
+
+.sheet-signatures {
+  display: grid;
+  gap: 14px 22px;
+  margin-top: 22px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.sheet-signature-line {
+  display: flex;
+  align-items: flex-end;
+  min-height: 34px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #131a24;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.sheet-signature-line img {
+  max-width: 100%;
+  max-height: 34px;
+}
+
+.sheet-signatures small {
+  display: block;
+  margin-top: 3px;
+  color: #4a5568;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+@media (max-width: 900px) {
+  .sheet-renters,
+  .sheet-columns,
+  .sheet-signatures {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sheet-photo-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* =========================================================
@@ -5982,5 +6409,10 @@ canvas {
   .agreement-sheet {
     border: 0;
     background: #fff;
+  }
+
+  .sheet-diagrams,
+  .sheet-diagram {
+    break-inside: avoid;
   }
 }
