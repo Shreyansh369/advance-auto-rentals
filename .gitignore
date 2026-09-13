@@ -13,3 +13,7 @@ reports/
 *.log
 *.tsbuildinfo
 service-account*.json
+
+# Written by `next dev` for AI tooling; not part of the deliverable.
+AGENTS.md
+CLAUDE.md

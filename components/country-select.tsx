@@ -44,15 +44,27 @@ function countryName(
   }
 }
 
+/*
+ * The picker works either way round: the booking and signup
+ * forms read it by name after a submit, while the customer
+ * editors hold the value in component state. Passing `value`
+ * selects the controlled mode.
+ */
 export function CountrySelect({
   id,
   name,
+  value,
+  onChange,
   defaultValue = "",
   required = false,
   disabled = false,
 }: {
   id?: string;
-  name: string;
+  name?: string;
+  value?: string;
+  onChange?: (
+    event: React.ChangeEvent<HTMLSelectElement>,
+  ) => void;
   defaultValue?: string;
   required?: boolean;
   disabled?: boolean;
@@ -73,9 +85,12 @@ export function CountrySelect({
     <select
       id={id}
       name={name}
-      defaultValue={defaultValue}
       required={required}
       disabled={disabled}
+      onChange={onChange}
+      {...(value === undefined
+        ? { defaultValue }
+        : { value })}
     >
       <option value="">
         Select country

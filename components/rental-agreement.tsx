@@ -1,6 +1,13 @@
 "use client";
 
-import { Printer, X } from "lucide-react";
+import {
+  CheckCircle2,
+  Mail,
+  Printer,
+  Send,
+  X,
+  XCircle,
+} from "lucide-react";
 
 import { createPortal } from "react-dom";
 
@@ -10,10 +17,19 @@ import {
   useSyncExternalStore,
 } from "react";
 
+import { useFirebaseAuth } from "./firebase-provider";
+
 import {
   callFirestoreOperation,
+  type ContractStatus,
+  type ContractWorkflow,
   type ReservationContract,
 } from "@/lib/services/firestore-client";
+
+import {
+  contractMailerConfigured,
+  sendContractEmail,
+} from "@/lib/services/contract-mailer";
 
 import {
   firebaseErrorMessage,
@@ -42,6 +58,54 @@ function dateTime(value: string): string {
   );
 }
 
+function moment(
+  value: string | null,
+): string {
+  return value
+    ? dateTime(value)
+    : "Not recorded";
+}
+
+function statusLabel(
+  status: ContractStatus,
+): string {
+  switch (status) {
+    case "in_review":
+      return "Waiting for review";
+
+    case "approved":
+      return "Approved";
+
+    case "rejected":
+      return "Rejected";
+
+    default:
+      return "Not submitted";
+  }
+}
+
+/*
+ * The pill re-uses the fleet status palette rather than
+ * introducing a second set of colours for the same idea.
+ */
+function statusTone(
+  status: ContractStatus,
+): string {
+  switch (status) {
+    case "in_review":
+      return "cleaning";
+
+    case "approved":
+      return "available";
+
+    case "rejected":
+      return "overdue";
+
+    default:
+      return "";
+  }
+}
+
 /*
  * The agreement is rebuilt from the stored booking every time
  * it is opened, so it always reflects the reservation that was
@@ -54,11 +118,33 @@ export function RentalAgreement({
   reservationId: string;
   onClose: () => void;
 }) {
+  const { role } = useFirebaseAuth();
+
   const [contract, setContract] =
     useState<ReservationContract>();
 
+  const [workflow, setWorkflow] =
+    useState<ContractWorkflow>();
+
   const [error, setError] =
     useState<string>();
+
+  const [notice, setNotice] =
+    useState<string>();
+
+  const [busy, setBusy] =
+    useState(false);
+
+  const [reviewNote, setReviewNote] =
+    useState("");
+
+  /*
+   * Every decision rewrites the workflow record, so the panel
+   * is re-read from Firestore afterwards instead of being
+   * patched locally and drifting from what was stored.
+   */
+  const [reloadToken, setReloadToken] =
+    useState(0);
 
   /*
    * The dialog is mounted on document.body rather than inside
@@ -80,17 +166,30 @@ export function RentalAgreement({
 
     async function load() {
       try {
-        const result =
-          await callFirestoreOperation<
+        const [
+          agreement,
+          review,
+        ] = await Promise.all([
+          callFirestoreOperation<
             { reservationId: string },
             ReservationContract
           >(
             "getReservationContract",
             { reservationId },
-          );
+          ),
+
+          callFirestoreOperation<
+            { reservationId: string },
+            ContractWorkflow
+          >(
+            "getContractWorkflow",
+            { reservationId },
+          ),
+        ]);
 
         if (!cancelled) {
-          setContract(result);
+          setContract(agreement);
+          setWorkflow(review);
         }
       } catch (cause) {
         if (!cancelled) {
@@ -108,7 +207,117 @@ export function RentalAgreement({
     return () => {
       cancelled = true;
     };
-  }, [reservationId]);
+  }, [
+    reservationId,
+    reloadToken,
+  ]);
+
+  const status: ContractStatus =
+    workflow?.status ?? "not_submitted";
+
+  const isAdmin = role === "admin";
+
+  const mailerConfigured =
+    contractMailerConfigured();
+
+  const recipientEmail =
+    contract?.customer.email ?? null;
+
+  async function run(
+    action: () => Promise<string>,
+  ) {
+    setBusy(true);
+    setError(undefined);
+    setNotice(undefined);
+
+    try {
+      const message = await action();
+
+      setNotice(message);
+
+      setReloadToken(
+        (token) => token + 1,
+      );
+    } catch (cause) {
+      setError(
+        firebaseErrorMessage(cause),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function submitForReview() {
+    void run(async () => {
+      const result =
+        await callFirestoreOperation<
+          { reservationId: string },
+          {
+            reservationId: string;
+            version: number;
+          }
+        >(
+          "submitContractForReview",
+          { reservationId },
+        );
+
+      return `Sent for review as version ${result.version}.`;
+    });
+  }
+
+  function decide(
+    decision: "approve" | "reject",
+  ) {
+    const note =
+      reviewNote.trim() || null;
+
+    if (
+      decision === "reject" &&
+      !note
+    ) {
+      setNotice(undefined);
+
+      setError(
+        "Explain why the contract is being rejected.",
+      );
+
+      return;
+    }
+
+    void run(async () => {
+      await callFirestoreOperation<
+        {
+          reservationId: string;
+          decision:
+            | "approve"
+            | "reject";
+          note: string | null;
+        },
+        unknown
+      >("reviewContract", {
+        reservationId,
+        decision,
+        note,
+      });
+
+      setReviewNote("");
+
+      return decision === "approve"
+        ? "Contract approved. It can now be emailed to the customer."
+        : "Contract rejected and sent back for correction.";
+    });
+  }
+
+  function emailContract() {
+    void run(async () => {
+      const result =
+        await sendContractEmail(
+          reservationId,
+        );
+
+      return `Agreement emailed to ${result.recipientEmail}.`;
+    });
+  }
 
   if (!hydrated) {
     return null;
@@ -171,6 +380,276 @@ export function RentalAgreement({
             {error}
           </div>
         )}
+
+        {notice && (
+          <div
+            className="alert alert-success"
+            role="status"
+          >
+            {notice}
+          </div>
+        )}
+
+        <section className="agreement-review">
+          <div className="agreement-review-head">
+            <div>
+              <p className="section-kicker">
+                Contract review
+              </p>
+
+              <p className="agreement-review-state">
+                <span
+                  className={`status-pill ${statusTone(
+                    status,
+                  )}`}
+                >
+                  {statusLabel(status)}
+                </span>
+
+                {workflow &&
+                  workflow.version >
+                    0 && (
+                    <span className="quiet">
+                      Version{" "}
+                      {workflow.version}
+                    </span>
+                  )}
+              </p>
+            </div>
+
+            <div className="agreement-review-actions">
+              {(status ===
+                "not_submitted" ||
+                status ===
+                  "rejected") && (
+                <button
+                  className="button button-primary compact"
+                  type="button"
+                  disabled={
+                    busy || !workflow
+                  }
+                  onClick={
+                    submitForReview
+                  }
+                >
+                  <Send size={15} />
+                  Submit for review
+                </button>
+              )}
+
+              {status ===
+                "in_review" &&
+                isAdmin && (
+                  <>
+                    <button
+                      className="button button-primary compact"
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        decide(
+                          "approve",
+                        )
+                      }
+                    >
+                      <CheckCircle2
+                        size={15}
+                      />
+                      Approve
+                    </button>
+
+                    <button
+                      className="button button-secondary compact"
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        decide("reject")
+                      }
+                    >
+                      <XCircle
+                        size={15}
+                      />
+                      Reject
+                    </button>
+                  </>
+                )}
+
+              {status ===
+                "approved" && (
+                <button
+                  className="button button-primary compact"
+                  type="button"
+                  disabled={
+                    busy ||
+                    !mailerConfigured ||
+                    !recipientEmail
+                  }
+                  onClick={
+                    emailContract
+                  }
+                >
+                  <Mail size={15} />
+                  Email to customer
+                </button>
+              )}
+            </div>
+          </div>
+
+          {status === "in_review" &&
+            isAdmin && (
+              <div className="field">
+                <label htmlFor="contract-review-note">
+                  Review note
+                </label>
+
+                <textarea
+                  id="contract-review-note"
+                  value={reviewNote}
+                  maxLength={1000}
+                  onChange={(event) =>
+                    setReviewNote(
+                      event.target
+                        .value,
+                    )
+                  }
+                  placeholder="Required when rejecting, optional when approving."
+                />
+              </div>
+            )}
+
+          {status === "in_review" &&
+            !isAdmin && (
+              <p className="form-help">
+                An administrator has to
+                approve this agreement
+                before it can be emailed.
+              </p>
+            )}
+
+          {status === "approved" &&
+            !mailerConfigured && (
+              <p className="form-help">
+                Email delivery is not
+                configured in this
+                deployment. The agreement
+                can still be printed or
+                saved as a PDF.
+              </p>
+            )}
+
+          {status === "approved" &&
+            mailerConfigured &&
+            !recipientEmail && (
+              <p className="form-help">
+                This customer has no email
+                address on file, so the
+                agreement cannot be emailed.
+              </p>
+            )}
+
+          {workflow && (
+            <dl className="agreement-review-meta">
+              {workflow.submittedByNameSnapshot && (
+                <div>
+                  <dt>
+                    Submitted by
+                  </dt>
+
+                  <dd>
+                    {
+                      workflow.submittedByNameSnapshot
+                    }
+                    {" · "}
+                    {moment(
+                      workflow.submittedAt,
+                    )}
+                  </dd>
+                </div>
+              )}
+
+              {workflow.reviewedByNameSnapshot && (
+                <div>
+                  <dt>Reviewed by</dt>
+
+                  <dd>
+                    {
+                      workflow.reviewedByNameSnapshot
+                    }
+                    {" · "}
+                    {moment(
+                      workflow.reviewedAt,
+                    )}
+                  </dd>
+                </div>
+              )}
+
+              {workflow.reviewNote && (
+                <div>
+                  <dt>Review note</dt>
+
+                  <dd>
+                    {workflow.reviewNote}
+                  </dd>
+                </div>
+              )}
+            </dl>
+          )}
+
+          {workflow &&
+            workflow.deliveries.length >
+              0 && (
+              <div className="agreement-deliveries">
+                <h3>Email history</h3>
+
+                <ul>
+                  {workflow.deliveries.map(
+                    (delivery) => (
+                      <li
+                        key={
+                          delivery.id
+                        }
+                      >
+                        <span
+                          className={
+                            delivery.status ===
+                            "failed"
+                              ? "status-pill overdue"
+                              : "status-pill available"
+                          }
+                        >
+                          {delivery.status ===
+                          "failed"
+                            ? "Failed"
+                            : "Sent"}
+                        </span>
+
+                        <span>
+                          {
+                            delivery.recipientEmail
+                          }
+                          {" · version "}
+                          {
+                            delivery.contractVersion
+                          }
+                          {" · "}
+                          {moment(
+                            delivery.createdAt,
+                          )}
+                        </span>
+
+                        {delivery.failureReason && (
+                          <small>
+                            {
+                              delivery.failureReason
+                            }
+                          </small>
+                        )}
+                      </li>
+                    ),
+                  )}
+                </ul>
+              </div>
+            )}
+        </section>
 
         {contract && (
           <article className="agreement-sheet">

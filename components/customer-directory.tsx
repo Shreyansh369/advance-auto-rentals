@@ -15,6 +15,7 @@ import {
   Pencil,
   Plus,
   Search,
+  Trash2,
   UserRound,
   X,
 } from "lucide-react";
@@ -28,6 +29,7 @@ import {
 
 import { AppShell } from "./app-shell";
 import { CountrySelect } from "./country-select";
+import { useFirebaseAuth } from "./firebase-provider";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
@@ -201,6 +203,9 @@ function formatRentalDate(
 }
 
 export function CustomerDirectory() {
+  const { role } =
+    useFirebaseAuth();
+
   const [tab, setTab] =
     useState<CustomerTab>(
       "customers",
@@ -252,6 +257,16 @@ export function CustomerDirectory() {
 
   const [rentalsReloadToken, setRentalsReloadToken] =
     useState(0);
+
+  /*
+   * Removing a customer is irreversible, so the row asks for
+   * a second click rather than deleting on the first one.
+   */
+  const [pendingDeleteId, setPendingDeleteId] =
+    useState<string | null>(null);
+
+  const [deletingId, setDeletingId] =
+    useState<string | null>(null);
 
   useEffect(() => {
     const source = query(
@@ -375,13 +390,23 @@ export function CustomerDirectory() {
                     ),
                   );
 
+                /*
+                 * Overdue is derived from the expected return
+                 * time, not read from a stored flag: nothing
+                 * sweeps the collection on a schedule, so the
+                 * stored status would still say "active" long
+                 * after a car was due back.
+                 */
                 const status =
                   String(
                     rentalDoc.get(
                       "status",
                     ),
-                  ) ===
-                  "overdue"
+                  ) === "overdue" ||
+                  (expectedReturn !==
+                    null &&
+                    expectedReturn.getTime() <
+                      Date.now())
                     ? "overdue"
                     : "active";
 
@@ -582,6 +607,41 @@ export function CustomerDirectory() {
     setEditingCustomerForm(
       customerToForm(customer),
     );
+  }
+
+  /*
+   * Deletion is refused by the service layer while any
+   * booking or rental still references the customer, so the
+   * failure the employee sees explains which history is in
+   * the way rather than a bare permission error.
+   */
+  async function removeCustomer(
+    customer: Customer,
+  ) {
+    setError(undefined);
+    setNotice(undefined);
+    setDeletingId(customer.id);
+
+    try {
+      await callFirestoreOperation<
+        { customerId: string },
+        { customerId: string }
+      >("deleteCustomer", {
+        customerId: customer.id,
+      });
+
+      setPendingDeleteId(null);
+
+      setNotice(
+        `${customer.fullName} was removed.`,
+      );
+    } catch (cause) {
+      setError(
+        firebaseErrorMessage(cause),
+      );
+    } finally {
+      setDeletingId(null);
+    }
   }
 
   async function createCustomer(
@@ -913,10 +973,6 @@ export function CustomerDirectory() {
           licenceNumber: string;
           licenceCountry: string;
           licenceExpiresAt: string;
-          dateOfBirth:
-            string | null;
-          notes:
-            string | null;
           licenceStoragePath:
             string | null;
         },
@@ -942,12 +998,11 @@ export function CustomerDirectory() {
           licenceCountry,
           licenceExpiresAt,
 
-          dateOfBirth:
-            null,
-
-          notes:
-            null,
-
+          /*
+           * The date of birth and the internal note are not
+           * on this form, so they are left out of the patch
+           * rather than sent back as null and erased.
+           */
           licenceStoragePath:
             editingCustomerForm
               .licenceStoragePath,
@@ -1779,20 +1834,88 @@ export function CustomerDirectory() {
                           </td>
 
                           <td>
-                            <button
-                              className="button button-secondary compact"
-                              type="button"
-                              onClick={() =>
-                                openEditor(
-                                  customer,
-                                )
-                              }
-                            >
-                              <Pencil
-                                size={15}
-                              />
-                              Edit
-                            </button>
+                            {pendingDeleteId ===
+                            customer.id ? (
+                              <div className="row-actions">
+                                <button
+                                  className="button button-danger compact"
+                                  type="button"
+                                  disabled={
+                                    deletingId ===
+                                    customer.id
+                                  }
+                                  onClick={() =>
+                                    void removeCustomer(
+                                      customer,
+                                    )
+                                  }
+                                >
+                                  {deletingId ===
+                                  customer.id
+                                    ? "Removing…"
+                                    : "Yes, remove"}
+                                </button>
+
+                                <button
+                                  className="text-button"
+                                  type="button"
+                                  disabled={
+                                    deletingId ===
+                                    customer.id
+                                  }
+                                  onClick={() =>
+                                    setPendingDeleteId(
+                                      null,
+                                    )
+                                  }
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="row-actions">
+                                <button
+                                  className="button button-secondary compact"
+                                  type="button"
+                                  onClick={() =>
+                                    openEditor(
+                                      customer,
+                                    )
+                                  }
+                                >
+                                  <Pencil
+                                    size={15}
+                                  />
+                                  Edit
+                                </button>
+
+                                {role ===
+                                  "admin" && (
+                                  <button
+                                    className="icon-button"
+                                    type="button"
+                                    aria-label={`Remove ${customer.fullName}`}
+                                    onClick={() => {
+                                      setError(
+                                        undefined,
+                                      );
+
+                                      setNotice(
+                                        undefined,
+                                      );
+
+                                      setPendingDeleteId(
+                                        customer.id,
+                                      );
+                                    }}
+                                  >
+                                    <Trash2
+                                      size={16}
+                                    />
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           </td>
                         </tr>
                       ),
@@ -1901,7 +2024,7 @@ export function CustomerDirectory() {
                               className={
                                 rental.status ===
                                 "overdue"
-                                  ? "status-pill status-danger"
+                                  ? "status-pill overdue"
                                   : "status-pill"
                               }
                             >

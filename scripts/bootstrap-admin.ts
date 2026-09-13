@@ -45,16 +45,20 @@ try {
   });
 }
 
-await auth.setCustomUserClaims(user.uid, {
-  role: "admin",
-});
-
+/*
+ * Authorisation is read from users/{uid} by the security
+ * rules, not from a custom claim, and the rules require
+ * status: "approved" before any collection opens. A profile
+ * without it belongs to an account that can sign in and do
+ * nothing at all.
+ */
 await db.collection("users").doc(user.uid).set(
   {
     uid: user.uid,
     email,
     role: "admin",
-    active: true,
+    status: "approved",
+    requestedRole: "admin",
     updatedAt: FieldValue.serverTimestamp(),
     createdAt: FieldValue.serverTimestamp(),
   },
@@ -65,4 +69,4 @@ console.log("");
 console.log("Local admin ready.");
 console.log(`Email: ${email}`);
 console.log(`UID: ${user.uid}`);
-console.log("Role: admin");
+console.log("Role: admin (approved)");
