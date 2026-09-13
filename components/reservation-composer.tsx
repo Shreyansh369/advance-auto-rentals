@@ -99,6 +99,8 @@ type Reservation = {
   id: string;
   customerName: string;
   vehicleRegistration: string;
+  pickupAt: string | null;
+  expectedReturnAt: string | null;
 };
 
 type Rental = {
@@ -228,6 +230,27 @@ function formatVehicleStatus(
     );
 }
 
+function bookingMoment(
+  value: string | null,
+): string {
+  if (!value) {
+    return "Not recorded";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.valueOf())) {
+    return "Not recorded";
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
 function todayDateTime(): string {
   const value =
     new Date();
@@ -349,6 +372,16 @@ export function ReservationComposer() {
    */
   const [paymentRentalId, setPaymentRentalId] =
     useState("");
+
+  /* Cancelling frees the vehicle, so it asks twice. */
+  const [cancellingId, setCancellingId] =
+    useState<string | null>(null);
+
+  const [cancelReason, setCancelReason] =
+    useState("");
+
+  const [cancelBusy, setCancelBusy] =
+    useState(false);
 
   const [bookingMedia, setBookingMedia] =
     useState<CloudinaryMedia[]>([]);
@@ -673,6 +706,18 @@ export function ReservationComposer() {
             vehicleRegistration:
               snapshot.get(
                 "vehicleRegistrationSnapshot",
+              ),
+            pickupAt:
+              toDateTimeInput(
+                snapshot.get(
+                  "pickupAt",
+                ),
+              ),
+            expectedReturnAt:
+              toDateTimeInput(
+                snapshot.get(
+                  "expectedReturnAt",
+                ),
               ),
           }),
         ),
@@ -1089,6 +1134,49 @@ export function ReservationComposer() {
       );
     } finally {
       setSavingCustomerEdit(false);
+    }
+  }
+
+  async function cancelBooking(
+    reservation: Reservation,
+  ) {
+    setCancelBusy(true);
+    setError(undefined);
+    setNotice(undefined);
+
+    try {
+      const result =
+        await callFirestoreOperation<
+          {
+            reservationId: string;
+            reason: string | null;
+          },
+          {
+            reservationId: string;
+            vehicleReleased: boolean;
+          }
+        >("cancelReservation", {
+          reservationId: reservation.id,
+          reason:
+            cancelReason.trim() || null,
+        });
+
+      setCancellingId(null);
+      setCancelReason("");
+
+      await load();
+
+      setNotice(
+        result.vehicleReleased
+          ? `Booking cancelled · ${reservation.vehicleRegistration} is available again.`
+          : "Booking cancelled.",
+      );
+    } catch (cause) {
+      setError(
+        firebaseErrorMessage(cause),
+      );
+    } finally {
+      setCancelBusy(false);
     }
   }
 
@@ -1831,6 +1919,124 @@ export function ReservationComposer() {
               void loadContractQueue();
             }}
           />
+        )}
+
+      {tab === "booking" &&
+        reservations.length > 0 && (
+          <section className="surface booking-list">
+            <p className="section-kicker">
+              Bookings awaiting checkout
+            </p>
+
+            <ul>
+              {reservations.map(
+                (reservation) => (
+                  <li
+                    key={reservation.id}
+                  >
+                    <span className="booking-list-detail">
+                      <strong>
+                        {
+                          reservation.vehicleRegistration
+                        }
+                      </strong>
+
+                      <small>
+                        {
+                          reservation.customerName
+                        }
+                        {reservation.pickupAt
+                          ? ` · ${bookingMoment(
+                              reservation.pickupAt,
+                            )} → ${bookingMoment(
+                              reservation.expectedReturnAt,
+                            )}`
+                          : ""}
+                      </small>
+                    </span>
+
+                    {cancellingId ===
+                    reservation.id ? (
+                      <span className="booking-list-confirm">
+                        <input
+                          aria-label="Reason for cancelling"
+                          placeholder="Reason (optional)"
+                          maxLength={500}
+                          value={cancelReason}
+                          disabled={cancelBusy}
+                          onChange={(
+                            event,
+                          ) =>
+                            setCancelReason(
+                              event.target
+                                .value,
+                            )
+                          }
+                        />
+
+                        <button
+                          className="button button-danger compact"
+                          type="button"
+                          disabled={cancelBusy}
+                          onClick={() =>
+                            void cancelBooking(
+                              reservation,
+                            )
+                          }
+                        >
+                          {cancelBusy
+                            ? "Cancelling…"
+                            : "Yes, cancel"}
+                        </button>
+
+                        <button
+                          className="text-button"
+                          type="button"
+                          disabled={cancelBusy}
+                          onClick={() => {
+                            setCancellingId(
+                              null,
+                            );
+
+                            setCancelReason(
+                              "",
+                            );
+                          }}
+                        >
+                          Keep
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        className="button button-secondary compact"
+                        type="button"
+                        onClick={() => {
+                          setError(
+                            undefined,
+                          );
+
+                          setNotice(
+                            undefined,
+                          );
+
+                          setCancelReason(
+                            "",
+                          );
+
+                          setCancellingId(
+                            reservation.id,
+                          );
+                        }}
+                      >
+                        <X size={15} />
+                        Cancel booking
+                      </button>
+                    )}
+                  </li>
+                ),
+              )}
+            </ul>
+          </section>
         )}
 
       {tab === "booking" &&
