@@ -126,6 +126,56 @@ a {
   gap: 8px;
 }
 
+/* Confirmed bookings that have not gone out yet, with the
+   control that releases the vehicle they are holding. */
+.booking-list {
+  margin-bottom: 14px;
+  padding: 15px 16px;
+}
+
+.booking-list ul {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.booking-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.booking-list-detail {
+  display: grid;
+  flex: 1 1 200px;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+
+.booking-list-detail small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.booking-list-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.booking-list-confirm input {
+  min-width: 0;
+  flex: 1 1 170px;
+}
+
 /* Contracts still waiting on an administrator, listed on the
    booking screen so an agreement submitted in one browser can
    be opened in another. */

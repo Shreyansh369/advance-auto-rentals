@@ -513,11 +513,45 @@ async function overlappingReservation(
         ).toMillis();
 
       if (
-        existingReturn >
+        existingReturn <=
         input.from.toMillis()
       ) {
-        return candidate.id;
+        continue;
       }
+
+      /*
+       * A booking whose rental has already been handed back
+       * is not holding the vehicle, whatever the reservation
+       * still says. Returns now close the reservation, but
+       * bookings taken before that was true are still sitting
+       * at "checked_out" with a future expected return, and
+       * those would otherwise block the vehicle for the rest
+       * of the original window.
+       */
+      if (
+        String(candidate.get("status")) ===
+        "checked_out"
+      ) {
+        const rentalId = trimmedOrNull(
+          candidate.get("rentalId"),
+        );
+
+        if (rentalId) {
+          const rental = await getDoc(
+            doc(db, "rentals", rentalId),
+          );
+
+          if (
+            rental.exists() &&
+            String(rental.get("status")) ===
+              "returned"
+          ) {
+            continue;
+          }
+        }
+      }
+
+      return candidate.id;
     }
 
     if (
@@ -2100,6 +2134,189 @@ async function createReservation(
   };
 }
 
+/*
+ * A booking that is no longer wanted has to be removable, or
+ * the vehicle it holds stays unbookable for that window with
+ * nothing the desk can do about it.
+ *
+ * It is cancelled rather than deleted: the record of what was
+ * promised, to whom, and who called it off is worth keeping,
+ * and a cancelled booking holds no vehicle because the
+ * conflict search only counts "confirmed" and "checked_out".
+ * Deleting the document outright stays an administrator's
+ * action through the console.
+ */
+async function cancelReservation(
+  input: {
+    reservationId: string;
+    reason: string | null;
+  },
+): Promise<{
+  reservationId: string;
+  vehicleReleased: boolean;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const reservationId = trimmedOrNull(
+    input.reservationId,
+  );
+
+  if (!reservationId) {
+    throw new Error(
+      "Select a booking to cancel.",
+    );
+  }
+
+  const reason = trimmedOrNull(input.reason);
+
+  if (reason && reason.length > 500) {
+    throw new Error(
+      "Keep the cancellation reason under 500 characters.",
+    );
+  }
+
+  const reservationRef = doc(
+    db,
+    "reservations",
+    reservationId,
+  );
+
+  let vehicleReleased = false;
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const snapshot =
+        await transaction.get(
+          reservationRef,
+        );
+
+      if (!snapshot.exists()) {
+        throw new Error(
+          "Booking was not found.",
+        );
+      }
+
+      const status = String(
+        snapshot.get("status"),
+      );
+
+      if (status === "cancelled") {
+        throw new Error(
+          "This booking has already been cancelled.",
+        );
+      }
+
+      /*
+       * Once the car has gone out the booking is no longer
+       * the thing holding it — the rental is — so it is
+       * returned, not cancelled.
+       */
+      if (status !== "confirmed") {
+        throw new Error(
+          status === "checked_out"
+            ? "This booking has already been checked out. Complete the return instead."
+            : "Only a confirmed booking can be cancelled.",
+        );
+      }
+
+      const vehicleId = trimmedOrNull(
+        snapshot.get("vehicleId"),
+      );
+
+      const vehicleRef = vehicleId
+        ? doc(db, "vehicles", vehicleId)
+        : null;
+
+      const vehicleSnapshot = vehicleRef
+        ? await transaction.get(vehicleRef)
+        : null;
+
+      const actorName =
+        await actorNameSnapshot(
+          transaction,
+          actorUid,
+        );
+
+      transaction.update(reservationRef, {
+        status: "cancelled",
+
+        cancelledBy: actorUid,
+
+        cancelledByNameSnapshot: actorName,
+
+        cancelledAt: nowTimestamp(),
+
+        cancellationReason: reason,
+
+        updatedAt: nowTimestamp(),
+      });
+
+      /*
+       * The vehicle only goes back on offer if this booking is
+       * what took it off. A car already out on another rental,
+       * in for maintenance or waiting to be cleaned keeps the
+       * status it has.
+       */
+      if (
+        vehicleRef &&
+        vehicleSnapshot?.exists() &&
+        String(vehicleSnapshot.get("status")) ===
+          "reserved"
+      ) {
+        vehicleReleased = true;
+
+        transaction.update(vehicleRef, {
+          status: "available",
+
+          statusNote: null,
+
+          updatedAt: nowTimestamp(),
+        });
+      }
+
+      transaction.set(
+        doc(collection(db, "auditLogs")),
+        {
+          actorUid,
+
+          action: "reservation.cancelled",
+
+          resource: {
+            collection: "reservations",
+            id: reservationId,
+          },
+
+          details: {
+            actorName,
+            reason,
+            vehicleId,
+            vehicleReleased,
+
+            customerNameSnapshot: String(
+              snapshot.get(
+                "customerNameSnapshot",
+              ) ?? "",
+            ),
+
+            vehicleRegistrationSnapshot: String(
+              snapshot.get(
+                "vehicleRegistrationSnapshot",
+              ) ?? "",
+            ),
+          },
+
+          createdAt: nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return { reservationId, vehicleReleased };
+}
+
 /* =========================================================
    Checkout
    ========================================================= */
@@ -2931,6 +3148,37 @@ async function returnRental(
         financialSnapshot.data();
 
       /*
+       * Checkout marks the reservation "checked_out", and the
+       * conflict search treats that as still holding the
+       * vehicle. Nothing used to clear it, so once a car had
+       * been rented its booking blocked that window for good:
+       * returning a car early, in particular, left the vehicle
+       * unbookable until the original expected return had
+       * passed. The reservation is closed here, in the same
+       * transaction that closes the rental.
+       *
+       * Read before any write, as a transaction requires.
+       */
+      const reservationId = trimmedOrNull(
+        rental.reservationId,
+      );
+
+      const reservationRef = reservationId
+        ? doc(
+            db,
+            "reservations",
+            reservationId,
+          )
+        : null;
+
+      const reservationSnapshot =
+        reservationRef
+          ? await transaction.get(
+              reservationRef,
+            )
+          : null;
+
+      /*
        * Re-reading the status inside the transaction is what
        * makes a repeated submission safe: the second attempt
        * sees "returned" and aborts instead of applying the
@@ -3119,6 +3367,22 @@ async function returnRental(
             nowTimestamp(),
         },
       );
+
+      if (
+        reservationRef &&
+        reservationSnapshot?.exists()
+      ) {
+        transaction.update(
+          reservationRef,
+          {
+            status: "completed",
+
+            completedAt: actualReturnAt,
+
+            updatedAt: nowTimestamp(),
+          },
+        );
+      }
 
       /*
        * A returned vehicle always goes to cleaning before it
@@ -6456,6 +6720,16 @@ export async function callFirestoreOperation<
             customerSignatureName:
               | string
               | null;
+          },
+        )) as TResult
+      );
+
+    case "cancelReservation":
+      return (
+        (await cancelReservation(
+          data as {
+            reservationId: string;
+            reason: string | null;
           },
         )) as TResult
       );
