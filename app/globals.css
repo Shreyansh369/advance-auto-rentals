@@ -481,6 +481,16 @@ a {
   padding: 22px;
 }
 
+/* Rental history sits below the dashboard grid at full width:
+   its rows carry a vehicle, a customer, a date and a total, and
+   they read badly squeezed into a third of the row. */
+.history-panel {
+  /* Matches the grid above it, so the column edges line up. */
+  max-width: 1460px;
+  margin: 15px auto 0;
+  padding: 22px;
+}
+
 .section-heading {
   display: flex;
   align-items: flex-start;
