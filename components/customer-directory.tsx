@@ -51,6 +51,8 @@ type Customer = {
   telephone: string;
   email: string | null;
   address: string | null;
+  state: string | null;
+  localAddress: string | null;
   licenceNumber: string;
   licenceCountry: string;
   licenceExpiresAt: string | null;
@@ -62,6 +64,8 @@ type CustomerForm = {
   telephone: string;
   email: string;
   address: string;
+  state: string;
+  localAddress: string;
   licenceNumber: string;
   licenceCountry: string;
   licenceExpiresAt: string;
@@ -118,6 +122,10 @@ function customerToForm(
       customer.email ?? "",
     address:
       customer.address ?? "",
+    state:
+      customer.state ?? "",
+    localAddress:
+      customer.localAddress ?? "",
     licenceNumber:
       customer.licenceNumber,
     licenceCountry:
@@ -140,6 +148,8 @@ function emptyCustomerForm(): CustomerForm {
     telephone: "",
     email: "",
     address: "",
+    state: "",
+    localAddress: "",
     licenceNumber: "",
     licenceCountry: "",
     licenceExpiresAt: "",
@@ -333,6 +343,16 @@ export function CustomerDirectory({
               address:
                 customerDoc.get(
                   "address",
+                ) ?? null,
+
+              state:
+                customerDoc.get(
+                  "state",
+                ) ?? null,
+
+              localAddress:
+                customerDoc.get(
+                  "localAddress",
                 ) ?? null,
 
               licenceNumber:
@@ -722,6 +742,20 @@ export function CustomerDirectory({
         ) ?? "",
       ).trim();
 
+    const stateValue =
+      String(
+        form.get(
+          "state",
+        ) ?? "",
+      ).trim();
+
+    const localAddressValue =
+      String(
+        form.get(
+          "localAddress",
+        ) ?? "",
+      ).trim();
+
     const licenceNumber =
       String(
         form.get(
@@ -810,6 +844,8 @@ export function CustomerDirectory({
             telephone: string;
             email: string | null;
             address: string | null;
+            state: string | null;
+            localAddress: string | null;
             licenceNumber: string;
             licenceCountry: string;
             licenceExpiresAt: string;
@@ -834,6 +870,10 @@ export function CustomerDirectory({
             address:
               addressValue ||
               null,
+            state:
+              stateValue || null,
+            localAddress:
+              localAddressValue || null,
             licenceNumber,
             licenceCountry,
             licenceExpiresAt,
@@ -863,6 +903,9 @@ export function CustomerDirectory({
           emailValue,
         address:
           addressValue,
+        state: stateValue ?? "",
+        localAddress:
+          localAddressValue ?? "",
         licenceNumber,
         licenceCountry,
         licenceExpiresAt,
@@ -999,6 +1042,8 @@ export function CustomerDirectory({
           telephone: string;
           email: string | null;
           address: string | null;
+          state: string | null;
+          localAddress: string | null;
           licenceNumber: string;
           licenceCountry: string;
           licenceExpiresAt: string;
@@ -1022,6 +1067,14 @@ export function CustomerDirectory({
 
           address:
             address || null,
+
+          state:
+            editingCustomerForm.state.trim() ||
+            null,
+
+          localAddress:
+            editingCustomerForm.localAddress.trim() ||
+            null,
 
           licenceNumber,
           licenceCountry,
@@ -1422,6 +1475,29 @@ export function CustomerDirectory({
                   </div>
 
                   <div className="field">
+                    <label htmlFor="state">
+                      State
+                    </label>
+
+                    <input
+                      id="state"
+                      name="state"
+                      autoComplete="address-level1"
+                    />
+                  </div>
+
+                  <div className="field">
+                    <label htmlFor="local-address">
+                      Local address
+                    </label>
+
+                    <input
+                      id="local-address"
+                      name="localAddress"
+                    />
+                  </div>
+
+                  <div className="field">
                     <label htmlFor="licence-number">
                       Licence number
                     </label>
@@ -1631,6 +1707,53 @@ export function CustomerDirectory({
                         )
                       }
                       autoComplete="street-address"
+                    />
+                  </div>
+
+                  <div className="field">
+                    <label htmlFor="state-2">
+                      State
+                    </label>
+
+                    <input
+                      id="state-2"
+                      value={
+                        editingCustomerForm.state
+                      }
+                      onChange={(event) =>
+                        setEditingCustomerForm(
+                          (current) => ({
+                            ...current,
+                            state:
+                              event.target
+                                .value,
+                          }),
+                        )
+                      }
+                      autoComplete="address-level1"
+                    />
+                  </div>
+
+                  <div className="field">
+                    <label htmlFor="local-address-2">
+                      Local address
+                    </label>
+
+                    <input
+                      id="local-address-2"
+                      value={
+                        editingCustomerForm.localAddress
+                      }
+                      onChange={(event) =>
+                        setEditingCustomerForm(
+                          (current) => ({
+                            ...current,
+                            localAddress:
+                              event.target
+                                .value,
+                          }),
+                        )
+                      }
                     />
                   </div>
 

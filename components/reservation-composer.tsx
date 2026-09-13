@@ -48,6 +48,13 @@ import {
 import type { CloudinaryMedia } from "@/lib/cloudinary";
 
 import {
+  AGREEMENT_RATES,
+  CHARGE_ROWS,
+  PAYMENT_METHODS,
+  type AgreementPaymentMethod,
+} from "@/lib/agreement";
+
+import {
   callFirestoreOperation,
   type ContractQueueEntry,
 } from "@/lib/services/firestore-client";
@@ -101,6 +108,11 @@ type Reservation = {
   vehicleRegistration: string;
   pickupAt: string | null;
   expectedReturnAt: string | null;
+  /* Extended prices for the agreement's charges table:
+     units booked multiplied by the rate quoted at booking. */
+  dailyCents: number;
+  weeklyCents: number;
+  monthlyCents: number;
 };
 
 type Rental = {
@@ -153,6 +165,15 @@ const tabs: Array<{
     icon: CreditCard,
   },
 ];
+
+/* The charge rows the employee fills in at checkout. Daily,
+   weekly and monthly come from the booking quote instead. */
+const agreementChargeRows = CHARGE_ROWS.filter(
+  (row) =>
+    !["daily", "weekly", "monthly"].includes(
+      row.key,
+    ),
+);
 
 const fuelLevels = [
   "one_eighth",
@@ -228,6 +249,40 @@ function formatVehicleStatus(
       (letter) =>
         letter.toUpperCase(),
     );
+}
+
+/*
+ * One row of the agreement's charges table: the number of
+ * daily, weekly or monthly bundles the booking was priced at,
+ * multiplied by the rate it was quoted at.
+ */
+function extendedPrice(
+  snapshot: {
+    get: (field: string) => unknown;
+  },
+  unitsField: string,
+  rateField: string,
+): number {
+  const quote = (snapshot.get("quote") ??
+    {}) as Record<string, unknown>;
+
+  const rates = (snapshot.get("rateSnapshot") ??
+    {}) as Record<string, unknown>;
+
+  const units = Number(
+    quote[unitsField] ?? 0,
+  );
+
+  const rate = Number(rates[rateField] ?? 0);
+
+  if (
+    !Number.isFinite(units) ||
+    !Number.isFinite(rate)
+  ) {
+    return 0;
+  }
+
+  return Math.round(units * rate);
 }
 
 function bookingMoment(
@@ -373,6 +428,26 @@ export function ReservationComposer() {
   const [paymentRentalId, setPaymentRentalId] =
     useState("");
 
+  const [
+    checkoutReservationId,
+    setCheckoutReservationId,
+  ] = useState("");
+
+  /*
+   * The payment tab's fee inputs are held here rather than
+   * read off the form at submit time, so the amount due can be
+   * recalculated on screen as the employee types.
+   */
+  const [selectedFees, setSelectedFees] =
+    useState<Record<string, boolean>>({});
+
+  const [feeAmounts, setFeeAmounts] = useState<
+    Record<string, string>
+  >({});
+
+  const [paymentAmount, setPaymentAmount] =
+    useState("");
+
   /* Cancelling frees the vehicle, so it asks twice. */
   const [cancellingId, setCancellingId] =
     useState<string | null>(null);
@@ -402,6 +477,49 @@ export function ReservationComposer() {
 
   const [signatureName, setSignatureName] =
     useState("");
+
+  const [checkoutMedia, setCheckoutMedia] =
+    useState<CloudinaryMedia[]>([]);
+
+  /*
+   * The charge rows the employee fills in. The daily, weekly
+   * and monthly rows restate the booking's quote and are not
+   * entered here, so they are left out of this list.
+   */
+  const [agreementCharges, setAgreementCharges] =
+    useState<Record<string, string>>({
+      fuel: "",
+      detailing: "",
+      liabilityWaiver: "",
+      windscreenWaiver: "",
+      insurance: "",
+      other: "",
+      extraHours: "",
+    });
+
+  const [waivers, setWaivers] = useState({
+    liabilityWaiver: false,
+    windscreenWaiver: false,
+    personalAccidentInsurance: false,
+  });
+
+  const [paymentMethod, setPaymentMethod] =
+    useState<AgreementPaymentMethod | "">("");
+
+  const [additionalDriver, setAdditionalDriver] =
+    useState({
+      fullName: "",
+      address: "",
+      state: "",
+      dateOfBirth: "",
+      licenceNumber: "",
+      licenceExpiresAt: "",
+      telephone: "",
+      localAddress: "",
+    });
+
+  const [contractRentalId, setContractRentalId] =
+    useState<string | null>(null);
 
   /*
    * New-customer licence capture state.
@@ -446,9 +564,6 @@ export function ReservationComposer() {
 
   const [busy, setBusy] =
     useState(false);
-
-  const [contractReservationId, setContractReservationId] =
-    useState<string | null>(null);
 
   const [showContract, setShowContract] =
     useState(false);
@@ -718,6 +833,24 @@ export function ReservationComposer() {
                 snapshot.get(
                   "expectedReturnAt",
                 ),
+              ),
+            dailyCents:
+              extendedPrice(
+                snapshot,
+                "dailyUnits",
+                "dailyCents",
+              ),
+            weeklyCents:
+              extendedPrice(
+                snapshot,
+                "weeklyUnits",
+                "weeklyCents",
+              ),
+            monthlyCents:
+              extendedPrice(
+                snapshot,
+                "monthlyUnits",
+                "monthlyCents",
               ),
           }),
         ),
@@ -1137,6 +1270,105 @@ export function ReservationComposer() {
     }
   }
 
+  /*
+   * The form collects dollars; everything below the surface is
+   * whole cents, so the conversion happens once, here.
+   */
+  function dollarsToCents(
+    value: FormDataEntryValue | null,
+  ): number {
+    const amount = Number(
+      String(value ?? "").trim() || 0,
+    );
+
+    if (!Number.isFinite(amount) || amount < 0) {
+      return 0;
+    }
+
+    return Math.round(amount * 100);
+  }
+
+  /*
+   * The printed charges table: the rental days as the booking
+   * quoted them, plus whatever the employee typed in.
+   */
+  const checkoutReservationQuote =
+    reservations.find(
+      (reservation) =>
+        reservation.id ===
+        checkoutReservationId,
+    );
+
+  const quotedCharges: Record<string, number> =
+    {
+      daily:
+        checkoutReservationQuote?.dailyCents ??
+        0,
+      weekly:
+        checkoutReservationQuote?.weeklyCents ??
+        0,
+      monthly:
+        checkoutReservationQuote?.monthlyCents ??
+        0,
+
+      ...Object.fromEntries(
+        agreementChargeRows.map((row) => [
+          row.key,
+          Math.round(
+            (Number(
+              agreementCharges[row.key] || 0,
+            ) || 0) * 100,
+          ),
+        ]),
+      ),
+    };
+
+  const agreementTotalCents = Object.values(
+    quotedCharges,
+  ).reduce(
+    (sum, cents) => sum + Number(cents || 0),
+    0,
+  );
+
+  const selectedPayableRental =
+    payableRentals.find(
+      (rental) =>
+        rental.id === paymentRentalId,
+    );
+
+  const additionalFeesCents =
+    paymentFeeOptions.reduce((sum, fee) => {
+      if (!selectedFees[fee.type]) {
+        return sum;
+      }
+
+      const amount = Number(
+        feeAmounts[fee.type] || 0,
+      );
+
+      return Number.isFinite(amount) &&
+        amount > 0
+        ? sum + Math.round(amount * 100)
+        : sum;
+    }, 0);
+
+  const totalDueCents =
+    (selectedPayableRental?.outstandingCents ??
+      0) + additionalFeesCents;
+
+  const paidNowCents = (() => {
+    const amount = Number(paymentAmount || 0);
+
+    return Number.isFinite(amount) && amount > 0
+      ? Math.round(amount * 100)
+      : 0;
+  })();
+
+  const balanceAfterPayment = Math.max(
+    totalDueCents - paidNowCents,
+    0,
+  );
+
   async function cancelBooking(
     reservation: Reservation,
   ) {
@@ -1222,12 +1454,6 @@ export function ReservationComposer() {
                 | string
                 | null;
               bookingMedia: CloudinaryMedia[];
-              customerSignatureDataUrl:
-                | string
-                | null;
-              customerSignatureName:
-                | string
-                | null;
             },
             {
               reservationId: string;
@@ -1287,26 +1513,14 @@ export function ReservationComposer() {
                 ).trim() ||
                 null,
 
-              bookingMedia,
-
-              customerSignatureDataUrl:
-                signatureMode === "draw"
-                  ? customerSignature
-                  : null,
-
-              customerSignatureName:
-                signatureMode === "type"
-                  ? signatureName.trim() ||
-                    null
-                  : null,
+              /*
+               * The condition photos are taken at checkout
+               * now, with the car in front of the renter, so
+               * a booking carries none.
+               */
+              bookingMedia: [],
             },
           );
-
-        setContractReservationId(
-          result.reservationId,
-        );
-
-        setShowContract(true);
 
         formElement.reset();
 
@@ -1317,8 +1531,6 @@ export function ReservationComposer() {
         setBookingMedia(
           [],
         );
-
-        setSignatureName("");
 
         setCustomerSignature(
           null,
@@ -1342,7 +1554,7 @@ export function ReservationComposer() {
 
         return `Booking confirmed · ${result.quote.chargedDays} day(s) · ${formatMoney(
           result.quote.baseRentalCents,
-        )}. Open the rental agreement to print or save it.`;
+        )}. Check the vehicle out to sign and issue the rental agreement.`;
       },
     );
   }
@@ -1376,6 +1588,30 @@ export function ReservationComposer() {
               notes:
                 | string
                 | null;
+              checkoutMedia: CloudinaryMedia[];
+              customerSignatureDataUrl:
+                | string
+                | null;
+              customerSignatureName:
+                | string
+                | null;
+              additionalDriver:
+                | Record<string, string>
+                | null;
+              waivers: Record<string, boolean>;
+              depositCents: number;
+              paymentMethod: string | null;
+              paymentReferenceLast4:
+                | string
+                | null;
+              paymentCardHolder:
+                | string
+                | null;
+              charges: Record<string, number>;
+              specialInstructions:
+                | string
+                | null;
+              extraHours: number;
             },
             {
               rentalId: string;
@@ -1420,12 +1656,105 @@ export function ReservationComposer() {
                   ),
                 ).trim() ||
                 null,
+
+              checkoutMedia,
+
+              customerSignatureDataUrl:
+                signatureMode === "draw"
+                  ? customerSignature
+                  : null,
+
+              customerSignatureName:
+                signatureMode === "type"
+                  ? signatureName.trim() ||
+                    null
+                  : null,
+
+              additionalDriver:
+                additionalDriver.fullName.trim()
+                  ? additionalDriver
+                  : null,
+
+              waivers,
+
+              depositCents: dollarsToCents(
+                form.get("depositAmount"),
+              ),
+
+              paymentMethod:
+                paymentMethod || null,
+
+              paymentReferenceLast4:
+                String(
+                  form.get("paymentLast4") ??
+                    "",
+                ).trim() || null,
+
+              paymentCardHolder:
+                String(
+                  form.get(
+                    "paymentCardHolder",
+                  ) ?? "",
+                ).trim() || null,
+
+              charges: quotedCharges,
+
+              specialInstructions:
+                String(
+                  form.get("notes"),
+                ).trim() || null,
+
+              extraHours: Number(
+                form.get("extraHours") ?? 0,
+              ),
             },
           );
 
         formElement.reset();
 
-        return `Vehicle checked out · rental ${result.rentalId}.`;
+        setCheckoutReservationId("");
+        setCheckoutMedia([]);
+        setCustomerSignature(null);
+        setSignatureName("");
+        setPaymentMethod("");
+
+        setAgreementCharges({
+          fuel: "",
+          detailing: "",
+          liabilityWaiver: "",
+          windscreenWaiver: "",
+          insurance: "",
+          other: "",
+          extraHours: "",
+        });
+
+        setWaivers({
+          liabilityWaiver: false,
+          windscreenWaiver: false,
+          personalAccidentInsurance: false,
+        });
+
+        setAdditionalDriver({
+          fullName: "",
+          address: "",
+          state: "",
+          dateOfBirth: "",
+          licenceNumber: "",
+          licenceExpiresAt: "",
+          telephone: "",
+          localAddress: "",
+        });
+
+        /*
+         * The agreement is issued here, not at booking: this
+         * is the document the renter has just signed for the
+         * vehicle in front of them.
+         */
+        setContractRentalId(result.rentalId);
+
+        setShowContract(true);
+
+        return `Vehicle checked out · rental agreement ready to print.`;
       },
     );
   }
@@ -1830,8 +2159,11 @@ export function ReservationComposer() {
 
         formElement.reset();
 
-        /* reset() cannot clear a controlled select. */
+        /* reset() cannot clear controlled inputs. */
         setPaymentRentalId("");
+        setPaymentAmount("");
+        setSelectedFees({});
+        setFeeAmounts({});
 
         return `Payment recorded · outstanding balance ${formatMoney(
           result.outstandingCents,
@@ -1890,7 +2222,7 @@ export function ReservationComposer() {
         >
           <span>{notice}</span>
 
-          {contractReservationId && (
+          {contractRentalId && (
             <button
               className="button button-secondary compact"
               type="button"
@@ -1906,11 +2238,9 @@ export function ReservationComposer() {
       )}
 
       {showContract &&
-        contractReservationId && (
+        contractRentalId && (
           <RentalAgreement
-            reservationId={
-              contractReservationId
-            }
+            rentalId={contractRentalId}
             onClose={() => {
               setShowContract(false);
 
@@ -2107,14 +2437,19 @@ export function ReservationComposer() {
                     <button
                       className="button button-secondary compact"
                       type="button"
+                      disabled={
+                        !entry.rentalId
+                      }
                       onClick={() => {
-                        setContractReservationId(
-                          entry.reservationId,
+                        if (!entry.rentalId) {
+                          return;
+                        }
+
+                        setContractRentalId(
+                          entry.rentalId,
                         );
 
-                        setShowContract(
-                          true,
-                        );
+                        setShowContract(true);
                       }}
                     >
                       <FileText
@@ -2148,11 +2483,12 @@ export function ReservationComposer() {
               </h2>
 
               <p>
-                Select the customer once,
-                select the vehicle once,
-                capture the vehicle
-                condition and confirm the
-                reservation.
+                Select the customer, select
+                the vehicle and confirm the
+                reservation. The condition
+                photos, the signature and the
+                agreement are taken at
+                checkout.
               </p>
             </div>
 
@@ -3053,96 +3389,6 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <MediaCapture
-                stage="booking"
-                value={
-                  bookingMedia
-                }
-                onChange={
-                  setBookingMedia
-                }
-                label="Vehicle condition at booking"
-                hint="Capture exterior and interior photos before confirming the booking."
-              />
-            </div>
-
-            <div className="field full">
-              <div className="signature-mode">
-                <button
-                  type="button"
-                  className={
-                    signatureMode === "draw"
-                      ? "button button-primary compact"
-                      : "button button-secondary compact"
-                  }
-                  aria-pressed={
-                    signatureMode === "draw"
-                  }
-                  onClick={() => {
-                    setSignatureMode("draw");
-                    setSignatureName("");
-                  }}
-                >
-                  Sign on device
-                </button>
-
-                <button
-                  type="button"
-                  className={
-                    signatureMode === "type"
-                      ? "button button-primary compact"
-                      : "button button-secondary compact"
-                  }
-                  aria-pressed={
-                    signatureMode === "type"
-                  }
-                  onClick={() => {
-                    setSignatureMode("type");
-                    setCustomerSignature(null);
-                  }}
-                >
-                  Type the name
-                </button>
-              </div>
-
-              {signatureMode === "draw" ? (
-                <CustomerSignaturePad
-                  value={
-                    customerSignature
-                  }
-                  onChange={
-                    setCustomerSignature
-                  }
-                  disabled={busy}
-                />
-              ) : (
-                <div className="field">
-                  <label htmlFor="signature-name">
-                    Customer name as accepted
-                  </label>
-
-                  <input
-                    id="signature-name"
-                    value={signatureName}
-                    maxLength={120}
-                    disabled={busy}
-                    placeholder="Typed by the customer, or read back and confirmed"
-                    onChange={(event) =>
-                      setSignatureName(
-                        event.target.value,
-                      )
-                    }
-                  />
-
-                  <p className="form-help">
-                    Recorded on the agreement in
-                    place of a drawn signature.
-                  </p>
-                </div>
-              )}
-            </div>
-
-            <div className="field full">
               <label htmlFor="booking-note">
                 Booking note
               </label>
@@ -3159,10 +3405,6 @@ export function ReservationComposer() {
                 disabled={
                   busy ||
                   !selectedCustomerId ||
-                  !(
-                    customerSignature ||
-                    signatureName.trim()
-                  ) ||
                   !vehicles.some(
                     (vehicle) =>
                       vehicle.status ===
@@ -3210,7 +3452,12 @@ export function ReservationComposer() {
                 id="confirmed-booking"
                 name="reservationId"
                 required
-                defaultValue=""
+                value={checkoutReservationId}
+                onChange={(event) =>
+                  setCheckoutReservationId(
+                    event.target.value,
+                  )
+                }
               >
                 <option
                   value=""
@@ -3316,7 +3563,8 @@ export function ReservationComposer() {
 
             <div className="field full">
               <label htmlFor="checkout-note">
-                Checkout note
+                Special instruction, additional
+                information
               </label>
 
               <textarea
@@ -3325,12 +3573,354 @@ export function ReservationComposer() {
               />
             </div>
 
+            <div className="field">
+              <label htmlFor="extra-hours">
+                Extra hours
+              </label>
+
+              <input
+                id="extra-hours"
+                name="extraHours"
+                type="number"
+                min={0}
+                max={999}
+                step={1}
+                defaultValue={0}
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="deposit">
+                Deposit (USD)
+              </label>
+
+              <input
+                id="deposit"
+                name="depositAmount"
+                type="number"
+                min={0}
+                step="0.01"
+                defaultValue={(
+                  AGREEMENT_RATES.depositCents /
+                  100
+                ).toFixed(2)}
+              />
+            </div>
+
+            {/* ------------------ waivers and charges */}
+            <fieldset className="field full checkout-block">
+              <legend>
+                Waivers and charges
+              </legend>
+
+              <p className="form-help">
+                These print on the agreement and
+                are added to the balance. The
+                daily, weekly and monthly rows
+                come from the booking quote.
+              </p>
+
+              <div className="checkout-charges">
+                {agreementChargeRows.map(
+                  (row) => (
+                    <div
+                      className="field"
+                      key={row.key}
+                    >
+                      <label
+                        htmlFor={`charge-${row.key}`}
+                      >
+                        {row.label}
+                      </label>
+
+                      <input
+                        id={`charge-${row.key}`}
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={
+                          agreementCharges[
+                            row.key
+                          ] ?? ""
+                        }
+                        onChange={(event) =>
+                          setAgreementCharges(
+                            (current) => ({
+                              ...current,
+                              [row.key]:
+                                event.target
+                                  .value,
+                            }),
+                          )
+                        }
+                      />
+                    </div>
+                  ),
+                )}
+              </div>
+
+              <div className="checkout-waivers">
+                {[
+                  [
+                    "liabilityWaiver",
+                    "Liability waiver",
+                  ],
+                  [
+                    "windscreenWaiver",
+                    "Windscreen waiver",
+                  ],
+                  [
+                    "personalAccidentInsurance",
+                    "Personal accident insurance",
+                  ],
+                ].map(([key, label]) => (
+                  <label
+                    className="checkbox-row"
+                    key={key}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={
+                        waivers[
+                          key as keyof typeof waivers
+                        ]
+                      }
+                      onChange={(event) =>
+                        setWaivers(
+                          (current) => ({
+                            ...current,
+                            [key]:
+                              event.target
+                                .checked,
+                          }),
+                        )
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
+            {/* ------------------- payment information */}
+            <fieldset className="field full checkout-block">
+              <legend>
+                Payment information
+              </legend>
+
+              <div className="checkout-methods">
+                {PAYMENT_METHODS.map(
+                  (method) => (
+                    <label
+                      className="checkbox-row"
+                      key={method.value}
+                    >
+                      <input
+                        type="radio"
+                        name="agreementPaymentMethod"
+                        checked={
+                          paymentMethod ===
+                          method.value
+                        }
+                        onChange={() =>
+                          setPaymentMethod(
+                            method.value,
+                          )
+                        }
+                      />
+                      {method.label}
+                    </label>
+                  ),
+                )}
+              </div>
+
+              <div className="checkout-charges">
+                <div className="field">
+                  <label htmlFor="payment-last4">
+                    Card / check last 4 digits
+                  </label>
+
+                  <input
+                    id="payment-last4"
+                    name="paymentLast4"
+                    inputMode="numeric"
+                    maxLength={4}
+                    pattern="[0-9]{4}"
+                  />
+
+                  <p className="form-help">
+                    Only the last four are
+                    stored. The full number is
+                    written on the printed copy.
+                  </p>
+                </div>
+
+                <div className="field">
+                  <label htmlFor="payment-holder">
+                    Name on card
+                  </label>
+
+                  <input
+                    id="payment-holder"
+                    name="paymentCardHolder"
+                    autoComplete="off"
+                  />
+                </div>
+              </div>
+            </fieldset>
+
+            {/* --------------------- additional driver */}
+            <fieldset className="field full checkout-block">
+              <legend>
+                Additional driver (optional)
+              </legend>
+
+              <div className="checkout-charges">
+                {[
+                  ["fullName", "Name"],
+                  ["address", "Address"],
+                  ["state", "State"],
+                  ["dateOfBirth", "DOB"],
+                  [
+                    "licenceNumber",
+                    "BVI license no.",
+                  ],
+                  [
+                    "licenceExpiresAt",
+                    "Expiration date",
+                  ],
+                  ["telephone", "Telephone"],
+                  [
+                    "localAddress",
+                    "Local address",
+                  ],
+                ].map(([key, label]) => (
+                  <div
+                    className="field"
+                    key={key}
+                  >
+                    <label
+                      htmlFor={`driver-${key}`}
+                    >
+                      {label}
+                    </label>
+
+                    <input
+                      id={`driver-${key}`}
+                      value={
+                        additionalDriver[
+                          key as keyof typeof additionalDriver
+                        ]
+                      }
+                      onChange={(event) =>
+                        setAdditionalDriver(
+                          (current) => ({
+                            ...current,
+                            [key]:
+                              event.target
+                                .value,
+                          }),
+                        )
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+            </fieldset>
+
+            <div className="field full">
+              <MediaCapture
+                stage="booking"
+                value={checkoutMedia}
+                onChange={setCheckoutMedia}
+                label="Vehicle condition at checkout"
+                hint="Capture the left, right, front and back of the vehicle with the renter present."
+              />
+            </div>
+
+            <div className="field full">
+              <div className="signature-mode">
+                <button
+                  type="button"
+                  className={
+                    signatureMode === "draw"
+                      ? "button button-primary compact"
+                      : "button button-secondary compact"
+                  }
+                  aria-pressed={
+                    signatureMode === "draw"
+                  }
+                  onClick={() => {
+                    setSignatureMode("draw");
+                    setSignatureName("");
+                  }}
+                >
+                  Sign on device
+                </button>
+
+                <button
+                  type="button"
+                  className={
+                    signatureMode === "type"
+                      ? "button button-primary compact"
+                      : "button button-secondary compact"
+                  }
+                  aria-pressed={
+                    signatureMode === "type"
+                  }
+                  onClick={() => {
+                    setSignatureMode("type");
+                    setCustomerSignature(null);
+                  }}
+                >
+                  Type the name
+                </button>
+              </div>
+
+              {signatureMode === "draw" ? (
+                <CustomerSignaturePad
+                  value={customerSignature}
+                  onChange={
+                    setCustomerSignature
+                  }
+                  disabled={busy}
+                />
+              ) : (
+                <div className="field">
+                  <label htmlFor="signature-name">
+                    Renter name as accepted
+                  </label>
+
+                  <input
+                    id="signature-name"
+                    value={signatureName}
+                    maxLength={120}
+                    disabled={busy}
+                    onChange={(event) =>
+                      setSignatureName(
+                        event.target.value,
+                      )
+                    }
+                  />
+
+                  <p className="form-help">
+                    Recorded on the agreement in
+                    place of a drawn signature.
+                  </p>
+                </div>
+              )}
+            </div>
+
             <div className="form-actions">
               <button
                 className="button button-primary"
                 disabled={
                   busy ||
-                  !reservations.length
+                  !reservations.length ||
+                  !(
+                    customerSignature ||
+                    signatureName.trim()
+                  )
                 }
               >
                 Complete checkout
@@ -3796,6 +4386,12 @@ export function ReservationComposer() {
                 step="0.01"
                 inputMode="decimal"
                 required
+                value={paymentAmount}
+                onChange={(event) =>
+                  setPaymentAmount(
+                    event.target.value,
+                  )
+                }
               />
             </div>
 
@@ -3849,6 +4445,23 @@ export function ReservationComposer() {
                             fee.selectedName
                           }
                           type="checkbox"
+                          checked={
+                            selectedFees[
+                              fee.type
+                            ] ?? false
+                          }
+                          onChange={(
+                            event,
+                          ) =>
+                            setSelectedFees(
+                              (current) => ({
+                                ...current,
+                                [fee.type]:
+                                  event.target
+                                    .checked,
+                              }),
+                            )
+                          }
                         />{" "}
                         {
                           fee.label
@@ -3865,12 +4478,79 @@ export function ReservationComposer() {
                         step="0.01"
                         inputMode="decimal"
                         placeholder="Amount (USD)"
+                        value={
+                          feeAmounts[
+                            fee.type
+                          ] ?? ""
+                        }
+                        onChange={(event) =>
+                          setFeeAmounts(
+                            (current) => ({
+                              ...current,
+                              [fee.type]:
+                                event.target
+                                  .value,
+                            }),
+                          )
+                        }
                       />
                     </div>
                   ),
                 )}
               </div>
             </div>
+
+            {/*
+              * The running total, so the employee can read the
+              * amount due to the customer off the screen while
+              * the fees are still being typed rather than
+              * after the payment has been taken.
+              */}
+            {selectedPayableRental && (
+              <div className="field full payment-due">
+                <dl>
+                  <div>
+                    <dt>
+                      Outstanding before fees
+                    </dt>
+                    <dd>
+                      {formatMoney(
+                        selectedPayableRental.outstandingCents,
+                      )}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>Additional fees</dt>
+                    <dd>
+                      {formatMoney(
+                        additionalFeesCents,
+                      )}
+                    </dd>
+                  </div>
+
+                  <div className="payment-due-total">
+                    <dt>Total due</dt>
+                    <dd>
+                      {formatMoney(
+                        totalDueCents,
+                      )}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>
+                      Balance after this payment
+                    </dt>
+                    <dd>
+                      {formatMoney(
+                        balanceAfterPayment,
+                      )}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+            )}
 
             <div className="field full">
               <label htmlFor="reference">

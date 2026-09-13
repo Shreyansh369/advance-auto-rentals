@@ -19,11 +19,13 @@ import {
 
 import { useFirebaseAuth } from "./firebase-provider";
 
+import { AgreementSheet } from "./agreement-sheet";
+
 import {
   callFirestoreOperation,
   type ContractStatus,
   type ContractWorkflow,
-  type ReservationContract,
+  type RentalAgreementView,
 } from "@/lib/services/firestore-client";
 
 import {
@@ -31,9 +33,10 @@ import {
   sendContractEmail,
 } from "@/lib/services/contract-mailer";
 
+import { CHARGE_ROWS } from "@/lib/agreement";
+
 import {
   firebaseErrorMessage,
-  formatDate,
   formatMoney,
 } from "@/lib/presentation";
 
@@ -113,63 +116,52 @@ function statusTone(
  * as it was saved rather than as it was typed.
  */
 function agreementText(
-  contract: ReservationContract,
+  agreement: RentalAgreementView,
 ): string {
-  const money = (
-    cents: number | null,
-  ): string =>
-    cents == null
-      ? "Not offered"
-      : formatMoney(cents);
-
-  return [
-    "ADVANCE AUTO RENTAL & REPAIRS",
+  const lines = [
+    "ADVANCE AUTO RENTAL",
     "Rental agreement",
-    `Booking reference ${contract.reservationId}`,
     "",
-    `Customer: ${contract.customer.fullName}`,
+    `Renter: ${agreement.renter.fullName}`,
     `Telephone: ${
-      contract.customer.telephone ||
-      "Not recorded"
+      agreement.renter.telephone || "Not recorded"
     }`,
-    `Licence: ${contract.customer.licenceNumber} (${contract.customer.licenceCountry})`,
+    `Licence: ${agreement.renter.licenceNumber} (${agreement.renter.licenceCountry})`,
     "",
-    `Vehicle: ${contract.vehicle.registration} - ${contract.vehicle.make} ${contract.vehicle.model}`.trim(),
-    `Pickup: ${dateTime(contract.pickupAt)}`,
-    `Expected return: ${dateTime(
-      contract.expectedReturnAt,
-    )}`,
-    `Pickup location: ${
-      contract.pickupLocation ||
-      "Not recorded"
-    }`,
-    `Drop-off location: ${
-      contract.dropoffLocation ||
-      "Not recorded"
-    }`,
+    `Vehicle: ${agreement.vehicle.registration} - ${agreement.vehicle.make} ${agreement.vehicle.model}`.trim(),
+    `Date out: ${dateTime(agreement.dateOut)}`,
+    `Date in: ${dateTime(agreement.dateIn)}`,
     "",
-    `Rental days: ${contract.chargedDays}`,
-    `Daily rate: ${money(
-      contract.rateSnapshot.dailyCents,
-    )}`,
-    `Rental total: ${formatMoney(
-      contract.baseRentalCents,
+  ];
+
+  for (const row of CHARGE_ROWS) {
+    const cents = agreement.charges[row.key];
+
+    if (cents) {
+      lines.push(
+        `${row.label}: ${formatMoney(cents)}`,
+      );
+    }
+  }
+
+  lines.push(
+    `TOTAL: ${formatMoney(
+      agreement.chargeTotalCents,
     )}`,
     "",
     `${
-      contract.customerSignatureMethod ===
+      agreement.customerSignatureMethod ===
       "typed"
         ? "Accepted by"
         : "Signed by"
     }: ${
-      contract.customerSignatureName ||
-      contract.customer.fullName
+      agreement.customerSignatureName ||
+      agreement.renter.fullName
     }`,
-    `Prepared by: ${contract.preparedBy}`,
-    ...(contract.notes
-      ? ["", `Note: ${contract.notes}`]
-      : []),
-  ].join("\n");
+    `Checked out by: ${agreement.checkedOutBy}`,
+  );
+
+  return lines.join("\n");
 }
 
 /*
@@ -178,16 +170,16 @@ function agreementText(
  * actually saved rather than whatever remains on the form.
  */
 export function RentalAgreement({
-  reservationId,
+  rentalId,
   onClose,
 }: {
-  reservationId: string;
+  rentalId: string;
   onClose: () => void;
 }) {
   const { role } = useFirebaseAuth();
 
-  const [contract, setContract] =
-    useState<ReservationContract>();
+  const [agreement, setAgreement] =
+    useState<RentalAgreementView>();
 
   const [workflow, setWorkflow] =
     useState<ContractWorkflow>();
@@ -232,37 +224,41 @@ export function RentalAgreement({
 
     async function load() {
       try {
-        const [
-          agreement,
-          review,
-        ] = await Promise.all([
-          callFirestoreOperation<
-            { reservationId: string },
-            ReservationContract
-          >(
-            "getReservationContract",
-            { reservationId },
-          ),
+        const sheet =
+          await callFirestoreOperation<
+            { rentalId: string },
+            RentalAgreementView
+          >("getRentalAgreement", {
+            rentalId,
+          });
 
-          callFirestoreOperation<
+        if (cancelled) {
+          return;
+        }
+
+        setAgreement(sheet);
+
+        /*
+         * The review workflow is keyed by the booking the
+         * rental came from, so the agreement has to be read
+         * first to know which one that is.
+         */
+        const review =
+          await callFirestoreOperation<
             { reservationId: string },
             ContractWorkflow
-          >(
-            "getContractWorkflow",
-            { reservationId },
-          ),
-        ]);
+          >("getContractWorkflow", {
+            reservationId:
+              sheet.reservationId,
+          });
 
         if (!cancelled) {
-          setContract(agreement);
           setWorkflow(review);
         }
       } catch (cause) {
         if (!cancelled) {
           setError(
-            firebaseErrorMessage(
-              cause,
-            ),
+            firebaseErrorMessage(cause),
           );
         }
       }
@@ -273,10 +269,7 @@ export function RentalAgreement({
     return () => {
       cancelled = true;
     };
-  }, [
-    reservationId,
-    reloadToken,
-  ]);
+  }, [rentalId, reloadToken]);
 
   const status: ContractStatus =
     workflow?.status ?? "not_submitted";
@@ -287,7 +280,7 @@ export function RentalAgreement({
     contractMailerConfigured();
 
   const recipientEmail =
-    contract?.customer.email ?? null;
+    agreement?.renter.email ?? null;
 
   async function run(
     action: () => Promise<string>,
@@ -317,14 +310,21 @@ export function RentalAgreement({
     void run(async () => {
       const result =
         await callFirestoreOperation<
-          { reservationId: string },
+          {
+            reservationId: string;
+            rentalId: string;
+          },
           {
             reservationId: string;
             version: number;
           }
         >(
           "submitContractForReview",
-          { reservationId },
+          {
+            reservationId:
+              agreement?.reservationId ?? "",
+            rentalId,
+          },
         );
 
       return `Sent for review as version ${result.version}.`;
@@ -361,7 +361,8 @@ export function RentalAgreement({
         },
         unknown
       >("reviewContract", {
-        reservationId,
+        reservationId:
+          agreement?.reservationId ?? "",
         decision,
         note,
       });
@@ -382,21 +383,21 @@ export function RentalAgreement({
    * costs no infrastructure and needs no Firebase plan.
    */
   function emailFromMailClient() {
-    if (!contract) {
+    if (!agreement) {
       return;
     }
 
     const to =
-      contract.customer.email ?? "";
+      agreement.renter.email ?? "";
 
-    const subject = `Rental agreement ${contract.reservationId} - ${contract.vehicle.registration}`;
+    const subject = `Rental agreement ${agreement.rentalId} - ${agreement.vehicle.registration}`;
 
     const href = `mailto:${encodeURIComponent(
       to,
     )}?subject=${encodeURIComponent(
       subject,
     )}&body=${encodeURIComponent(
-      agreementText(contract),
+      agreementText(agreement),
     )}`;
 
     window.location.href = href;
@@ -414,7 +415,7 @@ export function RentalAgreement({
     void run(async () => {
       const result =
         await sendContractEmail(
-          reservationId,
+          agreement?.reservationId ?? "",
         );
 
       return `Agreement emailed to ${result.recipientEmail}.`;
@@ -443,8 +444,8 @@ export function RentalAgreement({
             </p>
 
             <h2>
-              {contract
-                ? contract.vehicle
+              {agreement
+                ? agreement.vehicle
                     .registration
                 : "Loading agreement"}
             </h2>
@@ -457,7 +458,7 @@ export function RentalAgreement({
               onClick={() =>
                 window.print()
               }
-              disabled={!contract}
+              disabled={!agreement}
             >
               <Printer size={16} />
               Print
@@ -772,329 +773,12 @@ export function RentalAgreement({
             )}
         </section>
 
-        {contract && (
-          <article className="agreement-sheet">
-            <div className="agreement-brand">
-              <img
-                src="/brand/advance-auto-rentals-logo.png"
-                alt="Advance Auto Rental &amp; Repairs"
-              />
-
-              <div>
-                <strong>
-                  Rental agreement
-                </strong>
-
-                <span>
-                  Booking reference{" "}
-                  {contract.reservationId}
-                </span>
-              </div>
-            </div>
-
-            <div className="agreement-columns">
-              <section>
-                <h3>Customer</h3>
-
-                <dl>
-                  <div>
-                    <dt>Name</dt>
-                    <dd>
-                      {
-                        contract.customer
-                          .fullName
-                      }
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Telephone</dt>
-                    <dd>
-                      {contract.customer
-                        .telephone ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Email</dt>
-                    <dd>
-                      {contract.customer
-                        .email ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Address</dt>
-                    <dd>
-                      {contract.customer
-                        .address ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Licence</dt>
-                    <dd>
-                      {
-                        contract.customer
-                          .licenceNumber
-                      }{" "}
-                      (
-                      {
-                        contract.customer
-                          .licenceCountry
-                      }
-                      )
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Licence expiry</dt>
-                    <dd>
-                      {formatDate(
-                        contract.customer
-                          .licenceExpiresAt,
-                      )}
-                    </dd>
-                  </div>
-                </dl>
-              </section>
-
-              <section>
-                <h3>Vehicle</h3>
-
-                <dl>
-                  <div>
-                    <dt>Registration</dt>
-                    <dd>
-                      {
-                        contract.vehicle
-                          .registration
-                      }
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Make and model</dt>
-                    <dd>
-                      {
-                        contract.vehicle
-                          .make
-                      }{" "}
-                      {
-                        contract.vehicle
-                          .model
-                      }
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Year</dt>
-                    <dd>
-                      {contract.vehicle
-                        .year ??
-                        "Not recorded"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Colour</dt>
-                    <dd>
-                      {contract.vehicle
-                        .color ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>VIN</dt>
-                    <dd>
-                      {contract.vehicle
-                        .vin ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-                </dl>
-              </section>
-
-              <section>
-                <h3>Rental period</h3>
-
-                <dl>
-                  <div>
-                    <dt>Pickup</dt>
-                    <dd>
-                      {dateTime(
-                        contract.pickupAt,
-                      )}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Expected return</dt>
-                    <dd>
-                      {dateTime(
-                        contract.expectedReturnAt,
-                      )}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Pickup location</dt>
-                    <dd>
-                      {contract.pickupLocation ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Drop-off location</dt>
-                    <dd>
-                      {contract.dropoffLocation ||
-                        "Not recorded"}
-                    </dd>
-                  </div>
-                </dl>
-              </section>
-
-              <section>
-                <h3>Charges</h3>
-
-                <dl>
-                  <div>
-                    <dt>Rental days</dt>
-                    <dd>
-                      {contract.chargedDays}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Daily rate</dt>
-                    <dd>
-                      {contract.rateSnapshot
-                        .dailyCents == null
-                        ? "Not offered"
-                        : formatMoney(
-                            contract
-                              .rateSnapshot
-                              .dailyCents,
-                          )}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Weekly rate</dt>
-                    <dd>
-                      {contract.rateSnapshot
-                        .weeklyCents == null
-                        ? "Not offered"
-                        : formatMoney(
-                            contract
-                              .rateSnapshot
-                              .weeklyCents,
-                          )}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Monthly rate</dt>
-                    <dd>
-                      {contract.rateSnapshot
-                        .monthlyCents == null
-                        ? "Not offered"
-                        : formatMoney(
-                            contract
-                              .rateSnapshot
-                              .monthlyCents,
-                          )}
-                    </dd>
-                  </div>
-
-                  <div className="agreement-total">
-                    <dt>Rental total</dt>
-                    <dd>
-                      {formatMoney(
-                        contract.baseRentalCents,
-                      )}
-                    </dd>
-                  </div>
-                </dl>
-              </section>
-            </div>
-
-            {contract.notes && (
-              <section className="agreement-notes">
-                <h3>Booking note</h3>
-
-                <p>{contract.notes}</p>
-              </section>
-            )}
-
-            <section className="agreement-signature">
-              <div>
-                <h3>
-                  Customer signature
-                </h3>
-
-                {contract.customerSignatureDataUrl ? (
-                  <img
-                    src={
-                      contract.customerSignatureDataUrl
-                    }
-                    alt="Customer signature"
-                  />
-                ) : contract.customerSignatureName ? (
-                  /*
-                   * A typed acceptance. It is shown in the
-                   * same place a drawn signature would be, and
-                   * labelled as typed below, so the agreement
-                   * never implies a signature that was not
-                   * given.
-                   */
-                  <p className="agreement-typed-signature">
-                    {
-                      contract.customerSignatureName
-                    }
-                  </p>
-                ) : (
-                  <p className="quiet">
-                    No signature was captured
-                    for this booking.
-                  </p>
-                )}
-
-                <small>
-                  {contract.customerSignatureMethod ===
-                  "typed"
-                    ? `Accepted by ${contract.customer.fullName} — name entered, not signed`
-                    : contract.customer
-                        .fullName}
-                </small>
-              </div>
-
-              <div>
-                <h3>Prepared by</h3>
-
-                <p>
-                  {contract.preparedBy}
-                </p>
-
-                <small>
-                  {formatDate(
-                    contract.createdAt,
-                    {
-                      month: "short",
-                      day: "numeric",
-                      year: "numeric",
-                    },
-                  )}
-                </small>
-              </div>
-            </section>
-          </article>
+        {agreement && (
+          <AgreementSheet
+            agreement={agreement}
+          />
         )}
+
       </section>
     </div>,
     document.body,
