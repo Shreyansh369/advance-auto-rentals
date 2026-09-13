@@ -106,6 +106,87 @@ a {
   padding-inline: 12px;
 }
 
+/* Destructive confirmation, used where a record is about to
+   be removed rather than changed. */
+.button-danger {
+  border-color: #f0bcc2;
+  background: #ffe9eb;
+  color: #a4293a;
+}
+
+.button-danger:hover:not(:disabled) {
+  background: #ffdce0;
+  border-color: #e2949e;
+}
+
+.row-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Contracts still waiting on an administrator, listed on the
+   booking screen so an agreement submitted in one browser can
+   be opened in another. */
+.contract-queue {
+  margin-bottom: 14px;
+  padding: 15px 16px;
+}
+
+.contract-queue ul {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contract-queue li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.contract-queue-detail {
+  display: grid;
+  flex: 1 1 200px;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+
+.contract-queue-detail small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* The booking screen's inline customer editor, shown under
+   the selected customer rather than on its own page. */
+.customer-edit-form {
+  margin-top: 10px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+
+/*
+ * The plain icon button is designed for the dark shell
+ * header, where a light hover reads. Inside a table row it
+ * needs its own tint to be visible at all.
+ */
+.row-actions .icon-button {
+  color: #a4293a;
+}
+
+.row-actions .icon-button:hover {
+  background: #ffe9eb;
+}
+
 .icon-button {
   display: grid;
   width: 36px;
@@ -5644,6 +5725,118 @@ canvas {
   font-size: 11px;
 }
 
+/* =========================================================
+   Contract review and finalisation
+   ========================================================= */
+
+.agreement-review {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.agreement-review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agreement-review-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.agreement-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agreement-review-meta {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.agreement-review-meta > div {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.agreement-review-meta dt {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agreement-review-meta dd {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.agreement-deliveries h3 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.agreement-deliveries ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agreement-deliveries li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.agreement-deliveries small {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/*
+ * Hint text under a control. It was already used on the
+ * booking form without a rule of its own, so it rendered at
+ * body size and read as a second instruction rather than a
+ * note.
+ */
+.form-help {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .vehicle-card-photo {
   display: block;
   width: 100%;
@@ -5679,7 +5872,9 @@ canvas {
    * and hiding the shell leaves the printable sheet standing.
    */
   .app-frame,
-  .agreement-modal-header {
+  .agreement-modal-header,
+  .agreement-review,
+  .alert {
     display: none !important;
   }
 

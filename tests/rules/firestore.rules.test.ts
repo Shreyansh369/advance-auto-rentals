@@ -58,6 +58,42 @@ beforeAll(async () => {
     await setDoc(doc(db, "idempotencyKeys", "payment_001"), { response: { outstandingCents: 0 } });
     await setDoc(doc(db, "vehicleRegistry", "reg_RT-001"), { vehicleId: "vehicle_001", value: "RT-001" });
     await setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1000 });
+
+    await setDoc(doc(db, "reservationContracts", "contract_review"), {
+      status: "in_review",
+      version: 1,
+    });
+
+    await setDoc(doc(db, "reservationContracts", "contract_rejected"), {
+      status: "rejected",
+      version: 1,
+    });
+
+    await setDoc(doc(db, "reservationContracts", "contract_approved"), {
+      status: "approved",
+      version: 1,
+      approvedVersion: 1,
+    });
+
+    await setDoc(
+      doc(db, "reservationContracts", "contract_approved", "versions", "v1"),
+      { reservationId: "contract_approved", version: 1, baseRentalCents: 16000 },
+    );
+
+    await setDoc(
+      doc(db, "reservationContracts", "contract_approved", "deliveries", "delivery_001"),
+      { status: "sent", providerMessageId: "msg_001", contractVersion: 1 },
+    );
+
+    await setDoc(doc(db, "reservationContracts", "contract_admin_review"), {
+      status: "in_review",
+      version: 1,
+    });
+
+    await setDoc(doc(db, "reservationContracts", "contract_ops_review"), {
+      status: "in_review",
+      version: 1,
+    });
   });
 });
 
@@ -151,6 +187,160 @@ describe("Firestore access policy", () => {
     await assertSucceeds(setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_002"), { extensionCents: 2000 }));
     await assertFails(updateDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1 }));
     await assertFails(deleteDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001")));
+  });
+
+  it("lets staff open a contract for review but never declare it approved", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(
+      setDoc(doc(db, "reservationContracts", "contract_new"), {
+        status: "in_review",
+        version: 1,
+      }),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "reservationContracts", "contract_forged"), {
+        status: "approved",
+        version: 1,
+      }),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "reservationContracts", "contract_skipped"), {
+        status: "in_review",
+        version: 4,
+      }),
+    );
+  });
+
+  it("lets a rejected contract be resubmitted at the next version only", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(
+      updateDoc(doc(db, "reservationContracts", "contract_rejected"), {
+        status: "in_review",
+        version: 1,
+      }),
+    );
+
+    await assertSucceeds(
+      updateDoc(doc(db, "reservationContracts", "contract_rejected"), {
+        status: "in_review",
+        version: 2,
+      }),
+    );
+  });
+
+  it("keeps the approve and reject decision with an administrator", async () => {
+    await assertFails(
+      updateDoc(
+        doc(asUser(OPS), "reservationContracts", "contract_ops_review"),
+        { status: "approved", version: 1 },
+      ),
+    );
+
+    await assertSucceeds(
+      updateDoc(
+        doc(asUser(ADMIN), "reservationContracts", "contract_admin_review"),
+        { status: "approved", version: 1 },
+      ),
+    );
+  });
+
+  it("treats an approved contract as final, even for an administrator", async () => {
+    await assertFails(
+      updateDoc(
+        doc(asUser(ADMIN), "reservationContracts", "contract_approved"),
+        { status: "in_review", version: 2 },
+      ),
+    );
+
+    await assertFails(
+      deleteDoc(
+        doc(asUser(ADMIN), "reservationContracts", "contract_approved"),
+      ),
+    );
+  });
+
+  it("lets only an administrator freeze a contract version, and nobody rewrite one", async () => {
+    await assertSucceeds(
+      getDoc(
+        doc(asUser(OPS), "reservationContracts", "contract_approved", "versions", "v1"),
+      ),
+    );
+
+    await assertFails(
+      setDoc(
+        doc(asUser(OPS), "reservationContracts", "contract_approved", "versions", "v9"),
+        { version: 9 },
+      ),
+    );
+
+    await assertSucceeds(
+      setDoc(
+        doc(asUser(ADMIN), "reservationContracts", "contract_approved", "versions", "v2"),
+        { version: 2, baseRentalCents: 16000 },
+      ),
+    );
+
+    await assertFails(
+      updateDoc(
+        doc(asUser(ADMIN), "reservationContracts", "contract_approved", "versions", "v1"),
+        { baseRentalCents: 1 },
+      ),
+    );
+
+    await assertFails(
+      deleteDoc(
+        doc(asUser(ADMIN), "reservationContracts", "contract_approved", "versions", "v1"),
+      ),
+    );
+  });
+
+  it("keeps email delivery receipts append-only", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(
+      getDoc(
+        doc(db, "reservationContracts", "contract_approved", "deliveries", "delivery_001"),
+      ),
+    );
+
+    await assertSucceeds(
+      setDoc(
+        doc(db, "reservationContracts", "contract_approved", "deliveries", "delivery_002"),
+        { status: "sent", providerMessageId: "msg_002", contractVersion: 1 },
+      ),
+    );
+
+    await assertFails(
+      updateDoc(
+        doc(db, "reservationContracts", "contract_approved", "deliveries", "delivery_001"),
+        { status: "failed" },
+      ),
+    );
+
+    await assertFails(
+      deleteDoc(
+        doc(db, "reservationContracts", "contract_approved", "deliveries", "delivery_001"),
+      ),
+    );
+  });
+
+  it("keeps contracts away from an account that has not been approved", async () => {
+    const db = asUser(PENDING);
+
+    await assertFails(
+      getDoc(doc(db, "reservationContracts", "contract_approved")),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "reservationContracts", "contract_pending"), {
+        status: "in_review",
+        version: 1,
+      }),
+    );
   });
 
   it("gives an administrator the financial reporting reads", async () => {

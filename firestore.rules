@@ -173,6 +173,69 @@ allow list: if isAdmin();
 
 
     /* =========================================================
+       CONTRACT REVIEW AND FINALISATION
+       ========================================================= */
+
+    match /reservationContracts/{reservationId} {
+
+      allow read: if isStaff();
+
+      /* A contract enters the workflow already waiting for
+         review, so there is no separate draft record to keep
+         in step with the booking it describes. */
+      allow create: if isStaff()
+        && request.resource.data.status == "in_review"
+        && request.resource.data.version == 1;
+
+      /* Resubmission after a rejection. The version advances
+         so an approved snapshot is always attributable to
+         the round of review that produced it. */
+      allow update: if isStaff()
+        && resource.data.status == "rejected"
+        && request.resource.data.status == "in_review"
+        && request.resource.data.version
+            == resource.data.version + 1;
+
+      /* Only an administrator finalises a contract, and only
+         one that is actually waiting for review. An approved
+         contract is terminal: no later update matches. */
+      allow update: if isAdmin()
+        && resource.data.status == "in_review"
+        && request.resource.data.status in [
+          "approved",
+          "rejected"
+        ]
+        && request.resource.data.version
+            == resource.data.version;
+
+      allow delete: if false;
+    }
+
+
+    match /reservationContracts/{reservationId}/versions/{version} {
+
+      /* The frozen agreement: written once by the
+         administrator who approved it, and immutable from
+         then on, so what was sent can always be reproduced. */
+      allow read: if isStaff();
+
+      allow create: if isAdmin();
+
+      allow update, delete: if false;
+    }
+
+
+    match /reservationContracts/{reservationId}/deliveries/{deliveryId} {
+
+      /* Append-only delivery receipts recording when a
+         contract was emailed, to whom, and which version. */
+      allow read, create: if isStaff();
+
+      allow update, delete: if false;
+    }
+
+
+    /* =========================================================
        RENTALS
        ========================================================= */
 

@@ -38,9 +38,11 @@ async function main(): Promise<void> {
     if (password.length < 12) throw new Error("The password supplied on standard input must be at least 12 characters.");
     user = await auth.createUser({ email, password });
   }
-  await auth.setCustomUserClaims(user.uid, { ...(user.customClaims ?? {}), role });
   const db = getFirestore();
-  await db.collection("users").doc(user.uid).set({ email: user.email ?? email, role, updatedAt: FieldValue.serverTimestamp(), updatedBy: "bootstrap-script", createdAt: FieldValue.serverTimestamp() }, { merge: true });
+  // The security rules read the role and the approval from this
+  // document, not from a custom claim. Without status: "approved"
+  // the account is denied every collection.
+  await db.collection("users").doc(user.uid).set({ email: user.email ?? email, role, status: "approved", requestedRole: role, updatedAt: FieldValue.serverTimestamp(), updatedBy: "bootstrap-script", createdAt: FieldValue.serverTimestamp() }, { merge: true });
   await db.collection("auditLogs").add({ actorUid: "bootstrap-script", action: "user.role_bootstrapped", target: { collection: "users", id: user.uid }, metadata: { email, role, created: create }, occurredAt: FieldValue.serverTimestamp() });
   console.log(JSON.stringify({ applied: true, uid: user.uid, email, role, created: create }, null, 2));
 }

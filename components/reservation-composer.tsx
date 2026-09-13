@@ -49,6 +49,7 @@ import type { CloudinaryMedia } from "@/lib/cloudinary";
 
 import {
   callFirestoreOperation,
+  type ContractQueueEntry,
 } from "@/lib/services/firestore-client";
 
 type Tab =
@@ -67,9 +68,23 @@ type Customer = {
   fullName: string;
   telephone: string;
   email: string | null;
+  address: string | null;
   licenceNumber: string;
   licenceCountry: string;
   licenceExpiresAt: string | null;
+};
+
+/* The booking screen edits the same fields the customers
+   screen does, minus the licence image, which has its own
+   capture control. */
+type CustomerEdit = {
+  fullName: string;
+  telephone: string;
+  email: string;
+  address: string;
+  licenceNumber: string;
+  licenceCountry: string;
+  licenceExpiresAt: string;
 };
 
 type Vehicle = {
@@ -348,6 +363,27 @@ export function ReservationComposer() {
   const [newCustomerLicencePath, setNewCustomerLicencePath] =
     useState<string | null>(null);
 
+  /*
+   * A detail that is wrong at the counter — a new telephone
+   * number, a renewed licence — can be corrected here rather
+   * than sending the employee to the Customers screen and
+   * back. The record is updated in place, so the booking is
+   * made against the corrected customer.
+   */
+  const [customerEdit, setCustomerEdit] =
+    useState<CustomerEdit | null>(null);
+
+  const [savingCustomerEdit, setSavingCustomerEdit] =
+    useState(false);
+
+  /*
+   * A contract submitted from one browser has to be findable
+   * from another, or an administrator can never reach the
+   * agreement they are supposed to approve.
+   */
+  const [contractQueue, setContractQueue] =
+    useState<ContractQueueEntry[]>([]);
+
   const [error, setError] =
     useState<string>();
 
@@ -554,6 +590,10 @@ export function ReservationComposer() {
               snapshot.get(
                 "email",
               ) ?? null,
+            address:
+              snapshot.get(
+                "address",
+              ) ?? null,
             licenceNumber:
               snapshot.get(
                 "licenceNumber",
@@ -599,6 +639,16 @@ export function ReservationComposer() {
                 b.registrationNumber,
               ),
           ),
+      );
+
+      setContractQueue(
+        await callFirestoreOperation<
+          undefined,
+          ContractQueueEntry[]
+        >(
+          "listContractsForReview",
+          undefined,
+        ),
       );
 
       setReservations(
@@ -832,6 +882,161 @@ export function ReservationComposer() {
           cause,
         ),
       );
+    }
+  }
+
+  function startCustomerEdit() {
+    if (!selectedCustomer) {
+      return;
+    }
+
+    setError(undefined);
+    setNotice(undefined);
+
+    setCustomerEdit({
+      fullName:
+        selectedCustomer.fullName,
+
+      telephone:
+        selectedCustomer.telephone,
+
+      email:
+        selectedCustomer.email ?? "",
+
+      address:
+        selectedCustomer.address ?? "",
+
+      licenceNumber:
+        selectedCustomer.licenceNumber,
+
+      licenceCountry:
+        selectedCustomer.licenceCountry,
+
+      licenceExpiresAt:
+        selectedCustomer.licenceExpiresAt
+          ? selectedCustomer.licenceExpiresAt.slice(
+              0,
+              10,
+            )
+          : "",
+    });
+  }
+
+  async function saveCustomerEdit() {
+    if (
+      !customerEdit ||
+      !selectedCustomerId
+    ) {
+      return;
+    }
+
+    const fullName =
+      customerEdit.fullName.trim();
+
+    const telephone =
+      customerEdit.telephone.trim();
+
+    const licenceNumber =
+      customerEdit.licenceNumber
+        .trim()
+        .toUpperCase();
+
+    const licenceCountry =
+      customerEdit.licenceCountry
+        .trim()
+        .toUpperCase();
+
+    const licenceExpiresAt =
+      customerEdit.licenceExpiresAt.trim();
+
+    setError(undefined);
+    setNotice(undefined);
+
+    if (
+      !fullName ||
+      !telephone ||
+      !licenceNumber ||
+      licenceCountry.length !== 2 ||
+      !licenceExpiresAt
+    ) {
+      setError(
+        "Complete the required customer details before saving.",
+      );
+
+      return;
+    }
+
+    const today = new Date();
+
+    today.setHours(0, 0, 0, 0);
+
+    const expiry = new Date(
+      `${licenceExpiresAt}T00:00:00`,
+    );
+
+    expiry.setHours(0, 0, 0, 0);
+
+    if (
+      Number.isNaN(expiry.getTime()) ||
+      expiry.getTime() <= today.getTime()
+    ) {
+      setError(
+        "Licence expiry must be after today.",
+      );
+
+      return;
+    }
+
+    setSavingCustomerEdit(true);
+
+    try {
+      await callFirestoreOperation<
+        {
+          customerId: string;
+          fullName: string;
+          telephone: string;
+          email: string | null;
+          address: string | null;
+          licenceNumber: string;
+          licenceCountry: string;
+          licenceExpiresAt: string;
+        },
+        { customerId: string }
+      >("createOrUpdateCustomer", {
+        customerId: selectedCustomerId,
+
+        fullName,
+        telephone,
+
+        email:
+          customerEdit.email.trim() || null,
+
+        address:
+          customerEdit.address.trim() || null,
+
+        licenceNumber,
+        licenceCountry,
+        licenceExpiresAt,
+      });
+
+      /*
+       * The picker reads from the list this screen loaded, so
+       * it is re-read before the editor closes and the
+       * selected customer shows the corrected details.
+       */
+      await load();
+
+      setCustomerEdit(null);
+
+      setNotice(
+        "Customer details updated.",
+      );
+    } catch (cause) {
+      setError(
+        firebaseErrorMessage(cause),
+      );
+    } finally {
+      setSavingCustomerEdit(false);
     }
   }
 
@@ -1536,10 +1741,93 @@ export function ReservationComposer() {
             reservationId={
               contractReservationId
             }
-            onClose={() =>
-              setShowContract(false)
-            }
+            onClose={() => {
+              setShowContract(false);
+
+              /* A decision taken in the dialog changes what
+                 is still waiting for review. */
+              void load();
+            }}
           />
+        )}
+
+      {tab === "booking" &&
+        contractQueue.length > 0 && (
+          <section className="surface contract-queue">
+            <p className="section-kicker">
+              Contracts awaiting a decision
+            </p>
+
+            <ul>
+              {contractQueue.map(
+                (entry) => (
+                  <li
+                    key={
+                      entry.reservationId
+                    }
+                  >
+                    <span
+                      className={
+                        entry.status ===
+                        "rejected"
+                          ? "status-pill overdue"
+                          : "status-pill cleaning"
+                      }
+                    >
+                      {entry.status ===
+                      "rejected"
+                        ? "Rejected"
+                        : "Waiting for review"}
+                    </span>
+
+                    <span className="contract-queue-detail">
+                      <strong>
+                        {
+                          entry.vehicleRegistration
+                        }
+                      </strong>
+
+                      <small>
+                        {
+                          entry.customerName
+                        }
+                        {" · version "}
+                        {entry.version}
+                        {entry.submittedByNameSnapshot
+                          ? ` · submitted by ${entry.submittedByNameSnapshot}`
+                          : ""}
+                      </small>
+
+                      {entry.reviewNote && (
+                        <small>
+                          {entry.reviewNote}
+                        </small>
+                      )}
+                    </span>
+
+                    <button
+                      className="button button-secondary compact"
+                      type="button"
+                      onClick={() => {
+                        setContractReservationId(
+                          entry.reservationId,
+                        );
+
+                        setShowContract(
+                          true,
+                        );
+                      }}
+                    >
+                      <FileText
+                        size={15}
+                      />
+                      Open
+                    </button>
+                  </li>
+                ),
+              )}
+            </ul>
+          </section>
         )}
 
       <section className="workflow-shell surface">
@@ -1692,17 +1980,33 @@ export function ReservationComposer() {
                         </span>
                       </div>
 
-                      <button
-                        className="text-button"
-                        type="button"
-                        onClick={() =>
-                          setSelectedCustomerId(
-                            "",
-                          )
-                        }
-                      >
-                        Change
-                      </button>
+                      <div className="row-actions">
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={
+                            startCustomerEdit
+                          }
+                        >
+                          Edit details
+                        </button>
+
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={() => {
+                            setCustomerEdit(
+                              null,
+                            );
+
+                            setSelectedCustomerId(
+                              "",
+                            );
+                          }}
+                        >
+                          Change
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <div className="customer-choice-list">
@@ -1772,6 +2076,215 @@ export function ReservationComposer() {
                       )}
                     </div>
                   )}
+
+                  {selectedCustomer &&
+                    customerEdit && (
+                      <div className="inline-customer-form customer-edit-form">
+                        <div className="field">
+                          <label htmlFor="edit-full-name">
+                            Full name
+                          </label>
+
+                          <input
+                            id="edit-full-name"
+                            value={
+                              customerEdit.fullName
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                fullName:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field">
+                          <label htmlFor="edit-telephone">
+                            Telephone
+                          </label>
+
+                          <input
+                            id="edit-telephone"
+                            inputMode="tel"
+                            value={
+                              customerEdit.telephone
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                telephone:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field">
+                          <label htmlFor="edit-email">
+                            Email
+                          </label>
+
+                          <input
+                            id="edit-email"
+                            type="email"
+                            value={
+                              customerEdit.email
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                email:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field">
+                          <label htmlFor="edit-licence-number">
+                            Licence number
+                          </label>
+
+                          <input
+                            id="edit-licence-number"
+                            value={
+                              customerEdit.licenceNumber
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                licenceNumber:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field">
+                          <label htmlFor="edit-issuing-country">
+                            Issuing country
+                          </label>
+
+                          <CountrySelect
+                            id="edit-issuing-country"
+                            value={
+                              customerEdit.licenceCountry
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                licenceCountry:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field">
+                          <label htmlFor="edit-licence-expiry">
+                            Licence expiry
+                          </label>
+
+                          <input
+                            id="edit-licence-expiry"
+                            type="date"
+                            min={tomorrowDate()}
+                            value={
+                              customerEdit.licenceExpiresAt
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                licenceExpiresAt:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field full">
+                          <label htmlFor="edit-address">
+                            Address
+                          </label>
+
+                          <input
+                            id="edit-address"
+                            value={
+                              customerEdit.address
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                address:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="form-actions">
+                          <button
+                            className="button button-primary compact"
+                            type="button"
+                            disabled={
+                              savingCustomerEdit
+                            }
+                            onClick={() =>
+                              void saveCustomerEdit()
+                            }
+                          >
+                            {savingCustomerEdit
+                              ? "Saving…"
+                              : "Save customer"}
+                          </button>
+
+                          <button
+                            className="button button-secondary compact"
+                            type="button"
+                            disabled={
+                              savingCustomerEdit
+                            }
+                            onClick={() =>
+                              setCustomerEdit(
+                                null,
+                              )
+                            }
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
                 </div>
               ) : (
                 <div className="inline-customer-form">

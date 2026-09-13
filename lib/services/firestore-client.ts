@@ -726,6 +726,40 @@ async function getOperationalDashboard(): Promise<DashboardSummary> {
       },
     ).length;
 
+  /*
+   * Overdue is worked out from the expected return time every
+   * time it is asked for, rather than stamped onto the rental
+   * by a nightly job. There is no scheduled function in this
+   * deployment, so a stored flag would simply be wrong until
+   * something happened to touch the record.
+   */
+  function isOverdue(
+    rental: FirestoreDoc,
+  ): boolean {
+    if (rental.status === "overdue") {
+      return true;
+    }
+
+    if (
+      ![
+        "active",
+        "overdue",
+      ].includes(String(rental.status))
+    ) {
+      return false;
+    }
+
+    if (!rental.expectedReturnAt) {
+      return false;
+    }
+
+    return (
+      new Date(
+        toIso(rental.expectedReturnAt),
+      ).getTime() < Date.now()
+    );
+  }
+
   const overdue =
     rentals.filter(
       (rental) => {
@@ -863,10 +897,12 @@ async function getOperationalDashboard(): Promise<DashboardSummary> {
           rental.checkedOutByNameSnapshot ??
             "—",
         ),
-        status:
-          rental.status === "overdue"
-            ? "overdue"
-            : "active",
+        /* Same derivation as the overdue count above, so the
+           badge on a rental and the number in the header can
+           never disagree. */
+        status: isOverdue(rental)
+          ? "overdue"
+          : "active",
       })) as DashboardSummary["activeRentals"];
 
   const upcomingReservations =
@@ -1130,7 +1166,7 @@ async function createOrUpdateCustomer(
     }
   }
 
-  const details = {
+  const details: Record<string, unknown> = {
     fullName,
 
     telephone,
@@ -1172,6 +1208,27 @@ async function createOrUpdateCustomer(
           ),
   };
 
+  /*
+   * An update is a patch, not a replacement. A screen that
+   * edits the contact details does not know about the date
+   * of birth, the internal note or the licence image, and
+   * sending those back as null would quietly erase them, so
+   * only the fields the caller actually supplied are written.
+   */
+  const patch: Record<string, unknown> = {};
+
+  for (const key of Object.keys(details)) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        input,
+        key,
+      ) &&
+      input[key] !== undefined
+    ) {
+      patch[key] = details[key];
+    }
+  }
+
   await runTransaction(
     db,
     async (transaction) => {
@@ -1195,7 +1252,7 @@ async function createOrUpdateCustomer(
         transaction.update(
           customerRef,
           {
-            ...details,
+            ...patch,
 
             updatedBy:
               actorUid,
@@ -5000,6 +5057,977 @@ operatingMarginCents:
   };
 }
 
+
+/* =========================================================
+   Customer removal
+   ========================================================= */
+
+/*
+ * A customer is only removable while nothing points at them.
+ * Reservations and rentals both carry a customerId, so the
+ * two collections are checked before the delete is attempted
+ * and the record is refused if either returns a match.
+ *
+ * The check runs outside the transaction because the browser
+ * SDK cannot read a query transactionally. A booking created
+ * in the same instant as the delete would therefore survive
+ * it; the reservation keeps its own customerNameSnapshot, so
+ * it still renders, and the deletion is written to the audit
+ * log so the removal can be traced.
+ */
+async function deleteCustomer(
+  input: { customerId: string },
+): Promise<{ customerId: string }> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const customerId = trimmedOrNull(
+    input.customerId,
+  );
+
+  if (!customerId) {
+    throw new Error(
+      "Select a customer to remove.",
+    );
+  }
+
+  const customerRef = doc(
+    db,
+    "customers",
+    customerId,
+  );
+
+  const [
+    reservationMatches,
+    rentalMatches,
+  ] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "reservations"),
+        where("customerId", "==", customerId),
+        limit(1),
+      ),
+    ),
+
+    getDocs(
+      query(
+        collection(db, "rentals"),
+        where("customerId", "==", customerId),
+        limit(1),
+      ),
+    ),
+  ]);
+
+  if (!reservationMatches.empty) {
+    throw new Error(
+      "This customer has bookings on file and cannot be removed.",
+    );
+  }
+
+  if (!rentalMatches.empty) {
+    throw new Error(
+      "This customer has rental history and cannot be removed.",
+    );
+  }
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const snapshot = await transaction.get(
+        customerRef,
+      );
+
+      if (!snapshot.exists()) {
+        throw new Error(
+          "Customer was not found.",
+        );
+      }
+
+      const actorName = await actorNameSnapshot(
+        transaction,
+        actorUid,
+      );
+
+      transaction.delete(customerRef);
+
+      transaction.set(
+        doc(collection(db, "auditLogs")),
+        {
+          actorUid,
+
+          action: "customer.deleted",
+
+          resource: {
+            collection: "customers",
+            id: customerId,
+          },
+
+          details: {
+            actorName,
+
+            fullName: String(
+              snapshot.get("fullName") ?? "",
+            ),
+
+            licenceNumber: String(
+              snapshot.get("licenceNumber") ?? "",
+            ),
+
+            /*
+             * The licence image lives in Cloudinary and can
+             * only be removed with the account's API secret,
+             * which this application deliberately does not
+             * hold. The path is recorded so it can be purged
+             * from the Cloudinary console.
+             */
+            licenceStoragePath: trimmedOrNull(
+              snapshot.get("licenceStoragePath"),
+            ),
+          },
+
+          createdAt: nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return { customerId };
+}
+
+/* =========================================================
+   Contract review, finalisation and delivery
+   ========================================================= */
+
+export type ContractStatus =
+  | "not_submitted"
+  | "in_review"
+  | "approved"
+  | "rejected";
+
+export type ContractDelivery = {
+  id: string;
+  status: "sent" | "failed";
+  provider: string;
+  providerMessageId: string | null;
+  recipientEmail: string;
+  recipientNameSnapshot: string;
+  contractVersion: number;
+  sentByNameSnapshot: string;
+  failureReason: string | null;
+  createdAt: string;
+};
+
+export type ContractWorkflow = {
+  reservationId: string;
+  status: ContractStatus;
+  version: number;
+  approvedVersion: number | null;
+  submittedByNameSnapshot: string | null;
+  submittedAt: string | null;
+  reviewedByNameSnapshot: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+  deliveries: ContractDelivery[];
+};
+
+function contractRef(reservationId: string) {
+  const { db } = getFirebaseClient();
+
+  return doc(
+    db,
+    "reservationContracts",
+    reservationId,
+  );
+}
+
+/*
+ * The approved snapshot is addressed by its version so a
+ * rejected-and-resubmitted contract never overwrites the
+ * agreement a customer was already sent.
+ */
+function contractVersionRef(
+  reservationId: string,
+  version: number,
+) {
+  const { db } = getFirebaseClient();
+
+  return doc(
+    db,
+    "reservationContracts",
+    reservationId,
+    "versions",
+    `v${version}`,
+  );
+}
+
+/* The role decides who may approve, so it is read from the
+   caller's own profile rather than taken from the browser. */
+async function actorProfileSnapshot(
+  transaction: {
+    get: (
+      reference: ReturnType<typeof doc>,
+    ) => Promise<{
+      data: () => Record<string, unknown> | undefined;
+    }>;
+  },
+  actorUid: string,
+): Promise<{
+  name: string;
+  role: string | null;
+}> {
+  const { db } = getFirebaseClient();
+
+  const snapshot = await transaction.get(
+    doc(db, "users", actorUid),
+  );
+
+  const profile = snapshot.data() ?? {};
+
+  return {
+    name:
+      trimmedOrNull(profile.fullName) ??
+      trimmedOrNull(profile.email) ??
+      actorUid,
+
+    role: trimmedOrNull(profile.role),
+  };
+}
+
+function contractStatusOf(
+  value: unknown,
+): ContractStatus {
+  return value === "in_review" ||
+    value === "approved" ||
+    value === "rejected"
+    ? value
+    : "not_submitted";
+}
+
+async function getContractWorkflow(
+  input: { reservationId: string },
+): Promise<ContractWorkflow> {
+  const reservationId = trimmedOrNull(
+    input.reservationId,
+  );
+
+  if (!reservationId) {
+    throw new Error(
+      "A booking reference is required.",
+    );
+  }
+
+  const { db } = getFirebaseClient();
+
+  const [snapshot, deliveryDocs] =
+    await Promise.all([
+      getDoc(contractRef(reservationId)),
+
+      getDocs(
+        query(
+          collection(
+            db,
+            "reservationContracts",
+            reservationId,
+            "deliveries",
+          ),
+          orderBy("createdAt", "desc"),
+          limit(20),
+        ),
+      ),
+    ]);
+
+  const deliveries: ContractDelivery[] =
+    deliveryDocs.docs.map((delivery) => ({
+      id: delivery.id,
+
+      status:
+        delivery.get("status") === "failed"
+          ? "failed"
+          : "sent",
+
+      provider: String(
+        delivery.get("provider") ?? "unknown",
+      ),
+
+      providerMessageId: trimmedOrNull(
+        delivery.get("providerMessageId"),
+      ),
+
+      recipientEmail: String(
+        delivery.get("recipientEmail") ?? "",
+      ),
+
+      recipientNameSnapshot: String(
+        delivery.get("recipientNameSnapshot") ??
+          "",
+      ),
+
+      contractVersion: Number(
+        delivery.get("contractVersion") ?? 0,
+      ),
+
+      sentByNameSnapshot: String(
+        delivery.get("sentByNameSnapshot") ?? "",
+      ),
+
+      failureReason: trimmedOrNull(
+        delivery.get("failureReason"),
+      ),
+
+      createdAt: toIso(
+        delivery.get("createdAt"),
+      ),
+    }));
+
+  if (!snapshot.exists()) {
+    return {
+      reservationId,
+      status: "not_submitted",
+      version: 0,
+      approvedVersion: null,
+      submittedByNameSnapshot: null,
+      submittedAt: null,
+      reviewedByNameSnapshot: null,
+      reviewedAt: null,
+      reviewNote: null,
+      deliveries,
+    };
+  }
+
+  return {
+    reservationId,
+
+    status: contractStatusOf(
+      snapshot.get("status"),
+    ),
+
+    version: Number(
+      snapshot.get("version") ?? 0,
+    ),
+
+    approvedVersion:
+      snapshot.get("approvedVersion") == null
+        ? null
+        : Number(
+            snapshot.get("approvedVersion"),
+          ),
+
+    submittedByNameSnapshot: trimmedOrNull(
+      snapshot.get("submittedByNameSnapshot"),
+    ),
+
+    submittedAt:
+      snapshot.get("submittedAt") == null
+        ? null
+        : toIso(snapshot.get("submittedAt")),
+
+    reviewedByNameSnapshot: trimmedOrNull(
+      snapshot.get("reviewedByNameSnapshot"),
+    ),
+
+    reviewedAt:
+      snapshot.get("reviewedAt") == null
+        ? null
+        : toIso(snapshot.get("reviewedAt")),
+
+    reviewNote: trimmedOrNull(
+      snapshot.get("reviewNote"),
+    ),
+
+    deliveries,
+  };
+}
+
+export type ContractQueueEntry = {
+  reservationId: string;
+  status: ContractStatus;
+  version: number;
+  customerName: string;
+  vehicleRegistration: string;
+  submittedByNameSnapshot: string | null;
+  reviewNote: string | null;
+};
+
+/*
+ * Everything an administrator still has to decide on, plus
+ * the contracts that came back rejected and need correcting.
+ * Without this an agreement submitted from one browser would
+ * be unreachable from another.
+ */
+async function listContractsForReview(): Promise<
+  ContractQueueEntry[]
+> {
+  const { db } = getFirebaseClient();
+
+  const snapshot = await getDocs(
+    query(
+      collection(db, "reservationContracts"),
+      where("status", "in", [
+        "in_review",
+        "rejected",
+      ]),
+      limit(50),
+    ),
+  );
+
+  return snapshot.docs
+    .map((entry) => ({
+      reservationId: entry.id,
+
+      status: contractStatusOf(
+        entry.get("status"),
+      ),
+
+      version: Number(
+        entry.get("version") ?? 0,
+      ),
+
+      customerName: String(
+        entry.get("customerNameSnapshot") ??
+          "Unknown customer",
+      ),
+
+      vehicleRegistration: String(
+        entry.get(
+          "vehicleRegistrationSnapshot",
+        ) ?? "Unknown vehicle",
+      ),
+
+      submittedByNameSnapshot: trimmedOrNull(
+        entry.get("submittedByNameSnapshot"),
+      ),
+
+      reviewNote: trimmedOrNull(
+        entry.get("reviewNote"),
+      ),
+    }))
+    .sort((a, b) =>
+      a.vehicleRegistration.localeCompare(
+        b.vehicleRegistration,
+      ),
+    );
+}
+
+/*
+ * Submitting hands the agreement to an administrator. The
+ * version advances on every submission, so the number that
+ * is later frozen and emailed identifies exactly which round
+ * of review produced the approved text.
+ */
+async function submitContractForReview(
+  input: { reservationId: string },
+): Promise<{
+  reservationId: string;
+  version: number;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const reservationId = trimmedOrNull(
+    input.reservationId,
+  );
+
+  if (!reservationId) {
+    throw new Error(
+      "A booking reference is required.",
+    );
+  }
+
+  const reservationRef = doc(
+    db,
+    "reservations",
+    reservationId,
+  );
+
+  const reference = contractRef(reservationId);
+
+  let version = 0;
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const [reservation, existing] =
+        await Promise.all([
+          transaction.get(reservationRef),
+          transaction.get(reference),
+        ]);
+
+      if (!reservation.exists()) {
+        throw new Error(
+          "Booking was not found.",
+        );
+      }
+
+      const actorName = await actorNameSnapshot(
+        transaction,
+        actorUid,
+      );
+
+      const current = existing.exists()
+        ? contractStatusOf(
+            existing.get("status"),
+          )
+        : "not_submitted";
+
+      if (current === "approved") {
+        throw new Error(
+          "This contract has already been finalised.",
+        );
+      }
+
+      if (current === "in_review") {
+        throw new Error(
+          "This contract is already waiting for review.",
+        );
+      }
+
+      version =
+        Number(
+          existing.exists()
+            ? (existing.get("version") ?? 0)
+            : 0,
+        ) + 1;
+
+      const review = {
+        reservationId,
+
+        status: "in_review",
+
+        version,
+
+        /*
+         * Copied so the review queue can list what is waiting
+         * without reading every reservation behind it.
+         */
+        customerNameSnapshot: String(
+          reservation.get(
+            "customerNameSnapshot",
+          ) ?? "",
+        ),
+
+        vehicleRegistrationSnapshot: String(
+          reservation.get(
+            "vehicleRegistrationSnapshot",
+          ) ?? "",
+        ),
+
+        approvedVersion: null,
+
+        submittedBy: actorUid,
+
+        submittedByNameSnapshot: actorName,
+
+        submittedAt: nowTimestamp(),
+
+        reviewedBy: null,
+
+        reviewedByNameSnapshot: null,
+
+        reviewedAt: null,
+
+        reviewNote: null,
+
+        updatedAt: nowTimestamp(),
+      };
+
+      if (existing.exists()) {
+        transaction.update(reference, review);
+      } else {
+        transaction.set(reference, {
+          ...review,
+          createdAt: nowTimestamp(),
+        });
+      }
+
+      transaction.set(
+        doc(collection(db, "auditLogs")),
+        {
+          actorUid,
+
+          action: "contract.submitted",
+
+          resource: {
+            collection: "reservationContracts",
+            id: reservationId,
+          },
+
+          details: { version },
+
+          createdAt: nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return { reservationId, version };
+}
+
+/*
+ * Approval freezes the agreement. The snapshot is built from
+ * the stored reservation, customer and vehicle inside the
+ * same transaction that records the decision, and is written
+ * to a versioned document the security rules make immutable,
+ * so what was approved is what is later sent.
+ */
+async function reviewContract(
+  input: {
+    reservationId: string;
+    decision: "approve" | "reject";
+    note: string | null;
+  },
+): Promise<{
+  reservationId: string;
+  status: ContractStatus;
+  version: number;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const reservationId = trimmedOrNull(
+    input.reservationId,
+  );
+
+  if (!reservationId) {
+    throw new Error(
+      "A booking reference is required.",
+    );
+  }
+
+  if (
+    input.decision !== "approve" &&
+    input.decision !== "reject"
+  ) {
+    throw new Error(
+      "Choose whether to approve or reject the contract.",
+    );
+  }
+
+  const note = trimmedOrNull(input.note);
+
+  if (input.decision === "reject" && !note) {
+    throw new Error(
+      "Explain why the contract is being rejected.",
+    );
+  }
+
+  if (note && note.length > 1000) {
+    throw new Error(
+      "Keep the review note under 1000 characters.",
+    );
+  }
+
+  const reference = contractRef(reservationId);
+
+  const reservationRef = doc(
+    db,
+    "reservations",
+    reservationId,
+  );
+
+  let version = 0;
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const [existing, reservationSnapshot] =
+        await Promise.all([
+          transaction.get(reference),
+          transaction.get(reservationRef),
+        ]);
+
+      if (!existing.exists()) {
+        throw new Error(
+          "This contract has not been submitted for review.",
+        );
+      }
+
+      if (
+        contractStatusOf(
+          existing.get("status"),
+        ) !== "in_review"
+      ) {
+        throw new Error(
+          "Only a contract waiting for review can be approved or rejected.",
+        );
+      }
+
+      if (!reservationSnapshot.exists()) {
+        throw new Error(
+          "Booking was not found.",
+        );
+      }
+
+      const actor = await actorProfileSnapshot(
+        transaction,
+        actorUid,
+      );
+
+      if (actor.role !== "admin") {
+        throw new Error(
+          "Only an administrator can approve or reject a contract.",
+        );
+      }
+
+      version = Number(
+        existing.get("version") ?? 1,
+      );
+
+      const reservation =
+        reservationSnapshot.data() ?? {};
+
+      if (input.decision === "reject") {
+        transaction.update(reference, {
+          status: "rejected",
+
+          reviewedBy: actorUid,
+
+          reviewedByNameSnapshot: actor.name,
+
+          reviewedAt: nowTimestamp(),
+
+          reviewNote: note,
+
+          updatedAt: nowTimestamp(),
+        });
+      } else {
+        const [customerSnapshot, vehicleSnapshot] =
+          await Promise.all([
+            transaction.get(
+              doc(
+                db,
+                "customers",
+                String(reservation.customerId),
+              ),
+            ),
+
+            transaction.get(
+              doc(
+                db,
+                "vehicles",
+                String(reservation.vehicleId),
+              ),
+            ),
+          ]);
+
+        const customer =
+          customerSnapshot.data() ?? {};
+
+        const vehicle =
+          vehicleSnapshot.data() ?? {};
+
+        const rateSnapshot = (reservation.rateSnapshot ??
+          {}) as Record<string, unknown>;
+
+        const quote = (reservation.quote ??
+          {}) as Record<string, unknown>;
+
+        transaction.set(
+          contractVersionRef(
+            reservationId,
+            version,
+          ),
+          {
+            reservationId,
+
+            version,
+
+            approvedBy: actorUid,
+
+            approvedByNameSnapshot: actor.name,
+
+            approvedAt: nowTimestamp(),
+
+            customer: {
+              fullName: String(
+                customer.fullName ??
+                  reservation.customerNameSnapshot ??
+                  "",
+              ),
+
+              telephone: String(
+                customer.telephone ?? "",
+              ),
+
+              email: trimmedOrNull(
+                customer.email,
+              ),
+
+              address: trimmedOrNull(
+                customer.address,
+              ),
+
+              licenceNumber: String(
+                customer.licenceNumber ?? "",
+              ),
+
+              licenceCountry: String(
+                customer.licenceCountry ?? "",
+              ),
+
+              licenceExpiresAt: trimmedOrNull(
+                customer.licenceExpiresAt,
+              ),
+            },
+
+            vehicle: {
+              registration: String(
+                reservation.vehicleRegistrationSnapshot ??
+                  vehicle.registrationNumber ??
+                  "",
+              ),
+
+              make: String(vehicle.make ?? ""),
+
+              model: String(
+                vehicle.model ?? "",
+              ),
+
+              year:
+                vehicle.year == null
+                  ? null
+                  : Number(vehicle.year),
+
+              color: trimmedOrNull(
+                vehicle.color,
+              ),
+
+              vin: trimmedOrNull(vehicle.vin),
+            },
+
+            pickupAt: toIso(
+              reservation.pickupAt,
+            ),
+
+            expectedReturnAt: toIso(
+              reservation.expectedReturnAt,
+            ),
+
+            pickupLocation: trimmedOrNull(
+              reservation.pickupLocation,
+            ),
+
+            dropoffLocation: trimmedOrNull(
+              reservation.dropoffLocation,
+            ),
+
+            notes: trimmedOrNull(
+              reservation.notes,
+            ),
+
+            preparedBy: String(
+              reservation.createdByNameSnapshot ??
+                "",
+            ),
+
+            chargedDays: Number(
+              quote.chargedDays ?? 0,
+            ),
+
+            baseRentalCents: Number(
+              quote.baseRentalCents ?? 0,
+            ),
+
+            rateSnapshot: {
+              dailyCents:
+                rateSnapshot.dailyCents == null
+                  ? null
+                  : Number(
+                      rateSnapshot.dailyCents,
+                    ),
+
+              weeklyCents:
+                rateSnapshot.weeklyCents == null
+                  ? null
+                  : Number(
+                      rateSnapshot.weeklyCents,
+                    ),
+
+              monthlyCents:
+                rateSnapshot.monthlyCents == null
+                  ? null
+                  : Number(
+                      rateSnapshot.monthlyCents,
+                    ),
+            },
+
+            /*
+             * The signature image itself stays on the
+             * reservation. Repeating a 400 KB data URL in
+             * every approved version would put the document
+             * close to the Firestore size limit for no gain,
+             * so the snapshot records who signed and when.
+             */
+            signedByNameSnapshot: String(
+              customer.fullName ??
+                reservation.customerNameSnapshot ??
+                "",
+            ),
+
+            signatureCapturedAt:
+              reservation.customerSignatureCapturedAt ==
+              null
+                ? null
+                : toIso(
+                    reservation.customerSignatureCapturedAt,
+                  ),
+          },
+        );
+
+        transaction.update(reference, {
+          status: "approved",
+
+          approvedVersion: version,
+
+          reviewedBy: actorUid,
+
+          reviewedByNameSnapshot: actor.name,
+
+          reviewedAt: nowTimestamp(),
+
+          reviewNote: note,
+
+          updatedAt: nowTimestamp(),
+        });
+      }
+
+      transaction.set(
+        doc(collection(db, "auditLogs")),
+        {
+          actorUid,
+
+          action:
+            input.decision === "approve"
+              ? "contract.approved"
+              : "contract.rejected",
+
+          resource: {
+            collection: "reservationContracts",
+            id: reservationId,
+          },
+
+          details: { version, note },
+
+          createdAt: nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return {
+    reservationId,
+
+    status:
+      input.decision === "approve"
+        ? "approved"
+        : "rejected",
+
+    version,
+  };
+}
+
 /* =========================================================
    Compatibility dispatcher
    ========================================================= */
@@ -5064,6 +6092,43 @@ export async function callFirestoreOperation<
           data as {
             customerId: string;
             licenceStoragePath: string;
+          },
+        )) as TResult
+      );
+
+    case "deleteCustomer":
+      return (
+        (await deleteCustomer(
+          data as { customerId: string },
+        )) as TResult
+      );
+
+    case "getContractWorkflow":
+      return (
+        (await getContractWorkflow(
+          data as { reservationId: string },
+        )) as TResult
+      );
+
+    case "listContractsForReview":
+      return (
+        (await listContractsForReview()) as TResult
+      );
+
+    case "submitContractForReview":
+      return (
+        (await submitContractForReview(
+          data as { reservationId: string },
+        )) as TResult
+      );
+
+    case "reviewContract":
+      return (
+        (await reviewContract(
+          data as {
+            reservationId: string;
+            decision: "approve" | "reject";
+            note: string | null;
           },
         )) as TResult
       );
