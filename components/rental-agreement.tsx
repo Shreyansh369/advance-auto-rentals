@@ -2,9 +2,12 @@
 
 import { Printer, X } from "lucide-react";
 
+import { createPortal } from "react-dom";
+
 import {
   useEffect,
   useState,
+  useSyncExternalStore,
 } from "react";
 
 import {
@@ -17,6 +20,11 @@ import {
   formatDate,
   formatMoney,
 } from "@/lib/presentation";
+
+/** The hydration flag never changes, so there is nothing to subscribe to. */
+function subscribeToNothing(): () => void {
+  return () => {};
+}
 
 function dateTime(value: string): string {
   const date = new Date(value);
@@ -51,6 +59,21 @@ export function RentalAgreement({
 
   const [error, setError] =
     useState<string>();
+
+  /*
+   * The dialog is mounted on document.body rather than inside
+   * the application shell. Printing hides the shell, and a
+   * descendant of a hidden element cannot be printed, so the
+   * agreement has to sit outside it.
+   *
+   * The page is prerendered as static HTML, where there is no
+   * document to portal into, so the portal waits for hydration.
+   */
+  const hydrated = useSyncExternalStore(
+    subscribeToNothing,
+    () => true,
+    () => false,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -87,7 +110,11 @@ export function RentalAgreement({
     };
   }, [reservationId]);
 
-  return (
+  if (!hydrated) {
+    return null;
+  }
+
+  return createPortal(
     <div
       className="agreement-backdrop"
       role="presentation"
@@ -455,6 +482,7 @@ export function RentalAgreement({
           </article>
         )}
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -56,6 +56,8 @@ beforeAll(async () => {
     await setDoc(doc(db, "financialLedger", "entry_001"), { amountCents: 5000 });
     await setDoc(doc(db, "auditLogs", "audit_001"), { action: "vehicle.created" });
     await setDoc(doc(db, "idempotencyKeys", "payment_001"), { response: { outstandingCents: 0 } });
+    await setDoc(doc(db, "vehicleRegistry", "reg_RT-001"), { vehicleId: "vehicle_001", value: "RT-001" });
+    await setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1000 });
   });
 });
 
@@ -125,6 +127,30 @@ describe("Firestore access policy", () => {
     await assertFails(deleteDoc(doc(db, "vehicles", "vehicle_001")));
     await assertFails(deleteDoc(doc(db, "customers", "customer_001")));
     await assertFails(deleteDoc(doc(db, "rentals", "rental_001")));
+  });
+
+  it("lets staff claim and release a vehicle uniqueness key", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(getDoc(doc(db, "vehicleRegistry", "reg_RT-001")));
+    await assertSucceeds(setDoc(doc(db, "vehicleRegistry", "reg_RT-002"), { vehicleId: "vehicle_002", value: "RT-002" }));
+    await assertSucceeds(deleteDoc(doc(db, "vehicleRegistry", "reg_RT-002")));
+  });
+
+  it("keeps vehicle uniqueness keys away from an unapproved account", async () => {
+    const db = asUser(PENDING);
+
+    await assertFails(getDoc(doc(db, "vehicleRegistry", "reg_RT-001")));
+    await assertFails(setDoc(doc(db, "vehicleRegistry", "reg_RT-003"), { vehicleId: "x", value: "RT-003" }));
+  });
+
+  it("lets staff record a rental extension but never rewrite one", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(getDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001")));
+    await assertSucceeds(setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_002"), { extensionCents: 2000 }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1 }));
+    await assertFails(deleteDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001")));
   });
 
   it("gives an administrator the financial reporting reads", async () => {

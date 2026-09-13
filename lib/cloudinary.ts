@@ -200,6 +200,11 @@ export async function uploadVehicleMedia(
  * vehicle photos use. Only the returned URL is written to
  * Firestore, where the security rules already restrict customer
  * records to approved staff.
+ *
+ * The checks below bind this application, not the endpoint: the
+ * preset is unsigned and its name ships in the bundle, so the
+ * same limits have to be set on the preset itself in Cloudinary.
+ * See docs/security.md.
  */
 export async function uploadCustomerDocument(
   file: File,

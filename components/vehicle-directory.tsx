@@ -299,11 +299,35 @@ export function VehicleDirectory({
       VehicleStatus | "all"
     >("all");
 
-  const [documentsOnly, setDocumentsOnly] =
-    useState(
-      () =>
-        initialView === "documents",
-    );
+  /*
+   * The filter follows the URL rather than only its first
+   * value: following the dashboard link while /vehicles is
+   * already mounted changes the query without remounting, and
+   * the linked view would otherwise open unfiltered.
+   */
+  const [manualView, setManualView] =
+    useState<{
+      view: string | null;
+      documentsOnly: boolean;
+    } | null>(null);
+
+  const documentsOnly =
+    manualView &&
+    manualView.view === (initialView ?? null)
+      ? manualView.documentsOnly
+      : initialView === "documents";
+
+  function setDocumentsOnly(
+    next: boolean | ((value: boolean) => boolean),
+  ) {
+    setManualView({
+      view: initialView ?? null,
+      documentsOnly:
+        typeof next === "function"
+          ? next(documentsOnly)
+          : next,
+    });
+  }
 
   const [evaluatedAt, setEvaluatedAt] =
     useState(0);

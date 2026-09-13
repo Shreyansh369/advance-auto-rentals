@@ -29,6 +29,8 @@ The project stays on the Spark plan, so there is no server-side enforcement laye
 
 - An approved staff account can write any document the rules allow it to write, including a rental financial total, without passing through the validation in the application code. Firestore rules restrict who and what, not the arithmetic.
 - Customer licence images and vehicle photos are delivered from Cloudinary over unguessable public URLs. The URL is stored only on the customer record, which is staff-only, but anyone holding the URL can open the image. Switching the Cloudinary account's delivery type to authenticated closes this without a code change.
+- The upload preset is unsigned and its name is public, so the MIME and size limits in `lib/cloudinary.ts` bind the application, not the endpoint. Anyone who reads the bundle can post directly to Cloudinary and upload outside those limits. Mirror the restrictions on the preset itself in the Cloudinary console — allowed formats, a maximum file size, and a fixed folder — so the limits hold wherever the request comes from. Signed uploads would close it completely but need a server to sign with.
+- Nothing deletes a Cloudinary asset. Replacing a licence image or removing a vehicle photo drops the reference from Firestore and leaves the uploaded file in the account. Set a retention rule on the upload folder, or prune by tag (`customer-document`, `vehicle`), until there is a backend that can delete on the customer's behalf.
 
 App Check with reCAPTCHA Enterprise is initialised when `NEXT_PUBLIC_RECAPTCHA_ENTERPRISE_SITE_KEY` is set and emulators are off. Without callable functions it cannot be enforced on Firestore from the Spark plan, so treat it as defence in depth rather than a gate.
 

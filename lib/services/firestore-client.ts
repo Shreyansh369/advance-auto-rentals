@@ -10,6 +10,7 @@ import {
   query,
   runTransaction,
   serverTimestamp,
+  startAfter,
   Timestamp,
   where,
 } from "firebase/firestore";
@@ -286,6 +287,248 @@ function sanitizeMediaList(
         ),
       ),
     );
+}
+
+/*
+ * Date.parse returns NaN for an unparseable string, and every
+ * comparison against NaN is false, so an expiry of "soon" would
+ * slip past an `expiry < pickup` guard as though it were valid.
+ * Compliance dates are therefore parsed through here, where a
+ * non-finite result is an error rather than a silent pass.
+ */
+function complianceDateMs(
+  value: unknown,
+  label: string,
+): number {
+  const parsed = Date.parse(
+    String(value ?? ""),
+  );
+
+  if (!Number.isFinite(parsed)) {
+    throw new Error(
+      `${label} is missing or is not a valid date.`,
+    );
+  }
+
+  return parsed;
+}
+
+/*
+ * The same check for a value that is allowed to be absent, used
+ * when a date is being stored rather than enforced.
+ */
+function optionalDateOrNull(
+  value: unknown,
+  label: string,
+): string | null {
+  const raw = trimmedOrNull(value);
+
+  if (raw === null) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(
+      Date.parse(raw),
+    )
+  ) {
+    throw new Error(
+      `${label} is not a valid date.`,
+    );
+  }
+
+  return raw;
+}
+
+/*
+ * Registration numbers and VINs have to be unique across the
+ * fleet, but a query cannot be made part of a Firestore
+ * transaction from the browser, and two vehicle creations share
+ * no document, so neither would ever be forced to retry. The
+ * uniqueness is therefore claimed as a document whose id is
+ * derived from the value: both attempts then contend on the
+ * same document and exactly one of them wins.
+ */
+function vehicleKeyRef(
+  kind: "reg" | "vin",
+  value: string,
+) {
+  const { db } = getFirebaseClient();
+
+  return doc(
+    db,
+    "vehicleRegistry",
+    `${kind}_${value.replaceAll("/", "%2F")}`,
+  );
+}
+
+type VehicleKeyClaim = {
+  ref: ReturnType<typeof vehicleKeyRef>;
+  heldBy: string | null;
+};
+
+/*
+ * Reads a claim. Firestore requires every read in a transaction
+ * to happen before the first write, so claims are resolved up
+ * front and written later.
+ */
+async function readVehicleKeyClaim(
+  transaction: {
+    get: (
+      reference: ReturnType<typeof doc>,
+    ) => Promise<{
+      exists: () => boolean;
+      get: (field: string) => unknown;
+    }>;
+  },
+  kind: "reg" | "vin",
+  value: string,
+  claimantId: string,
+): Promise<VehicleKeyClaim> {
+  const { db } = getFirebaseClient();
+
+  const ref = vehicleKeyRef(kind, value);
+
+  const snapshot =
+    await transaction.get(ref);
+
+  if (!snapshot.exists()) {
+    return { ref, heldBy: null };
+  }
+
+  const owner = String(
+    snapshot.get("vehicleId") ?? "",
+  );
+
+  if (!owner || owner === claimantId) {
+    return { ref, heldBy: null };
+  }
+
+  /*
+   * A claim left behind by a vehicle that has since been
+   * removed, or renamed away from this value, must not block a
+   * legitimate reuse of the registration.
+   */
+  const ownerSnapshot =
+    await transaction.get(
+      doc(db, "vehicles", owner),
+    );
+
+  if (!ownerSnapshot.exists()) {
+    return { ref, heldBy: null };
+  }
+
+  const field =
+    kind === "reg"
+      ? "registrationNumber"
+      : "vin";
+
+  const stillHeld =
+    String(
+      ownerSnapshot.get(field) ?? "",
+    ) === value;
+
+  return {
+    ref,
+    heldBy: stillHeld ? owner : null,
+  };
+}
+
+const CONFLICT_PAGE_SIZE = 200;
+
+/*
+ * Finds a confirmed or checked-out booking for the vehicle that
+ * overlaps the given window.
+ *
+ * A booking that starts at or after the window ends cannot
+ * overlap it, so the search is bounded by the window rather
+ * than by an arbitrary row count, and it pages to the end: a
+ * vehicle with a long history would otherwise push the
+ * conflicting booking out of a capped result set.
+ */
+async function overlappingReservation(
+  input: {
+    vehicleId: string;
+    from: Timestamp;
+    to: Timestamp;
+    ignoreReservationId?: string;
+  },
+): Promise<string | null> {
+  const { db } = getFirebaseClient();
+
+  let cursor:
+    | Awaited<
+        ReturnType<typeof getDocs>
+      >["docs"][number]
+    | undefined;
+
+  for (;;) {
+    const page = await getDocs(
+      query(
+        collection(
+          db,
+          "reservations",
+        ),
+        where(
+          "vehicleId",
+          "==",
+          input.vehicleId,
+        ),
+        where(
+          "status",
+          "in",
+          [
+            "confirmed",
+            "checked_out",
+          ],
+        ),
+        where(
+          "pickupAt",
+          "<",
+          input.to,
+        ),
+        orderBy("pickupAt"),
+        ...(cursor
+          ? [startAfter(cursor)]
+          : []),
+        limit(CONFLICT_PAGE_SIZE),
+      ),
+    );
+
+    for (const candidate of page.docs) {
+      if (
+        candidate.id ===
+        input.ignoreReservationId
+      ) {
+        continue;
+      }
+
+      const existingReturn =
+        asTimestamp(
+          toIso(
+            candidate.get(
+              "expectedReturnAt",
+            ),
+          ),
+        ).toMillis();
+
+      if (
+        existingReturn >
+        input.from.toMillis()
+      ) {
+        return candidate.id;
+      }
+    }
+
+    if (
+      page.size < CONFLICT_PAGE_SIZE
+    ) {
+      return null;
+    }
+
+    cursor =
+      page.docs[page.docs.length - 1];
+  }
 }
 
 function trimmedOrNull(
@@ -1234,10 +1477,15 @@ async function getReservationContract(
     },
 
     vehicle: {
+      /*
+       * The registration captured at booking time wins over the
+       * fleet record, so renaming a vehicle later cannot change
+       * what an already-signed agreement says it was for.
+       */
       registration:
         String(
-          vehicle.registrationNumber ??
-            reservation.vehicleRegistrationSnapshot ??
+          reservation.vehicleRegistrationSnapshot ??
+            vehicle.registrationNumber ??
             "Unknown vehicle",
         ),
 
@@ -1448,39 +1696,6 @@ async function createReservation(
       ),
     );
 
-  /*
-   * The overlap check reads every confirmed or checked-out
-   * booking for this vehicle. A Firestore transaction cannot
-   * run a query from the browser SDK, so the candidates are
-   * read first and each one is re-read inside the transaction
-   * to make the conflict check consistent.
-   */
-  const conflictSnapshot =
-    await getDocs(
-      query(
-        collection(
-          db,
-          "reservations",
-        ),
-        where(
-          "vehicleId",
-          "==",
-          String(
-            input.vehicleId,
-          ),
-        ),
-        where(
-          "status",
-          "in",
-          [
-            "confirmed",
-            "checked_out",
-          ],
-        ),
-        limit(100),
-      ),
-    );
-
   let quote: ReturnType<typeof quoteRental>;
 
   await runTransaction(
@@ -1548,13 +1763,13 @@ async function createReservation(
       }
 
       if (
-        !vehicle.insuranceExpiresAt ||
-        Date.parse(
+        complianceDateMs(
           vehicle.insuranceExpiresAt,
+          "Vehicle insurance expiry",
         ) < pickupMillis ||
-        !vehicle.registrationExpiresAt ||
-        Date.parse(
+        complianceDateMs(
           vehicle.registrationExpiresAt,
+          "Vehicle registration expiry",
         ) < pickupMillis
       ) {
         throw new Error(
@@ -1582,66 +1797,27 @@ async function createReservation(
         );
       }
 
-      for (
-        const candidate of
-        conflictSnapshot.docs
-      ) {
-        const current =
-          await transaction.get(
-            doc(
-              db,
-              "reservations",
-              candidate.id,
-            ),
-          );
+      /*
+       * The browser SDK cannot run a query through the
+       * transaction, so this is an ordinary read. Running it
+       * inside the callback is still what makes the check
+       * sound: every reservation also writes its vehicle
+       * document, so a competing booking forces this
+       * transaction to retry, and the retry re-runs this
+       * search and sees the reservation that was just
+       * committed.
+       */
+      const conflictId =
+        await overlappingReservation({
+          vehicleId: vehicleRef.id,
+          from: pickupAt,
+          to: expectedReturnAt,
+        });
 
-        if (!current.exists()) {
-          continue;
-        }
-
-        if (
-          ![
-            "confirmed",
-            "checked_out",
-          ].includes(
-            String(
-              current.get(
-                "status",
-              ),
-            ),
-          )
-        ) {
-          continue;
-        }
-
-        const existingPickup =
-          asTimestamp(
-            toIso(
-              current.get(
-                "pickupAt",
-              ),
-            ),
-          ).toMillis();
-
-        const existingReturn =
-          asTimestamp(
-            toIso(
-              current.get(
-                "expectedReturnAt",
-              ),
-            ),
-          ).toMillis();
-
-        if (
-          existingPickup <
-            expectedReturnAt.toMillis() &&
-          existingReturn >
-            pickupAt.toMillis()
-        ) {
-          throw new Error(
-            "Vehicle has an overlapping reservation.",
-          );
-        }
+      if (conflictId) {
+        throw new Error(
+          "Vehicle has an overlapping reservation.",
+        );
       }
 
       quote = quoteRental(
@@ -2247,6 +2423,34 @@ async function extendRental(
         );
       }
 
+      /*
+       * Extending through a later booking would leave the next
+       * checkout with a vehicle that is still out, so the same
+       * overlap search the booking screen uses runs here too,
+       * ignoring this rental's own reservation.
+       */
+      const conflictId =
+        await overlappingReservation({
+          vehicleId:
+            String(
+              rental.vehicleId,
+            ),
+
+          from: currentExpectedReturn,
+          to: newExpectedReturn,
+
+          ignoreReservationId:
+            String(
+              rental.reservationId ?? "",
+            ),
+        });
+
+      if (conflictId) {
+        throw new Error(
+          "The vehicle is reserved again before that date. Shorten the extension or move the other booking.",
+        );
+      }
+
       const updatedQuote =
         quoteRental(
           {
@@ -2284,18 +2488,28 @@ async function extendRental(
         ) +
         extensionCents;
 
+      if (
+        !Number.isFinite(totalCents) ||
+        totalCents > MAX_MONEY_CENTS
+      ) {
+        throw new Error(
+          "This extension would take the rental past the permitted total.",
+        );
+      }
+
       const outstandingCents =
         calculateBalance(
-          totalCents,
+          Math.round(totalCents),
 
-          Number(
-            financial.paidCents ??
-              0,
+          assertMoneyCents(
+            financial.paidCents ?? 0,
+            "Amount received",
           ),
 
-          Number(
+          assertMoneyCents(
             financial.refundedCents ??
               0,
+            "Amount refunded",
           ),
         );
 
@@ -3404,6 +3618,36 @@ async function createVehicle(
   }
 
   /*
+   * Availability and booking both compare these dates. An
+   * unparseable string would compare as NaN and read as though
+   * it had not expired, so it is refused here rather than
+   * relying on the form to be the only way in.
+   */
+  const registrationExpiresAt =
+    optionalDateOrNull(
+      input.registrationExpiresAt,
+      "Registration expiry",
+    );
+
+  const insuranceExpiresAt =
+    optionalDateOrNull(
+      input.insuranceExpiresAt,
+      "Insurance expiry",
+    );
+
+  const lastServiceAt =
+    optionalDateOrNull(
+      input.lastServiceAt,
+      "Last service date",
+    );
+
+  const nextServiceDueAt =
+    optionalDateOrNull(
+      input.nextServiceDueAt,
+      "Next service date",
+    );
+
+  /*
    * Registration numbers and VINs identify a vehicle across
    * the whole system, so a duplicate is refused before the
    * record is created rather than discovered later from two
@@ -3466,14 +3710,53 @@ async function createVehicle(
   await runTransaction(
     db,
     async (transaction) => {
-      const existing =
-        await transaction.get(
-          vehicleRef,
+      const registrationClaim =
+        await readVehicleKeyClaim(
+          transaction,
+          "reg",
+          registrationNumber,
+          vehicleRef.id,
         );
 
-      if (existing.exists()) {
+      if (registrationClaim.heldBy) {
         throw new Error(
-          "This vehicle record already exists.",
+          `Registration number ${registrationNumber} is already assigned to another vehicle.`,
+        );
+      }
+
+      const vinClaim =
+        vin === null
+          ? null
+          : await readVehicleKeyClaim(
+              transaction,
+              "vin",
+              vin,
+              vehicleRef.id,
+            );
+
+      if (vinClaim?.heldBy) {
+        throw new Error(
+          `VIN ${vin} is already assigned to another vehicle.`,
+        );
+      }
+
+      transaction.set(
+        registrationClaim.ref,
+        {
+          vehicleId: vehicleRef.id,
+          value: registrationNumber,
+          updatedAt: nowTimestamp(),
+        },
+      );
+
+      if (vinClaim && vin !== null) {
+        transaction.set(
+          vinClaim.ref,
+          {
+            vehicleId: vehicleRef.id,
+            value: vin,
+            updatedAt: nowTimestamp(),
+          },
         );
       }
 
@@ -3500,21 +3783,13 @@ async function createVehicle(
 
           vin,
 
-          registrationExpiresAt:
-            input.registrationExpiresAt ??
-            null,
+          registrationExpiresAt,
 
-          insuranceExpiresAt:
-            input.insuranceExpiresAt ??
-            null,
+          insuranceExpiresAt,
 
-          lastServiceAt:
-            input.lastServiceAt ??
-            null,
+          lastServiceAt,
 
-          nextServiceDueAt:
-            input.nextServiceDueAt ??
-            null,
+          nextServiceDueAt,
 
           rates,
 
@@ -3622,6 +3897,73 @@ async function updateVehicleDetails(
       const current =
         snapshot.data() as VehicleDocument;
 
+      /*
+       * Renaming a vehicle moves its uniqueness claim: the new
+       * value is claimed under the same contention rules as a
+       * creation, and the old one is released so the previous
+       * registration can be issued again.
+       */
+      const nextRegistration =
+        String(
+          input.registrationNumber ??
+            current.registrationNumber,
+        )
+          .trim()
+          .toUpperCase();
+
+      const nextVin =
+        trimmedOrNull(
+          input.vin,
+        )?.toUpperCase() ?? null;
+
+      if (
+        nextVin !== null &&
+        nextVin.length !== 17
+      ) {
+        throw new Error(
+          "VIN must contain exactly 17 characters.",
+        );
+      }
+
+      const registrationChanged =
+        nextRegistration !==
+        current.registrationNumber;
+
+      const vinChanged =
+        nextVin !== (current.vin ?? null);
+
+      const registrationClaim =
+        registrationChanged
+          ? await readVehicleKeyClaim(
+              transaction,
+              "reg",
+              nextRegistration,
+              vehicleRef.id,
+            )
+          : null;
+
+      if (registrationClaim?.heldBy) {
+        throw new Error(
+          `Registration number ${nextRegistration} is already assigned to another vehicle.`,
+        );
+      }
+
+      const vinClaim =
+        vinChanged && nextVin !== null
+          ? await readVehicleKeyClaim(
+              transaction,
+              "vin",
+              nextVin,
+              vehicleRef.id,
+            )
+          : null;
+
+      if (vinClaim?.heldBy) {
+        throw new Error(
+          `VIN ${nextVin} is already assigned to another vehicle.`,
+        );
+      }
+
       const rates = {
         currency:
           "USD" as const,
@@ -3664,16 +4006,52 @@ async function updateVehicleDetails(
         );
       }
 
+      if (registrationClaim) {
+        transaction.set(
+          registrationClaim.ref,
+          {
+            vehicleId: vehicleRef.id,
+            value: nextRegistration,
+            updatedAt: nowTimestamp(),
+          },
+        );
+
+        transaction.delete(
+          vehicleKeyRef(
+            "reg",
+            current.registrationNumber,
+          ),
+        );
+      }
+
+      if (vinClaim && nextVin !== null) {
+        transaction.set(
+          vinClaim.ref,
+          {
+            vehicleId: vehicleRef.id,
+            value: nextVin,
+            updatedAt: nowTimestamp(),
+          },
+        );
+      }
+
+      if (
+        vinChanged &&
+        current.vin
+      ) {
+        transaction.delete(
+          vehicleKeyRef(
+            "vin",
+            current.vin,
+          ),
+        );
+      }
+
       transaction.update(
         vehicleRef,
         {
           registrationNumber:
-            String(
-              input.registrationNumber ??
-                current.registrationNumber,
-            )
-              .trim()
-              .toUpperCase(),
+            nextRegistration,
 
           make:
             String(
@@ -3704,31 +4082,31 @@ async function updateVehicleDetails(
                 ).trim() ||
                 null,
 
-          vin:
-            input.vin == null
-              ? null
-              : String(
-                  input.vin,
-                )
-                  .trim()
-                  .toUpperCase() ||
-                null,
+          vin: nextVin,
 
           registrationExpiresAt:
-            input.registrationExpiresAt ??
-            null,
+            optionalDateOrNull(
+              input.registrationExpiresAt,
+              "Registration expiry",
+            ),
 
           insuranceExpiresAt:
-            input.insuranceExpiresAt ??
-            null,
+            optionalDateOrNull(
+              input.insuranceExpiresAt,
+              "Insurance expiry",
+            ),
 
           lastServiceAt:
-            input.lastServiceAt ??
-            null,
+            optionalDateOrNull(
+              input.lastServiceAt,
+              "Last service date",
+            ),
 
           nextServiceDueAt:
-            input.nextServiceDueAt ??
-            null,
+            optionalDateOrNull(
+              input.nextServiceDueAt,
+              "Next service date",
+            ),
 
           rates,
 
@@ -3855,13 +4233,13 @@ async function changeVehicleStatus(
           Date.now();
 
         if (
-          !vehicle.insuranceExpiresAt ||
-          !vehicle.registrationExpiresAt ||
-          Date.parse(
+          complianceDateMs(
             vehicle.insuranceExpiresAt,
+            "Vehicle insurance expiry",
           ) <= now ||
-          Date.parse(
+          complianceDateMs(
             vehicle.registrationExpiresAt,
+            "Vehicle registration expiry",
           ) <= now
         ) {
           throw new Error(

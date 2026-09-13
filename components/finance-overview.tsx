@@ -21,6 +21,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -107,6 +108,13 @@ export function FinanceOverview() {
   const [reloadToken, setReloadToken] =
     useState(0);
 
+  /*
+   * Held across retries so a lost response cannot record the
+   * same expense twice; replaced only after it is stored.
+   */
+  const expenseKey =
+    useRef<string>(undefined);
+
   useEffect(() => {
     if (role !== "admin") {
       return;
@@ -115,6 +123,14 @@ export function FinanceOverview() {
     let cancelled = false;
 
     async function load() {
+      /*
+       * Changing a filter starts a new report, so the old
+       * figures are marked stale straight away rather than
+       * being presented as though they matched the new range.
+       */
+      setLoading(true);
+      setError(undefined);
+
       try {
         const [
           overview,
@@ -295,9 +311,12 @@ export function FinanceOverview() {
             ).trim(),
 
           idempotencyKey:
-            crypto.randomUUID(),
+            (expenseKey.current ??=
+              crypto.randomUUID()),
         },
       );
+
+      expenseKey.current = undefined;
 
       setNotice(
         "Expense recorded.",

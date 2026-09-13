@@ -5673,6 +5673,11 @@ canvas {
 }
 
 @media print {
+  /*
+   * The agreement is portalled to document.body, so it is a
+   * sibling of the application shell rather than a descendant
+   * and hiding the shell leaves the printable sheet standing.
+   */
   .app-frame,
   .agreement-modal-header {
     display: none !important;

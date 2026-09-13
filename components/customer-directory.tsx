@@ -341,6 +341,8 @@ export function CustomerDirectory() {
       return;
     }
 
+    let cancelled = false;
+
     async function loadActiveRentals() {
       try {
         const snapshot =
@@ -467,6 +469,14 @@ export function CustomerDirectory() {
     }
 
     void loadActiveRentals();
+
+    /*
+     * A tab switch or refresh while a read is in flight would
+     * otherwise let the older response overwrite the newer one.
+     */
+    return () => {
+      cancelled = true;
+    };
   }, [tab, rentalsReloadToken]);
 
   function refreshActiveRentals() {

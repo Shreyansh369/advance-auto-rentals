@@ -363,6 +363,44 @@ export function ReservationComposer() {
   const [showContract, setShowContract] =
     useState(false);
 
+  /*
+   * An idempotency key has to outlive a single submit to be
+   * worth anything: if the write commits but the response is
+   * lost, the retry must present the same key so the server
+   * replays the stored result instead of charging again. The
+   * key is therefore held per operation and only replaced once
+   * that operation has actually succeeded.
+   */
+  const operationKeys =
+    useRef<Record<string, string>>({});
+
+  function operationKey(
+    operation: string,
+  ): string {
+    const existing =
+      operationKeys.current[operation];
+
+    if (existing) {
+      return existing;
+    }
+
+    const created =
+      crypto.randomUUID();
+
+    operationKeys.current[operation] =
+      created;
+
+    return created;
+  }
+
+  function releaseOperationKey(
+    operation: string,
+  ): void {
+    delete operationKeys.current[
+      operation
+    ];
+  }
+
   const selectedCustomer =
     customers.find(
       (customer) =>
@@ -634,7 +672,9 @@ export function ReservationComposer() {
     }
   }
 
-  async function loadPayableRentals() {
+  async function loadPayableRentals(
+    isCancelled: () => boolean = () => false,
+  ) {
     try {
       const records =
         await callFirestoreOperation<
@@ -644,6 +684,10 @@ export function ReservationComposer() {
           "getPayableRentals",
           {},
         );
+
+      if (isCancelled()) {
+        return;
+      }
 
       setPayableRentals(
         records,
@@ -685,16 +729,27 @@ export function ReservationComposer() {
       return;
     }
 
+    let cancelled = false;
+
     /*
      * Opening the payment tab re-reads the outstanding
      * balances so the list cannot show a rental that was
-     * already settled from another screen.
+     * already settled from another screen. The initial load and
+     * a post-operation reload can still be in flight, so a
+     * response that arrives after this effect is torn down is
+     * discarded rather than overwriting a newer list.
      */
     async function refreshPayableRentals() {
-      await loadPayableRentals();
+      await loadPayableRentals(
+        () => cancelled,
+      );
     }
 
     void refreshPayableRentals();
+
+    return () => {
+      cancelled = true;
+    };
   }, [tab]);
 
   async function run(
@@ -1068,9 +1123,11 @@ export function ReservationComposer() {
                 ).trim(),
 
               idempotencyKey:
-                crypto.randomUUID(),
+                operationKey("extension"),
             },
           );
+
+        releaseOperationKey("extension");
 
         formElement.reset();
 
@@ -1393,9 +1450,11 @@ export function ReservationComposer() {
               additionalFees,
 
               idempotencyKey:
-                crypto.randomUUID(),
+                operationKey("payment"),
             },
           );
+
+        releaseOperationKey("payment");
 
         formElement.reset();
 
