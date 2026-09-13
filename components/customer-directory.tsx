@@ -250,6 +250,9 @@ export function CustomerDirectory() {
   const [rentalsLoaded, setRentalsLoaded] =
     useState(false);
 
+  const [rentalsReloadToken, setRentalsReloadToken] =
+    useState(0);
+
   useEffect(() => {
     const source = query(
       collection(
@@ -333,168 +336,146 @@ export function CustomerDirectory() {
 
   useEffect(() => {
     if (
-      !editingCustomerId
+      tab !== "active-rentals"
     ) {
       return;
     }
 
-    const latest =
-      customers.find(
-        (customer) =>
-          customer.id ===
-          editingCustomerId,
-      );
-
-    if (!latest) {
-      return;
-    }
-
-    setEditingCustomerForm(
-      customerToForm(latest),
-    );
-  }, [
-    customers,
-    editingCustomerId,
-  ]);
-
-  async function loadActiveRentals() {
-    setLoadingRentals(true);
-    setError(undefined);
-
-    try {
-      const snapshot =
-        await getDocs(
-          query(
-            collection(
-              getFirebaseClient().db,
-              "rentals",
+    async function loadActiveRentals() {
+      try {
+        const snapshot =
+          await getDocs(
+            query(
+              collection(
+                getFirebaseClient().db,
+                "rentals",
+              ),
+              where(
+                "status",
+                "in",
+                [
+                  "active",
+                  "overdue",
+                ],
+              ),
+              limit(100),
             ),
-            where(
-              "status",
-              "in",
-              [
-                "active",
-                "overdue",
-              ],
-            ),
-            limit(100),
-          ),
-        );
-
-      const records =
-        snapshot.docs
-          .map(
-            (rentalDoc) => {
-              const expectedReturn =
-                asDate(
-                  rentalDoc.get(
-                    "expectedReturnAt",
-                  ),
-                );
-
-              const status =
-                String(
-                  rentalDoc.get(
-                    "status",
-                  ),
-                ) ===
-                "overdue"
-                  ? "overdue"
-                  : "active";
-
-              return {
-                id:
-                  rentalDoc.id,
-
-                customerName:
-                  String(
-                    rentalDoc.get(
-                      "customerNameSnapshot",
-                    ) ??
-                      "Unknown customer",
-                  ),
-
-                vehicleRegistration:
-                  String(
-                    rentalDoc.get(
-                      "vehicleRegistrationSnapshot",
-                    ) ??
-                      "Unknown vehicle",
-                  ),
-
-                expectedReturnAt:
-                  expectedReturn,
-
-                bookedBy:
-                  String(
-                    rentalDoc.get(
-                      "createdByNameSnapshot",
-                    ) ??
-                      "Not recorded",
-                  ),
-
-                checkedOutBy:
-                  String(
-                    rentalDoc.get(
-                      "checkedOutByNameSnapshot",
-                    ) ??
-                      "Not recorded",
-                  ),
-
-                status,
-              } satisfies ActiveRental;
-            },
-          )
-          .sort(
-            (a, b) => {
-              const aTime =
-                a.expectedReturnAt?.getTime() ??
-                Number.MAX_SAFE_INTEGER;
-
-              const bTime =
-                b.expectedReturnAt?.getTime() ??
-                Number.MAX_SAFE_INTEGER;
-
-              return (
-                aTime -
-                bTime
-              );
-            },
           );
 
-      setActiveRentals(
-        records,
-      );
+        const records =
+          snapshot.docs
+            .map(
+              (rentalDoc) => {
+                const expectedReturn =
+                  asDate(
+                    rentalDoc.get(
+                      "expectedReturnAt",
+                    ),
+                  );
 
-      setRentalsLoaded(
-        true,
-      );
-    } catch (cause) {
-      console.error(
-        "Active rental load failed:",
-        cause,
-      );
+                const status =
+                  String(
+                    rentalDoc.get(
+                      "status",
+                    ),
+                  ) ===
+                  "overdue"
+                    ? "overdue"
+                    : "active";
 
-      setError(
-        firebaseErrorMessage(
+                return {
+                  id:
+                    rentalDoc.id,
+
+                  customerName:
+                    String(
+                      rentalDoc.get(
+                        "customerNameSnapshot",
+                      ) ??
+                        "Unknown customer",
+                    ),
+
+                  vehicleRegistration:
+                    String(
+                      rentalDoc.get(
+                        "vehicleRegistrationSnapshot",
+                      ) ??
+                        "Unknown vehicle",
+                    ),
+
+                  expectedReturnAt:
+                    expectedReturn,
+
+                  bookedBy:
+                    String(
+                      rentalDoc.get(
+                        "createdByNameSnapshot",
+                      ) ??
+                        "Not recorded",
+                    ),
+
+                  checkedOutBy:
+                    String(
+                      rentalDoc.get(
+                        "checkedOutByNameSnapshot",
+                      ) ??
+                        "Not recorded",
+                    ),
+
+                  status,
+                } satisfies ActiveRental;
+              },
+            )
+            .sort(
+              (a, b) => {
+                const aTime =
+                  a.expectedReturnAt?.getTime() ??
+                  Number.MAX_SAFE_INTEGER;
+
+                const bTime =
+                  b.expectedReturnAt?.getTime() ??
+                  Number.MAX_SAFE_INTEGER;
+
+                return (
+                  aTime -
+                  bTime
+                );
+              },
+            );
+
+        setActiveRentals(
+          records,
+        );
+
+        setRentalsLoaded(
+          true,
+        );
+      } catch (cause) {
+        console.error(
+          "Active rental load failed:",
           cause,
-        ),
-      );
-    } finally {
-      setLoadingRentals(false);
-    }
-  }
+        );
 
-  useEffect(() => {
-    if (
-      tab !==
-      "active-rentals"
-    ) {
-      return;
+        setError(
+          firebaseErrorMessage(
+            cause,
+          ),
+        );
+      } finally {
+        setLoadingRentals(false);
+      }
     }
 
     void loadActiveRentals();
-  }, [tab]);
+  }, [tab, rentalsReloadToken]);
+
+  function refreshActiveRentals() {
+    setLoadingRentals(true);
+    setError(undefined);
+    setRentalsReloadToken(
+      (token) => token + 1,
+    );
+  }
 
   const filteredCustomers =
     useMemo(() => {
@@ -602,9 +583,16 @@ export function CustomerDirectory() {
     setNotice(undefined);
     setSaving(true);
 
+    /*
+     * React clears currentTarget once the handler returns, so
+     * the element is captured before the first await.
+     */
+    const formElement =
+      event.currentTarget;
+
     const form =
       new FormData(
-        event.currentTarget,
+        formElement,
       );
 
     const fullName =
@@ -759,7 +747,7 @@ export function CustomerDirectory() {
           },
         );
 
-      event.currentTarget.reset();
+      formElement.reset();
 
       setShowCreateForm(
         false,
@@ -1143,8 +1131,8 @@ export function CustomerDirectory() {
               disabled={
                 loadingRentals
               }
-              onClick={() =>
-                void loadActiveRentals()
+              onClick={
+                refreshActiveRentals
               }
             >
               Refresh
@@ -1228,7 +1216,7 @@ export function CustomerDirectory() {
                       Customers screen.
                       After saving, you can
                       capture or upload the
-                      driver's licence photo.
+                      driver&apos;s licence photo.
                     </p>
                   </div>
 
@@ -1257,11 +1245,12 @@ export function CustomerDirectory() {
                   }
                 >
                   <div className="field">
-                    <label>
+                    <label htmlFor="full-name">
                       Full name
                     </label>
 
                     <input
+                      id="full-name"
                       name="fullName"
                       autoComplete="name"
                       required
@@ -1269,11 +1258,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="telephone">
                       Telephone
                     </label>
 
                     <input
+                      id="telephone"
                       name="telephone"
                       type="tel"
                       autoComplete="tel"
@@ -1283,11 +1273,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="email">
                       Email
                     </label>
 
                     <input
+                      id="email"
                       name="email"
                       type="email"
                       autoComplete="email"
@@ -1295,44 +1286,48 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field full">
-                    <label>
+                    <label htmlFor="address">
                       Address
                     </label>
 
                     <input
+                      id="address"
                       name="address"
                       autoComplete="street-address"
                     />
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="licence-number">
                       Licence number
                     </label>
 
                     <input
+                      id="licence-number"
                       name="licenceNumber"
                       required
                     />
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="issuing-country">
                       Issuing country
                     </label>
 
                     <CountrySelect
+                      id="issuing-country"
                       name="licenceCountry"
                       required
                     />
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="licence-expiry">
                       Licence expiry
                     </label>
 
                     <input
+                      id="licence-expiry"
                       name="licenceExpiresAt"
                       type="date"
                       min={tomorrowDate()}
@@ -1395,11 +1390,12 @@ export function CustomerDirectory() {
                   }
                 >
                   <div className="field">
-                    <label>
+                    <label htmlFor="full-name-2">
                       Full name
                     </label>
 
                     <input
+                      id="full-name-2"
                       value={
                         editingCustomerForm.fullName
                       }
@@ -1424,11 +1420,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="telephone-2">
                       Telephone
                     </label>
 
                     <input
+                      id="telephone-2"
                       value={
                         editingCustomerForm.telephone
                       }
@@ -1455,11 +1452,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="email-2">
                       Email
                     </label>
 
                     <input
+                      id="email-2"
                       value={
                         editingCustomerForm.email
                       }
@@ -1484,11 +1482,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field full">
-                    <label>
+                    <label htmlFor="address-2">
                       Address
                     </label>
 
                     <input
+                      id="address-2"
                       value={
                         editingCustomerForm.address
                       }
@@ -1512,11 +1511,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="licence-number-2">
                       Licence number
                     </label>
 
                     <input
+                      id="licence-number-2"
                       value={
                         editingCustomerForm.licenceNumber
                       }
@@ -1540,11 +1540,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="issuing-country-2">
                       Issuing country
                     </label>
 
                     <CountrySelect
+                      id="issuing-country-2"
                       key={`${editingCustomerId}-${editingCustomerForm.licenceCountry}`}
                       name="licenceCountry"
                       defaultValue={
@@ -1555,11 +1556,12 @@ export function CustomerDirectory() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="licence-expiry-2">
                       Licence expiry
                     </label>
 
                     <input
+                      id="licence-expiry-2"
                       value={
                         editingCustomerForm.licenceExpiresAt
                       }

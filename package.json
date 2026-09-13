@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run tests/unit --passWithNoTests",
     "test:watch": "vitest tests/unit",
-    "test:rules": "firebase emulators:exec --only auth,firestore \"pnpm vitest run tests/rules\"",
+    "test:rules": "firebase emulators:exec --only auth,firestore,storage \"pnpm vitest run tests/rules\"",
     "import:inventory": "tsx scripts/import-inventory.ts",
     "bootstrap:staff": "tsx scripts/bootstrap-staff.ts",
     "bootstrap:admin": "tsx scripts/bootstrap-admin.ts",

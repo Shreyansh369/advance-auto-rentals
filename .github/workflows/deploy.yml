@@ -20,11 +20,9 @@ jobs:
       - uses: pnpm/action-setup@v4
         with: { version: 11 }
       - uses: actions/setup-node@v5
-        with: { node-version: 22, cache: pnpm, cache-dependency-path: advance-auto-rentals/pnpm-lock.yaml }
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: pnpm-lock.yaml }
       - run: pnpm install --frozen-lockfile
-        working-directory: advance-auto-rentals
       - run: pnpm verify && pnpm test:rules
-        working-directory: advance-auto-rentals
         env:
           NEXT_PUBLIC_FIREBASE_API_KEY: ${{ vars.FIREBASE_API_KEY }}
           NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${{ vars.FIREBASE_AUTH_DOMAIN }}
@@ -38,8 +36,7 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SERVICE_ACCOUNT }}
-      - run: pnpm exec firebase deploy --project "$FIREBASE_PROJECT_ID" --only hosting,functions,firestore:rules,firestore:indexes,storage --non-interactive
-        working-directory: advance-auto-rentals
+      - run: pnpm exec firebase deploy --project "$FIREBASE_PROJECT_ID" --only hosting,firestore:rules,firestore:indexes --non-interactive
         env: { FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }} }
   production:
     if: inputs.target == 'production'
@@ -50,11 +47,9 @@ jobs:
       - uses: pnpm/action-setup@v4
         with: { version: 11 }
       - uses: actions/setup-node@v5
-        with: { node-version: 22, cache: pnpm, cache-dependency-path: advance-auto-rentals/pnpm-lock.yaml }
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: pnpm-lock.yaml }
       - run: pnpm install --frozen-lockfile
-        working-directory: advance-auto-rentals
       - run: pnpm verify && pnpm test:rules
-        working-directory: advance-auto-rentals
         env:
           NEXT_PUBLIC_FIREBASE_API_KEY: ${{ vars.FIREBASE_API_KEY }}
           NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${{ vars.FIREBASE_AUTH_DOMAIN }}
@@ -68,6 +63,5 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SERVICE_ACCOUNT }}
-      - run: pnpm exec firebase deploy --project "$FIREBASE_PROJECT_ID" --only hosting,functions,firestore:rules,firestore:indexes,storage --non-interactive
-        working-directory: advance-auto-rentals
+      - run: pnpm exec firebase deploy --project "$FIREBASE_PROJECT_ID" --only hosting,firestore:rules,firestore:indexes --non-interactive
         env: { FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }} }

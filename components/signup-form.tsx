@@ -191,6 +191,14 @@ export function SignupForm() {
     const numericAge =
       Number(age);
 
+    let createdCredential:
+      | Awaited<
+          ReturnType<
+            typeof createUserWithEmailAndPassword
+          >
+        >
+      | undefined;
+
     try {
       if (cleanName.length < 2) {
         throw new Error(
@@ -261,7 +269,7 @@ export function SignupForm() {
           );
         }
 
-        const credential =
+        createdCredential =
           await createUserWithEmailAndPassword(
             auth,
             cleanEmail,
@@ -269,10 +277,10 @@ export function SignupForm() {
           );
 
         uid =
-          credential.user.uid;
+          createdCredential.user.uid;
 
         await updateProfile(
-          credential.user,
+          createdCredential.user,
           {
             displayName: cleanName,
           },
@@ -356,6 +364,20 @@ export function SignupForm() {
         cause,
       );
 
+      /*
+       * If the sign-in account was created in this attempt but
+       * the staff profile was not, remove it again. Leaving it
+       * behind would block every retry with "email already in
+       * use" and there is no way for the applicant to clear it.
+       */
+      if (createdCredential) {
+        try {
+          await createdCredential.user.delete();
+        } catch {
+          // The account is signed out below either way.
+        }
+      }
+
       try {
         await getFirebaseClient()
           .auth
@@ -396,8 +418,8 @@ export function SignupForm() {
         <div className="auth-visual-top">
           <div className="auth-brand">
             <img
-              src="/brand/logo.svg"
-              alt="Advance Auto Rentals"
+              src="/brand/advance-auto-rentals-logo.png"
+              alt="Advance Auto Rental &amp; Repairs"
               className="auth-brand-logo"
             />
 
@@ -441,6 +463,29 @@ export function SignupForm() {
 
       <section className="auth-form-panel">
         <div className="auth-form-card auth-register-card">
+          {/*
+           * The showcase panel is hidden below 980px, so the
+           * registration card carries the branding on phones
+           * and tablets exactly as the sign-in card does.
+           */}
+          <div className="auth-mobile-brand">
+            <img
+              src="/brand/advance-auto-rentals-logo.png"
+              alt="Advance Auto Rental &amp; Repairs"
+              className="auth-brand-logo"
+            />
+
+            <div>
+              <strong>
+                Advance Auto Rentals
+              </strong>
+
+              <span>
+                Staff registration
+              </span>
+            </div>
+          </div>
+
           <button
             type="button"
             className="auth-back-link"

@@ -40,7 +40,7 @@ const cards: Array<{
   label: string;
   icon: typeof CarFront;
   tone: string;
-  href: "/vehicles" | "/rentals";
+  href: string;
 }> = [
   {
     key: "totalFleet",
@@ -96,7 +96,7 @@ const cards: Array<{
     label: "Documents due",
     icon: AlertTriangle,
     tone: "yellow",
-    href: "/vehicles",
+    href: "/vehicles?view=documents",
   },
 ];
 
@@ -110,31 +110,56 @@ export function Dashboard() {
   const [loading, setLoading] =
     useState(true);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(undefined);
-
-    try {
-      const result =
-        await callFirestoreOperation<
-          Record<string, never>,
-          DashboardSummary
-        >(
-          "getOperationalDashboard",
-          {},
-        );
-
-      setSummary(result);
-    } catch (cause) {
-      setError(firebaseErrorMessage(cause));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const [reloadToken, setReloadToken] =
+    useState(0);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const result =
+          await callFirestoreOperation<
+            Record<string, never>,
+            DashboardSummary
+          >(
+            "getOperationalDashboard",
+            {},
+          );
+
+        if (cancelled) {
+          return;
+        }
+
+        setSummary(result);
+        setError(undefined);
+      } catch (cause) {
+        if (!cancelled) {
+          setError(
+            firebaseErrorMessage(cause),
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
     void load();
-  }, [load]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadToken]);
+
+  const refresh = useCallback(() => {
+    setLoading(true);
+    setError(undefined);
+    setReloadToken(
+      (token) => token + 1,
+    );
+  }, []);
 
   const todayLabel =
     new Intl.DateTimeFormat("en-US", {
@@ -152,7 +177,7 @@ export function Dashboard() {
           <button
             type="button"
             className="button button-secondary compact"
-            onClick={() => void load()}
+            onClick={refresh}
             disabled={loading}
             aria-label="Refresh dashboard"
           >
@@ -203,7 +228,7 @@ export function Dashboard() {
               aria-label={`${label}: ${
                 summary ? summary[key] : "—"
               }. Open ${
-                href === "/vehicles"
+                href.startsWith("/vehicles")
                   ? "fleet"
                   : "rentals"
               }.`}
@@ -485,7 +510,7 @@ export function Dashboard() {
             </Link>
 
             <Link
-              href="/vehicles"
+              href="/vehicles?view=documents"
               className="attention-link"
               aria-label="View vehicle compliance documents"
             >

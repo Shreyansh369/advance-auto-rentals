@@ -43,6 +43,9 @@ import {
 } from "@/lib/services/firestore-client";
 
 import { AppShell } from "./app-shell";
+import { MediaCapture } from "./media-capture";
+
+import type { CloudinaryMedia } from "@/lib/cloudinary";
 
 type Vehicle = VehicleDocument & {
   id: string;
@@ -206,6 +209,51 @@ function dateIsValid(
   );
 }
 
+/*
+ * Compliance is judged against a timestamp captured when the
+ * fleet snapshot arrives rather than read during render, so
+ * every row on a given list is measured against the same
+ * moment.
+ */
+function expiresWithin(
+  value: string | null,
+  nowMs: number,
+  windowMs: number,
+): boolean {
+  if (!value) {
+    return true;
+  }
+
+  const expiry =
+    new Date(value).getTime();
+
+  if (Number.isNaN(expiry)) {
+    return true;
+  }
+
+  return expiry <= nowMs + windowMs;
+}
+
+function isCurrent(
+  value: string | null,
+  nowMs: number,
+): boolean {
+  if (!value) {
+    return false;
+  }
+
+  const expiry =
+    new Date(value).getTime();
+
+  return (
+    !Number.isNaN(expiry) &&
+    expiry > nowMs
+  );
+}
+
+const DOCUMENT_WINDOW_MS =
+  30 * 24 * 60 * 60 * 1000;
+
 function centsFromInput(
   value: string,
 ): number | null {
@@ -229,7 +277,11 @@ function centsFromInput(
   return Math.round(number * 100);
 }
 
-export function VehicleDirectory() {
+export function VehicleDirectory({
+  initialView,
+}: {
+  initialView?: string | null;
+} = {}) {
   const [vehicles, setVehicles] =
     useState<Vehicle[]>([]);
 
@@ -247,6 +299,15 @@ export function VehicleDirectory() {
       VehicleStatus | "all"
     >("all");
 
+  const [documentsOnly, setDocumentsOnly] =
+    useState(
+      () =>
+        initialView === "documents",
+    );
+
+  const [evaluatedAt, setEvaluatedAt] =
+    useState(0);
+
   const [editingVehicle, setEditingVehicle] =
     useState<Vehicle | null>(null);
 
@@ -255,6 +316,9 @@ export function VehicleDirectory() {
 
   const [form, setForm] =
     useState<VehicleForm | null>(null);
+
+  const [photos, setPhotos] =
+    useState<CloudinaryMedia[]>([]);
 
   const [saving, setSaving] =
     useState(false);
@@ -285,6 +349,8 @@ export function VehicleDirectory() {
           ),
         );
 
+        setEvaluatedAt(Date.now());
+
         setError(undefined);
       },
       () => {
@@ -303,6 +369,17 @@ export function VehicleDirectory() {
       (vehicle) =>
         (status === "all" ||
           vehicle.status === status) &&
+        (!documentsOnly ||
+          expiresWithin(
+            vehicle.registrationExpiresAt,
+            evaluatedAt,
+            DOCUMENT_WINDOW_MS,
+          ) ||
+          expiresWithin(
+            vehicle.insuranceExpiresAt,
+            evaluatedAt,
+            DOCUMENT_WINDOW_MS,
+          )) &&
         (!needle ||
           `${vehicle.registrationNumber} ${
             vehicle.make
@@ -316,7 +393,31 @@ export function VehicleDirectory() {
     vehicles,
     search,
     status,
+    documentsOnly,
+    evaluatedAt,
   ]);
+
+  const documentsDueCount =
+    useMemo(
+      () =>
+        vehicles.filter(
+          (vehicle) =>
+            expiresWithin(
+              vehicle.registrationExpiresAt,
+              evaluatedAt,
+              DOCUMENT_WINDOW_MS,
+            ) ||
+            expiresWithin(
+              vehicle.insuranceExpiresAt,
+              evaluatedAt,
+              DOCUMENT_WINDOW_MS,
+            ),
+        ).length,
+      [
+        vehicles,
+        evaluatedAt,
+      ],
+    );
 
   const statusCount = (
     item: VehicleStatus,
@@ -331,6 +432,7 @@ export function VehicleDirectory() {
     setNotice(undefined);
     setEditingVehicle(null);
     setForm(emptyVehicleForm());
+    setPhotos([]);
     setCreatingVehicle(true);
   }
 
@@ -339,6 +441,10 @@ export function VehicleDirectory() {
     setNotice(undefined);
     setEditingVehicle(vehicle);
     setForm(vehicleToForm(vehicle));
+    setPhotos(
+      (vehicle.photos ??
+        []) as CloudinaryMedia[],
+    );
   }
 
   function closeEditor() {
@@ -349,6 +455,7 @@ export function VehicleDirectory() {
     setEditingVehicle(null);
     setCreatingVehicle(false);
     setForm(null);
+    setPhotos([]);
   }
 
   function updateForm(
@@ -527,6 +634,8 @@ export function VehicleDirectory() {
         notes:
           form.notes.trim() ||
           null,
+
+        photos,
       };
 
       if (creatingVehicle) {
@@ -566,6 +675,7 @@ export function VehicleDirectory() {
       setEditingVehicle(null);
       setCreatingVehicle(false);
       setForm(null);
+      setPhotos([]);
     } catch (cause) {
       setError(
         firebaseErrorMessage(cause),
@@ -758,6 +868,27 @@ export function VehicleDirectory() {
                 )}
               </button>
             ))}
+
+            <button
+              type="button"
+              className={
+                documentsOnly
+                  ? "filter-chip active"
+                  : "filter-chip"
+              }
+              aria-pressed={documentsOnly}
+              onClick={() =>
+                setDocumentsOnly(
+                  (current) => !current,
+                )
+              }
+            >
+              Documents due
+
+              <span>
+                {documentsDueCount}
+              </span>
+            </button>
           </div>
         </div>
 
@@ -803,32 +934,16 @@ export function VehicleDirectory() {
                         vehicle.id;
 
                       const registrationValid =
-                        Boolean(
+                        isCurrent(
                           vehicle.registrationExpiresAt,
-                        ) &&
-                        !Number.isNaN(
-                          new Date(
-                            vehicle.registrationExpiresAt as string,
-                          ).valueOf(),
-                        ) &&
-                        new Date(
-                          vehicle.registrationExpiresAt as string,
-                        ).getTime() >
-                          Date.now();
+                          evaluatedAt,
+                        );
 
                       const insuranceValid =
-                        Boolean(
+                        isCurrent(
                           vehicle.insuranceExpiresAt,
-                        ) &&
-                        !Number.isNaN(
-                          new Date(
-                            vehicle.insuranceExpiresAt as string,
-                          ).valueOf(),
-                        ) &&
-                        new Date(
-                          vehicle.insuranceExpiresAt as string,
-                        ).getTime() >
-                          Date.now();
+                          evaluatedAt,
+                        );
 
                       return (
                         <tr
@@ -1020,6 +1135,20 @@ export function VehicleDirectory() {
                             vehicle.status,
                           )}
                         </span>
+
+                        {vehicle.photos
+                          ?.[0]?.url && (
+                          <img
+                            className="vehicle-card-photo"
+                            src={
+                              vehicle
+                                .photos[0]
+                                .url
+                            }
+                            alt={`${vehicle.registrationNumber} photo`}
+                            loading="lazy"
+                          />
+                        )}
 
                         <strong>
                           {
@@ -1262,11 +1391,12 @@ export function VehicleDirectory() {
 
               <div className="vehicle-editor-grid">
                 <div className="field">
-                  <label>
+                  <label htmlFor="registration-number">
                     Registration number
                   </label>
 
                   <input
+                    id="registration-number"
                     value={
                       form.registrationNumber
                     }
@@ -1280,11 +1410,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="vin">
                     VIN
                   </label>
 
                   <input
+                    id="vin"
                     value={form.vin}
                     onChange={(event) =>
                       updateForm(
@@ -1297,9 +1428,10 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>Make</label>
+                  <label htmlFor="make">Make</label>
 
                   <input
+                    id="make"
                     value={form.make}
                     onChange={(event) =>
                       updateForm(
@@ -1311,9 +1443,10 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>Model</label>
+                  <label htmlFor="model">Model</label>
 
                   <input
+                    id="model"
                     value={form.model}
                     onChange={(event) =>
                       updateForm(
@@ -1325,9 +1458,10 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>Year</label>
+                  <label htmlFor="year">Year</label>
 
                   <input
+                    id="year"
                     type="number"
                     min="1886"
                     max={
@@ -1345,11 +1479,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="colour">
                     Colour
                   </label>
 
                   <input
+                    id="colour"
                     value={form.color}
                     onChange={(event) =>
                       updateForm(
@@ -1361,11 +1496,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="registration-expiry">
                     Registration expiry
                   </label>
 
                   <input
+                    id="registration-expiry"
                     type="date"
                     value={
                       form.registrationExpiresAt
@@ -1380,11 +1516,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="insurance-expiry">
                     Insurance expiry
                   </label>
 
                   <input
+                    id="insurance-expiry"
                     type="date"
                     value={
                       form.insuranceExpiresAt
@@ -1399,11 +1536,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="last-service">
                     Last service
                   </label>
 
                   <input
+                    id="last-service"
                     type="date"
                     value={
                       form.lastServiceAt
@@ -1418,11 +1556,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="next-service-due">
                     Next service due
                   </label>
 
                   <input
+                    id="next-service-due"
                     type="date"
                     value={
                       form.nextServiceDueAt
@@ -1437,11 +1576,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="daily-rate">
                     Daily rate
                   </label>
 
                   <input
+                    id="daily-rate"
                     type="number"
                     min="0"
                     step="0.01"
@@ -1458,11 +1598,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="weekly-rate">
                     Weekly rate
                   </label>
 
                   <input
+                    id="weekly-rate"
                     type="number"
                     min="0"
                     step="0.01"
@@ -1479,11 +1620,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field">
-                  <label>
+                  <label htmlFor="monthly-rate">
                     Monthly rate
                   </label>
 
                   <input
+                    id="monthly-rate"
                     type="number"
                     min="0"
                     step="0.01"
@@ -1500,11 +1642,12 @@ export function VehicleDirectory() {
                 </div>
 
                 <div className="field full">
-                  <label>
+                  <label htmlFor="notes">
                     Notes
                   </label>
 
                   <textarea
+                    id="notes"
                     value={form.notes}
                     onChange={(event) =>
                       updateForm(
@@ -1512,6 +1655,17 @@ export function VehicleDirectory() {
                         event.target.value,
                       )
                     }
+                  />
+                </div>
+
+                <div className="field full">
+                  <MediaCapture
+                    stage="vehicle"
+                    value={photos}
+                    onChange={setPhotos}
+                    label="Vehicle photos"
+                    hint="Photos are uploaded to Cloudinary and saved with the fleet record."
+                    maxFiles={10}
                   />
                 </div>
               </div>

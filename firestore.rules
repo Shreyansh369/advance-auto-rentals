@@ -270,7 +270,12 @@ allow list: if isAdmin();
 
     match /idempotencyKeys/{key} {
 
-      allow read, write: if isStaff();
+      /* Records are create-only so a completed payment,
+         refund or expense cannot be replayed by clearing
+         its key. */
+      allow read, create: if isStaff();
+
+      allow update, delete: if false;
     }
 
 

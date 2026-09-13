@@ -19,6 +19,17 @@ export function CustomerSignaturePad({
   const drawingRef = useRef(false);
   const hasStrokeRef = useRef(Boolean(value));
 
+  /*
+   * The last image this pad put on screen. Finishing a stroke
+   * reports a new data URL upwards, which comes straight back
+   * in as `value`; without this the canvas would be torn down
+   * and rebuilt after every stroke, flashing white and losing
+   * anything drawn while the replacement image loaded.
+   */
+  const renderedRef = useRef<string | null>(value);
+
+  const widthRef = useRef(0);
+
   const configureCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
@@ -123,14 +134,44 @@ export function CustomerSignaturePad({
   );
 
   useEffect(() => {
-    redrawValue(value);
+    if (
+      value !== renderedRef.current
+    ) {
+      renderedRef.current = value;
+      redrawValue(value);
+    }
+  }, [redrawValue, value]);
 
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    widthRef.current = Math.floor(
+      canvas.getBoundingClientRect().width,
+    );
+
+    redrawValue(renderedRef.current);
+
+    /*
+     * Only a genuine width change rebuilds the backing store.
+     * Reconfiguring on every observer callback would reset the
+     * canvas while the customer is still signing.
+     */
     const resizeObserver =
-      new ResizeObserver(() => {
-        redrawValue(value);
+      new ResizeObserver((entries) => {
+        const width = Math.floor(
+          entries[0]?.contentRect.width ?? 0,
+        );
+
+        if (
+          width === widthRef.current ||
+          drawingRef.current
+        ) {
+          return;
+        }
+
+        widthRef.current = width;
+        redrawValue(renderedRef.current);
       });
 
     resizeObserver.observe(canvas);
@@ -138,7 +179,7 @@ export function CustomerSignaturePad({
     return () => {
       resizeObserver.disconnect();
     };
-  }, [redrawValue, value]);
+  }, [redrawValue]);
 
   function position(
     event: React.PointerEvent<HTMLCanvasElement>,
@@ -197,7 +238,6 @@ export function CustomerSignaturePad({
     );
 
     drawingRef.current = true;
-    hasStrokeRef.current = true;
   }
 
   function move(
@@ -226,6 +266,8 @@ export function CustomerSignaturePad({
     );
 
     context.stroke();
+
+    hasStrokeRef.current = true;
   }
 
   function end(
@@ -250,11 +292,14 @@ export function CustomerSignaturePad({
 
     if (!canvas) return;
 
-    onChange(
+    const next =
       hasStrokeRef.current
         ? canvas.toDataURL("image/png")
-        : null,
-    );
+        : null;
+
+    renderedRef.current = next;
+
+    onChange(next);
   }
 
   function clear() {
@@ -304,6 +349,7 @@ export function CustomerSignaturePad({
 
     hasStrokeRef.current = false;
     drawingRef.current = false;
+    renderedRef.current = null;
 
     onChange(null);
   }
@@ -325,7 +371,7 @@ export function CustomerSignaturePad({
         }}
       >
         <div>
-          <label>
+          <label htmlFor="customer-signature">
             Customer signature
           </label>
 
@@ -357,6 +403,7 @@ export function CustomerSignaturePad({
         }}
       >
         <canvas
+          id="customer-signature"
           ref={canvasRef}
           className="signature-pad-canvas"
           style={{

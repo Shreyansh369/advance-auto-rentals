@@ -45,11 +45,13 @@ function countryName(
 }
 
 export function CountrySelect({
+  id,
   name,
   defaultValue = "",
   required = false,
   disabled = false,
 }: {
+  id?: string;
   name: string;
   defaultValue?: string;
   required?: boolean;
@@ -69,6 +71,7 @@ export function CountrySelect({
 
   return (
     <select
+      id={id}
       name={name}
       defaultValue={defaultValue}
       required={required}

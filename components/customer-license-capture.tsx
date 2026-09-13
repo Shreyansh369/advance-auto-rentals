@@ -17,13 +17,10 @@ import {
 import {
   getDownloadURL,
   ref,
-  uploadBytes,
 } from "firebase/storage";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
-
-const MAX_FILE_BYTES =
-  5 * 1024 * 1024;
+import { uploadCustomerDocument } from "@/lib/cloudinary";
 
 type Props = {
   customerId: string | null;
@@ -85,6 +82,18 @@ export function CustomerLicenseCapture({
         return;
       }
 
+      if (
+        value.startsWith("https://")
+      ) {
+        setPreviewUrl(value);
+        return;
+      }
+
+      /*
+       * Licence images captured before the move to Cloudinary
+       * were stored as Firebase Storage paths. Those records
+       * still resolve here so nothing disappears.
+       */
       try {
         const { storage } =
           getFirebaseClient();
@@ -256,77 +265,25 @@ export function CustomerLicenseCapture({
       );
     }
 
-    if (
-      !file.type.match(
-        /^image\/(jpeg|png|webp)$/,
-      )
-    ) {
-      throw new Error(
-        "Licence photo must be a JPEG, PNG or WebP image.",
-      );
-    }
-
-    if (
-      file.size <= 0 ||
-      file.size > MAX_FILE_BYTES
-    ) {
-      throw new Error(
-        "Licence photo must be 5 MB or smaller.",
-      );
-    }
-
     setUploadError(undefined);
     setUploading(true);
 
     try {
-      const { storage } =
-        getFirebaseClient();
-
-      /*
-       * Firebase Storage rules require:
-       *
-       * customer-documents/{customerId}/{fileId}
-       */
-      const fileId =
-        crypto.randomUUID();
-
-      const storagePath =
-        `customer-documents/${customerId}/${fileId}`;
-
-      const storageRef =
-        ref(
-          storage,
-          storagePath,
-        );
-
-      await uploadBytes(
-        storageRef,
-        file,
-        {
-          contentType:
-            file.type,
-          customMetadata: {
-            documentType:
-              "drivers-licence",
-            customerId,
-          },
-        },
-      );
-
-      const downloadUrl =
-        await getDownloadURL(
-          storageRef,
+      const uploaded =
+        await uploadCustomerDocument(
+          file,
+          customerId,
         );
 
       setPreviewUrl(
-        downloadUrl,
+        uploaded.url,
       );
 
       onChange(
-        storagePath,
+        uploaded.url,
       );
 
-      return downloadUrl;
+      return uploaded.url;
     } catch (cause) {
       setUploadError(
         cause instanceof Error

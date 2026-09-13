@@ -16,6 +16,7 @@ import {
   ChevronRight,
   ClipboardCheck,
   CreditCard,
+  FileText,
   Plus,
   Search,
   UserRound,
@@ -34,6 +35,7 @@ import { CountrySelect } from "./country-select";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
 import { CustomerSignaturePad } from "./customer-signature-pad";
+import { RentalAgreement } from "./rental-agreement";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
@@ -355,6 +357,12 @@ export function ReservationComposer() {
   const [busy, setBusy] =
     useState(false);
 
+  const [contractReservationId, setContractReservationId] =
+    useState<string | null>(null);
+
+  const [showContract, setShowContract] =
+    useState(false);
+
   const selectedCustomer =
     customers.find(
       (customer) =>
@@ -672,13 +680,21 @@ export function ReservationComposer() {
 
   useEffect(() => {
     if (
-      tab !==
-      "payment"
+      tab !== "payment"
     ) {
       return;
     }
 
-    void loadPayableRentals();
+    /*
+     * Opening the payment tab re-reads the outstanding
+     * balances so the list cannot show a rental that was
+     * already settled from another screen.
+     */
+    async function refreshPayableRentals() {
+      await loadPayableRentals();
+    }
+
+    void refreshPayableRentals();
   }, [tab]);
 
   async function run(
@@ -874,42 +890,11 @@ export function ReservationComposer() {
             },
           );
 
-        let contractStatus = "";
+        setContractReservationId(
+          result.reservationId,
+        );
 
-        if (
-          selectedCustomer?.email
-        ) {
-          try {
-            await callFirestoreOperation<
-              {
-                reservationId: string;
-              },
-              {
-                emailId: string;
-              }
-            >(
-              "sendReservationContract",
-              {
-                reservationId:
-                  result.reservationId,
-              },
-            );
-
-            contractStatus = ` Rental agreement emailed to ${selectedCustomer.email}.`;
-          } catch (emailError) {
-            console.error(
-              "Rental agreement email failed:",
-              emailError,
-            );
-
-            contractStatus = ` Booking was created, but the rental agreement could not be emailed: ${firebaseErrorMessage(
-              emailError,
-            )}`;
-          }
-        } else {
-          contractStatus =
-            " Booking was created, but no customer email is available for the rental agreement.";
-        }
+        setShowContract(true);
 
         formElement.reset();
 
@@ -943,7 +928,7 @@ export function ReservationComposer() {
 
         return `Booking confirmed · ${result.quote.chargedDays} day(s) · ${formatMoney(
           result.quote.baseRentalCents,
-        )}.${contractStatus}`;
+        )}. Open the rental agreement to print or save it.`;
       },
     );
   }
@@ -1117,37 +1102,53 @@ export function ReservationComposer() {
           String(
             form.get(
               "adjustmentAmount",
-            ),
-          );
+            ) ?? "",
+          ).trim();
 
-        const adjustments =
-          amount
-            ? [
-                {
-                  type:
-                    String(
-                      form.get(
-                        "adjustmentType",
-                      ),
-                    ),
+        let adjustments: Array<{
+          type: string;
+          amountCents: number;
+          note: string;
+        }> = [];
 
-                  amountCents:
-                    Math.round(
-                      Number(
-                        amount,
-                      ) * 100,
-                    ),
+        if (amount) {
+          const amountCents =
+            Math.round(
+              Number(amount) * 100,
+            );
 
-                  note:
-                    String(
-                      form.get(
-                        "adjustmentNote",
-                      ),
-                    ).trim() ||
-                    "Return adjustment",
-                },
-              ]
-            : [];
+          if (
+            !Number.isFinite(
+              amountCents,
+            ) ||
+            amountCents <= 0
+          ) {
+            throw new Error(
+              "Adjustment amount must be greater than zero.",
+            );
+          }
+
+          adjustments = [
+            {
+              type:
+                String(
+                  form.get(
+                    "adjustmentType",
+                  ),
+                ),
+
+              amountCents,
+
+              note:
+                String(
+                  form.get(
+                    "adjustmentNote",
+                  ) ?? "",
+                ).trim() ||
+                "Return adjustment",
+            },
+          ];
+        }
 
         const result =
           await callFirestoreOperation<
@@ -1318,6 +1319,26 @@ export function ReservationComposer() {
                 fee !== null,
             );
 
+        const paymentAmountCents =
+          Math.round(
+            Number(
+              String(
+                form.get("amount") ?? "",
+              ).trim(),
+            ) * 100,
+          );
+
+        if (
+          !Number.isFinite(
+            paymentAmountCents,
+          ) ||
+          paymentAmountCents <= 0
+        ) {
+          throw new Error(
+            "Payment amount must be greater than zero.",
+          );
+        }
+
         const result =
           await callFirestoreOperation<
             {
@@ -1352,13 +1373,7 @@ export function ReservationComposer() {
                 ),
 
               amountCents:
-                Math.round(
-                  Number(
-                    form.get(
-                      "amount",
-                    ),
-                  ) * 100,
-                ),
+                paymentAmountCents,
 
               method:
                 String(
@@ -1439,9 +1454,34 @@ export function ReservationComposer() {
           className="alert alert-success"
           role="status"
         >
-          {notice}
+          <span>{notice}</span>
+
+          {contractReservationId && (
+            <button
+              className="button button-secondary compact"
+              type="button"
+              onClick={() =>
+                setShowContract(true)
+              }
+            >
+              <FileText size={15} />
+              Rental agreement
+            </button>
+          )}
         </div>
       )}
+
+      {showContract &&
+        contractReservationId && (
+          <RentalAgreement
+            reservationId={
+              contractReservationId
+            }
+            onClose={() =>
+              setShowContract(false)
+            }
+          />
+        )}
 
       <section className="workflow-shell surface">
         {tab ===
@@ -1472,7 +1512,7 @@ export function ReservationComposer() {
 
             <div className="field full">
               <div className="label-row">
-                <label>
+                <label htmlFor="customer">
                   Customer
                 </label>
 
@@ -1530,6 +1570,7 @@ export function ReservationComposer() {
                     />
 
                     <input
+                      id="customer"
                       ref={
                         customerSearchInputRef
                       }
@@ -1676,22 +1717,24 @@ export function ReservationComposer() {
               ) : (
                 <div className="inline-customer-form">
                   <div className="field">
-                    <label>
+                    <label htmlFor="full-name">
                       Full name
                     </label>
 
                     <input
+                      id="full-name"
                       name="newCustomerFullName"
                       autoComplete="name"
                     />
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="telephone">
                       Telephone
                     </label>
 
                     <input
+                      id="telephone"
                       name="newCustomerTelephone"
                       autoComplete="tel"
                       inputMode="tel"
@@ -1699,11 +1742,12 @@ export function ReservationComposer() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="email">
                       Email
                     </label>
 
                     <input
+                      id="email"
                       name="newCustomerEmail"
                       type="email"
                       autoComplete="email"
@@ -1711,32 +1755,35 @@ export function ReservationComposer() {
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="licence-number">
                       Licence number
                     </label>
 
                     <input
+                      id="licence-number"
                       name="newCustomerLicence"
                     />
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="issuing-country">
                       Issuing country
                     </label>
 
                     <CountrySelect
+                      id="issuing-country"
                       name="newCustomerCountry"
                       required
                     />
                   </div>
 
                   <div className="field">
-                    <label>
+                    <label htmlFor="licence-expiry">
                       Licence expiry
                     </label>
 
                     <input
+                      id="licence-expiry"
                       name="newCustomerExpiry"
                       type="date"
                       min={tomorrowDate()}
@@ -1745,11 +1792,12 @@ export function ReservationComposer() {
                   </div>
 
                   <div className="field full">
-                    <label>
+                    <label htmlFor="address">
                       Address
                     </label>
 
                     <input
+                      id="address"
                       name="newCustomerAddress"
                       autoComplete="street-address"
                     />
@@ -1771,7 +1819,7 @@ export function ReservationComposer() {
 
                       {!newCustomerLicencePath && (
                         <p className="form-help">
-                          Capture the driver's
+                          Capture the driver&apos;s
                           licence photo before this
                           customer can be used on a
                           booking.
@@ -2007,11 +2055,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="vehicle">
                 Vehicle
               </label>
 
               <select
+                id="vehicle"
                 name="vehicleId"
                 required
                 defaultValue=""
@@ -2077,11 +2126,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="pickup">
                 Pickup
               </label>
 
               <input
+                id="pickup"
                 name="pickupAt"
                 type="datetime-local"
                 min={todayDateTime()}
@@ -2090,11 +2140,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="expected-return">
                 Expected return
               </label>
 
               <input
+                id="expected-return"
                 name="expectedReturnAt"
                 type="datetime-local"
                 min={todayDateTime()}
@@ -2103,11 +2154,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="pickup-location">
                 Pickup location
               </label>
 
               <input
+                id="pickup-location"
                 name="pickupLocation"
                 type="text"
                 maxLength={300}
@@ -2116,11 +2168,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="drop-off-location">
                 Drop-off location
               </label>
 
               <input
+                id="drop-off-location"
                 name="dropoffLocation"
                 type="text"
                 maxLength={300}
@@ -2155,29 +2208,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              {selectedCustomer?.email ? (
-                <p className="form-help">
-                  The rental agreement will be
-                  emailed automatically to{" "}
-                  {selectedCustomer.email} after
-                  the booking is confirmed.
-                </p>
-              ) : (
-                <p className="form-help">
-                  No customer email is available.
-                  The booking can still be
-                  confirmed, but the rental
-                  agreement cannot be emailed.
-                </p>
-              )}
-            </div>
-
-            <div className="field full">
-              <label>
+              <label htmlFor="booking-note">
                 Booking note
               </label>
 
               <textarea
+                id="booking-note"
                 name="notes"
               />
             </div>
@@ -2228,11 +2264,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="confirmed-booking">
                 Confirmed booking
               </label>
 
               <select
+                id="confirmed-booking"
                 name="reservationId"
                 required
                 defaultValue=""
@@ -2270,7 +2307,7 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="pickup-odometer">
                 Pickup odometer
               </label>
 
@@ -2284,6 +2321,7 @@ export function ReservationComposer() {
                 }}
               >
                 <input
+                  id="pickup-odometer"
                   name="pickupOdometerValue"
                   type="number"
                   min="0"
@@ -2309,11 +2347,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="pickup-fuel">
                 Pickup fuel
               </label>
 
               <select
+                id="pickup-fuel"
                 name="pickupFuelLevel"
               >
                 {fuelLevels.map(
@@ -2338,11 +2377,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="checkout-note">
                 Checkout note
               </label>
 
               <textarea
+                id="checkout-note"
                 name="notes"
               />
             </div>
@@ -2387,11 +2427,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="active-rental">
                 Active rental
               </label>
 
               <select
+                id="active-rental"
                 name="rentalId"
                 required
                 defaultValue=""
@@ -2431,11 +2472,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="new-expected-return">
                 New expected return
               </label>
 
               <input
+                id="new-expected-return"
                 name="expectedReturnAt"
                 type="datetime-local"
                 min={todayDateTime()}
@@ -2444,11 +2486,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="extension-note">
                 Extension note
               </label>
 
               <input
+                id="extension-note"
                 name="note"
                 minLength={1}
                 maxLength={500}
@@ -2496,11 +2539,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="active-rental-2">
                 Active rental
               </label>
 
               <select
+                id="active-rental-2"
                 name="rentalId"
                 required
                 defaultValue=""
@@ -2540,11 +2584,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="return-time">
                 Return time
               </label>
 
               <input
+                id="return-time"
                 name="actualReturnAt"
                 type="datetime-local"
                 defaultValue={todayDateTime()}
@@ -2553,7 +2598,7 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="return-odometer">
                 Return odometer
               </label>
 
@@ -2567,6 +2612,7 @@ export function ReservationComposer() {
                 }}
               >
                 <input
+                  id="return-odometer"
                   name="returnOdometerValue"
                   type="number"
                   min="0"
@@ -2592,11 +2638,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="return-fuel">
                 Return fuel
               </label>
 
               <select
+                id="return-fuel"
                 name="returnFuelLevel"
               >
                 {fuelLevels.map(
@@ -2621,11 +2668,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="adjustment">
                 Adjustment
               </label>
 
               <select
+                id="adjustment"
                 name="adjustmentType"
               >
                 <option value="fuel">
@@ -2655,11 +2703,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="amount-usd-optional">
                 Amount (USD, optional)
               </label>
 
               <input
+                id="amount-usd-optional"
                 name="adjustmentAmount"
                 type="number"
                 min="0.01"
@@ -2669,11 +2718,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="adjustment-note">
                 Adjustment note
               </label>
 
               <input
+                id="adjustment-note"
                 name="adjustmentNote"
                 maxLength={500}
               />
@@ -2694,11 +2744,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="return-note">
                 Return note
               </label>
 
               <textarea
+                id="return-note"
                 name="notes"
               />
             </div>
@@ -2743,11 +2794,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="rental">
                 Rental
               </label>
 
               <select
+                id="rental"
                 name="rentalId"
                 required
                 defaultValue=""
@@ -2788,11 +2840,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="amount-usd">
                 Amount (USD)
               </label>
 
               <input
+                id="amount-usd"
                 name="amount"
                 type="number"
                 min="0.01"
@@ -2804,11 +2857,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="method">
                 Method
               </label>
 
-              <select name="method">
+              <select
+                      id="method" name="method">
                 <option value="cash">
                   Cash
                 </option>
@@ -2876,11 +2930,12 @@ export function ReservationComposer() {
             </div>
 
             <div className="field full">
-              <label>
+              <label htmlFor="reference">
                 Reference
               </label>
 
               <input
+                id="reference"
                 name="reference"
                 maxLength={200}
               />

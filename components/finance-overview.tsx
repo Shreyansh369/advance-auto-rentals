@@ -104,15 +104,17 @@ export function FinanceOverview() {
   const [savingExpense, setSavingExpense] =
     useState(false);
 
-  const load = useCallback(
-    async () => {
-      if (role !== "admin") {
-        return;
-      }
+  const [reloadToken, setReloadToken] =
+    useState(0);
 
-      setLoading(true);
-      setError(undefined);
+  useEffect(() => {
+    if (role !== "admin") {
+      return;
+    }
 
+    let cancelled = false;
+
+    async function load() {
       try {
         const [
           overview,
@@ -150,6 +152,10 @@ export function FinanceOverview() {
           ),
         ]);
 
+        if (cancelled) {
+          return;
+        }
+
         setData(overview);
 
         setVehicles(
@@ -167,26 +173,38 @@ export function FinanceOverview() {
           ),
         );
       } catch (cause) {
-        setError(
-          firebaseErrorMessage(cause),
-        );
+        if (!cancelled) {
+          setError(
+            firebaseErrorMessage(cause),
+          );
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
-    },
-    [
-      from,
-      to,
-      role,
-      selectedVehicleId,
-    ],
-  );
-
-  useEffect(() => {
-    if (role === "admin") {
-      void load();
     }
-  }, [load, role]);
+
+    void load();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    from,
+    to,
+    role,
+    selectedVehicleId,
+    reloadToken,
+  ]);
+
+  const runReport = useCallback(() => {
+    setLoading(true);
+    setError(undefined);
+    setReloadToken(
+      (token) => token + 1,
+    );
+  }, []);
 
   async function addExpense(
     event: React.FormEvent<HTMLFormElement>,
@@ -291,7 +309,9 @@ export function FinanceOverview() {
        */
       formElement.reset();
 
-      await load();
+      setReloadToken(
+        (token) => token + 1,
+      );
     } catch (cause) {
       setError(
         firebaseErrorMessage(cause),
@@ -369,7 +389,7 @@ export function FinanceOverview() {
         <button
           type="button"
           className="button button-secondary compact"
-          onClick={() => void load()}
+          onClick={runReport}
           disabled={loading}
         >
           <RefreshCw
@@ -454,7 +474,7 @@ export function FinanceOverview() {
         <button
           type="button"
           className="button button-primary"
-          onClick={() => void load()}
+          onClick={runReport}
           disabled={loading}
         >
           Run report
@@ -597,11 +617,12 @@ export function FinanceOverview() {
             }
           >
             <div className="field">
-              <label>
+              <label htmlFor="vehicle">
                 Vehicle
               </label>
 
               <select
+                id="vehicle"
                 name="vehicleId"
                 defaultValue=""
                 required
@@ -628,11 +649,12 @@ export function FinanceOverview() {
 
             <div className="form-columns">
               <div className="field">
-                <label>
+                <label htmlFor="category">
                   Category
                 </label>
 
                 <select
+                  id="category"
                   name="category"
                   defaultValue="maintenance"
                 >
@@ -659,11 +681,12 @@ export function FinanceOverview() {
               </div>
 
               <div className="field">
-                <label>
+                <label htmlFor="amount-usd">
                   Amount (USD)
                 </label>
 
                 <input
+                  id="amount-usd"
                   name="amount"
                   type="number"
                   min="0.01"
@@ -677,11 +700,12 @@ export function FinanceOverview() {
 
             <div className="form-columns">
               <div className="field">
-                <label>
+                <label htmlFor="date">
                   Date
                 </label>
 
                 <input
+                  id="date"
                   name="occurredAt"
                   type="date"
                   defaultValue={toDateInput(
@@ -692,11 +716,12 @@ export function FinanceOverview() {
               </div>
 
               <div className="field">
-                <label>
+                <label htmlFor="vendor">
                   Vendor
                 </label>
 
                 <input
+                  id="vendor"
                   name="vendor"
                   maxLength={160}
                 />
@@ -704,11 +729,12 @@ export function FinanceOverview() {
             </div>
 
             <div className="field">
-              <label>
+              <label htmlFor="note">
                 Note
               </label>
 
               <input
+                id="note"
                 name="note"
                 minLength={1}
                 maxLength={1000}

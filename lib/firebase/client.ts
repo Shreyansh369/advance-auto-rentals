@@ -20,12 +20,6 @@ import {
 } from "firebase/firestore";
 
 import {
-  connectFunctionsEmulator,
-  getFunctions,
-  type Functions,
-} from "firebase/functions";
-
-import {
   connectStorageEmulator,
   getStorage,
   type FirebaseStorage,
@@ -43,7 +37,6 @@ export interface FirebaseClient {
   app: FirebaseApp;
   auth: Auth;
   db: Firestore;
-  functions: Functions;
   storage: FirebaseStorage;
   appCheck?: AppCheck;
 }
@@ -82,9 +75,6 @@ export function getFirebaseClient(): FirebaseClient {
 
   const db =
     getFirestore(app);
-
-  const functions =
-    getFunctions(app);
 
   const storage =
     getStorage(app);
@@ -139,12 +129,6 @@ export function getFirebaseClient(): FirebaseClient {
       8080,
     );
 
-    connectFunctionsEmulator(
-      functions,
-      "127.0.0.1",
-      5001,
-    );
-
     connectStorageEmulator(
       storage,
       "127.0.0.1",
@@ -159,7 +143,6 @@ export function getFirebaseClient(): FirebaseClient {
     app,
     auth,
     db,
-    functions,
     storage,
     ...(appCheck
       ? {
