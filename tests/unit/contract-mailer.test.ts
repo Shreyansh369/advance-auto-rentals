@@ -116,6 +116,7 @@ const snapshotFields = {
   },
 
   signedByNameSnapshot: "Riley",
+  signatureMethod: "drawn",
   signatureCapturedAt: "2026-09-01T09:30:00.000Z",
 };
 
@@ -156,6 +157,42 @@ describe("contract rendering", () => {
 
     expect(escapeHtml(`a"b'c&d`)).toBe(
       "a&quot;b&#39;c&amp;d",
+    );
+  });
+
+  it("says a typed acceptance was typed rather than signed", () => {
+    const drawn = readSnapshot(snapshotFields);
+
+    expect(contractText(drawn)).toContain(
+      "Signed by: Riley",
+    );
+
+    const typed = readSnapshot({
+      ...snapshotFields,
+      signatureMethod: "typed",
+    });
+
+    expect(contractText(typed)).toContain(
+      "Accepted by: Riley",
+    );
+
+    expect(contractText(typed)).not.toContain(
+      "Signed by:",
+    );
+
+    expect(contractHtml(typed)).toContain(
+      "Accepted by",
+    );
+  });
+
+  it("treats a booking taken before the option existed as drawn", () => {
+    const legacy = readSnapshot({
+      ...snapshotFields,
+      signatureMethod: null,
+    });
+
+    expect(legacy.signatureMethod).toBe(
+      "drawn",
     );
   });
 

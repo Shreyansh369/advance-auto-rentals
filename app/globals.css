@@ -5726,6 +5726,33 @@ canvas {
   font-size: 13px;
 }
 
+/* A typed acceptance stands where a drawn signature would,
+   but is set in the sheet's own face rather than imitating
+   handwriting. */
+.agreement-typed-signature {
+  margin: 0;
+  padding: 14px 0 6px;
+  color: var(--ink);
+  font-size: 21px;
+  overflow-wrap: anywhere;
+}
+
+/* Qualifier under a metric whose window differs from the
+   filter above it. */
+.metric-note {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.signature-mode {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .agreement-signature small {
   display: block;
   margin-top: 6px;

@@ -41,6 +41,7 @@ export type ContractSnapshot = {
     monthlyCents: number | null;
   };
   signedByNameSnapshot: string;
+  signatureMethod: "drawn" | "typed";
   signatureCapturedAt: string | null;
 };
 
@@ -164,6 +165,13 @@ export function readSnapshot(
     signedByNameSnapshot: text(
       fields.signedByNameSnapshot,
     ),
+
+    /* Bookings taken before the typed-name option existed
+       carry no method, and every one of those was drawn. */
+    signatureMethod:
+      fields.signatureMethod === "typed"
+        ? "typed"
+        : "drawn",
     signatureCapturedAt: optionalText(
       fields.signatureCapturedAt,
     ),
@@ -371,12 +379,16 @@ export function contractHtml(
 
     section("Agreement", [
       row(
-        "Signed by",
+        snapshot.signatureMethod === "typed"
+          ? "Accepted by"
+          : "Signed by",
         snapshot.signedByNameSnapshot ||
           snapshot.customer.fullName,
       ),
       row(
-        "Signed on",
+        snapshot.signatureMethod === "typed"
+          ? "Accepted on"
+          : "Signed on",
         formatMoment(
           snapshot.signatureCapturedAt,
         ),
@@ -442,11 +454,19 @@ export function contractText(
       snapshot.baseRentalCents,
     )}`,
     "",
-    `Signed by: ${
+    `${
+      snapshot.signatureMethod === "typed"
+        ? "Accepted by"
+        : "Signed by"
+    }: ${
       snapshot.signedByNameSnapshot ||
       snapshot.customer.fullName
     }`,
-    `Signed on: ${formatMoment(
+    `${
+      snapshot.signatureMethod === "typed"
+        ? "Accepted on"
+        : "Signed on"
+    }: ${formatMoment(
       snapshot.signatureCapturedAt,
     )}`,
     `Prepared by: ${snapshot.preparedBy}`,
