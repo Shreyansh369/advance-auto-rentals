@@ -11,13 +11,110 @@ photo and licence image), and **Google Cloud** (the same
 project as Firebase — it is what signs the Gmail send). There
 is no mail provider, no server and no other third party.
 
-Read the whole page before starting. Nothing here deletes
-anything from the old accounts, so a step that goes wrong can
+There are two ways to do this, and they are very different
+amounts of work.
+
+**Transferring the accounts** hands over what already exists.
+Nothing moves, nothing is rebuilt, nothing can be lost —
+because no data is copied anywhere. This is section A, and it
+is what you want unless there is a reason it will not do.
+
+**Migrating into new accounts** builds the system again under
+the client's own sign-ups and copies the data across. Use it
+only if the client insists on accounts they created
+themselves, or the developer's accounts hold other unrelated
+projects that cannot come along. This is section B, and it is
+several hours with real risk of losing something.
+
+Read the whole of whichever section applies before starting.
+Nothing here deletes anything, so a step that goes wrong can
 be repeated.
 
 ---
 
-## 0. Before you start
+# A. Transferring the accounts
+
+The short version: the client's email is made an owner of
+each account, they accept, then the developer removes
+themselves. Nothing is exported, imported or rebuilt.
+
+The project id does not change, so every `NEXT_PUBLIC_*`
+value stays as it is and **the site does not need rebuilding
+or redeploying**.
+
+## A1. Firebase (and the Google Cloud project with it)
+
+A Firebase project is owned through Google Cloud IAM, so
+handing it over means adding an owner and removing yourself.
+
+1. Firebase Console → the project → **⚙ Project settings →
+   Users and permissions**.
+2. **Add member**. Enter the client's Google account —
+   `advanceautobvi@gmail.com`. Role: **Owner**.
+3. The client accepts the invitation from the email Google
+   sends. Have them confirm the project is listed at
+   <https://console.firebase.google.com> under their account.
+4. **Only once they have confirmed**, remove the developer's
+   account from that same screen. Either of you can do it
+   while both are owners; doing it last means a mistake is
+   always recoverable.
+
+That moves everything in one step: Firestore and all its
+data, every staff sign-in with its UID intact, Hosting and
+the deployed site, the security rules, the Google Cloud
+project underneath, and the OAuth client the Gmail send uses.
+
+Notes:
+
+- The invited address has to be a Google account. A
+  `gmail.com` address is one.
+- On the Spark plan there is no billing account to detach.
+- Nobody's UID changes, so nothing is orphaned. This is the
+  main reason to prefer transferring.
+- Skip sections B2 to B5 entirely. Section 3 (Gmail) may
+  still need doing if it was never set up.
+
+## A2. Cloudinary
+
+Two routes; either is fine.
+
+**Change the email on the account.** In the Cloudinary
+console, under **Settings**, find the account or profile
+details and change the login email to the client's. They
+confirm it, set their own password, and the account is
+theirs — every image and every URL already stored in
+Firestore keeps working, because the cloud name never
+changed.
+
+**Or invite them and step out.** Under **Settings → Users**,
+invite the client's email with the highest role available,
+have them accept, then remove the developer's user. On the
+free tier the roles are limited; if you cannot grant them
+full control this way, use the email change instead.
+
+Either way `NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME` and
+`NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET` do not change, so the
+site does not need rebuilding.
+
+## A3. The repository
+
+If the client is to own the code as well: GitHub → the
+repository → **Settings → General → Danger Zone → Transfer
+ownership**. They need a GitHub account. If they only need
+the running site and not the source, skip this.
+
+## A4. Check, then stop
+
+Work through section 4 below. If it all passes, you are
+done — sections B and 0 do not apply.
+
+---
+
+# B. Migrating into new accounts
+
+Only if section A will not do.
+
+## B0. Before you start
 
 Take an export of the live data even if you are certain
 nothing will go wrong:
@@ -37,7 +134,7 @@ is not inside somebody's account.
 
 ---
 
-## 1. Cloudinary
+## B1. Cloudinary
 
 **Prefer transferring the account.** Cloudinary lets the owner
 email be changed, and doing so moves every image and leaves
@@ -81,9 +178,9 @@ images have to be copied across and the stored URLs rewritten:
 
 ---
 
-## 2. Firebase
+## B2. Firebase
 
-### 2.1 Create the project
+### B2.1 Create the project
 
 The client creates a Firebase project on the **Spark** (free)
 plan under their own Google account. Nothing here needs Blaze.
@@ -94,7 +191,7 @@ plan under their own Google account. Nothing here needs Blaze.
   **Google**. Google is what the Gmail send uses.
 - **Hosting** → enable.
 
-### 2.2 Deploy the rules first
+### B2.2 Deploy the rules first
 
 Deploy the security rules **before** importing any data, or
 the first thing the application does on the new project is
@@ -106,7 +203,7 @@ pnpm exec firebase deploy \
   --only firestore:rules,firestore:indexes
 ```
 
-### 2.3 Move the staff sign-ins
+### B2.3 Move the staff sign-ins
 
 Firebase's own tooling moves accounts with their password
 hashes intact, so nobody has to reset a password:
@@ -132,7 +229,7 @@ Account UIDs are preserved, which matters: every rental,
 audit entry and contract records the UID of the staff member
 who touched it, and a new UID would orphan all of it.
 
-### 2.4 Move the data
+### B2.4 Move the data
 
 ```bash
 # Dry run first — it writes nothing and reports what it would.
@@ -153,7 +250,7 @@ customers, rentals or reservations, so it cannot quietly merge
 two databases. Documents keep their ids, so a run that fails
 part way can simply be repeated.
 
-### 2.5 Point the application at it
+### B2.5 Point the application at it
 
 Take the web configuration from **Project settings → General →
 Your apps → Web app** and set it wherever the site is built:
@@ -183,6 +280,10 @@ pnpm exec firebase deploy \
 ```
 
 ---
+
+---
+
+# Both routes
 
 ## 3. Sending the agreement by Gmail
 
@@ -255,17 +356,20 @@ touched:
 
 ---
 
-## 5. Closing the old accounts
+## 5. Stepping away
 
-Only after section 4 is fully ticked, and leave a week or two
-between the two:
+Only after section 4 is fully ticked.
 
-1. Remove the developer from the client's Firebase project
-   (**Project settings → Users and permissions**) and from
-   Cloudinary.
-2. Delete the exported JSON and any service account keys.
-3. Delete the old Firebase project and, if a new Cloudinary
-   account was created, the old Cloudinary account.
+**If you transferred (section A):** remove the developer's
+account from **Project settings → Users and permissions** and
+from Cloudinary. There is nothing to delete — the accounts are
+the client's now, with their history intact.
+
+**If you migrated (section B):** leave a week or two before
+touching the old accounts, then delete the exported JSON and
+any service account keys, and finally delete the old Firebase
+project and — only if a new Cloudinary account was created —
+the old Cloudinary account.
 
 Deleting a Firebase project is reversible for 30 days. Deleting
 Cloudinary assets is not, so keep the old cloud until the
