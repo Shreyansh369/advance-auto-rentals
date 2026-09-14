@@ -2,6 +2,7 @@
 
 import {
   CheckCircle2,
+  ClipboardCopy,
   Mail,
   Printer,
   Send,
@@ -33,12 +34,14 @@ import {
   sendContractEmail,
 } from "@/lib/services/contract-mailer";
 
-import { CHARGE_ROWS } from "@/lib/agreement";
-
 import {
-  firebaseErrorMessage,
-  formatMoney,
-} from "@/lib/presentation";
+  agreementBody,
+  agreementSubject,
+  gmailComposeUrl,
+  mailtoUrl,
+} from "@/lib/contract-message";
+
+import { firebaseErrorMessage } from "@/lib/presentation";
 
 /** The hydration flag never changes, so there is nothing to subscribe to. */
 function subscribeToNothing(): () => void {
@@ -107,61 +110,6 @@ function statusTone(
     default:
       return "";
   }
-}
-
-/*
- * The agreement as plain text, for handing to the operator's
- * own mail client. It is built from the same stored contract
- * the printed sheet uses, so the customer receives the booking
- * as it was saved rather than as it was typed.
- */
-function agreementText(
-  agreement: RentalAgreementView,
-): string {
-  const lines = [
-    "ADVANCE AUTO RENTAL",
-    "Rental agreement",
-    "",
-    `Renter: ${agreement.renter.fullName}`,
-    `Telephone: ${
-      agreement.renter.telephone || "Not recorded"
-    }`,
-    `Licence: ${agreement.renter.licenceNumber} (${agreement.renter.licenceCountry})`,
-    "",
-    `Vehicle: ${agreement.vehicle.registration} - ${agreement.vehicle.make} ${agreement.vehicle.model}`.trim(),
-    `Date out: ${dateTime(agreement.dateOut)}`,
-    `Date in: ${dateTime(agreement.dateIn)}`,
-    "",
-  ];
-
-  for (const row of CHARGE_ROWS) {
-    const cents = agreement.charges[row.key];
-
-    if (cents) {
-      lines.push(
-        `${row.label}: ${formatMoney(cents)}`,
-      );
-    }
-  }
-
-  lines.push(
-    `TOTAL: ${formatMoney(
-      agreement.chargeTotalCents,
-    )}`,
-    "",
-    `${
-      agreement.customerSignatureMethod ===
-      "typed"
-        ? "Accepted by"
-        : "Signed by"
-    }: ${
-      agreement.customerSignatureName ||
-      agreement.renter.fullName
-    }`,
-    `Checked out by: ${agreement.checkedOutBy}`,
-  );
-
-  return lines.join("\n");
 }
 
 /*
@@ -376,39 +324,74 @@ export function RentalAgreement({
   }
 
   /*
-   * Sending through the mailer endpoint needs that endpoint
-   * deployed. Until it is — and as a fallback whenever it
-   * cannot be reached — the agreement can still be handed to
-   * whatever mail client the operator already has open. It
-   * costs no infrastructure and needs no Firebase plan.
+   * Sending through a provider needs a domain the business
+   * owns and an endpoint to keep the key on. Handing the
+   * finished message to the account the office already signs
+   * in to needs neither, and the renter receives it from the
+   * address they would reply to. Gmail opens in a new tab;
+   * the mail-app route hands the same message to whatever
+   * client is installed.
    */
-  function emailFromMailClient() {
+  function handToMailClient(
+    route: "gmail" | "app",
+  ) {
     if (!agreement) {
       return;
     }
 
-    const to =
-      agreement.renter.email ?? "";
+    const to = agreement.renter.email ?? "";
 
-    const subject = `Rental agreement ${agreement.rentalId} - ${agreement.vehicle.registration}`;
-
-    const href = `mailto:${encodeURIComponent(
-      to,
-    )}?subject=${encodeURIComponent(
-      subject,
-    )}&body=${encodeURIComponent(
-      agreementText(agreement),
-    )}`;
-
-    window.location.href = href;
+    if (route === "gmail") {
+      window.open(
+        gmailComposeUrl(agreement),
+        "_blank",
+        "noopener,noreferrer",
+      );
+    } else {
+      window.location.href =
+        mailtoUrl(agreement);
+    }
 
     setError(undefined);
 
+    const where =
+      route === "gmail"
+        ? "Gmail"
+        : "your mail app";
+
     setNotice(
       to
-        ? `Opening your mail app with the agreement addressed to ${to}. Send it from there, then print or save a copy for the file.`
-        : "Opening your mail app with the agreement. This customer has no email address on file, so add the recipient yourself.",
+        ? `Opening ${where} with the agreement addressed to ${to}. Attach the saved copy, then send it.`
+        : `Opening ${where} with the agreement. This customer has no email address on file, so add the recipient yourself.`,
     );
+  }
+
+  /*
+   * The printed copy is what the renter signs, so the operator
+   * saves it first and attaches it to the message.
+   */
+  async function copyAgreementText() {
+    if (!agreement) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(
+        `${agreementSubject(agreement)}\n\n${agreementBody(agreement)}`,
+      );
+
+      setError(undefined);
+
+      setNotice(
+        "The agreement was copied. Paste it into any message.",
+      );
+    } catch {
+      setNotice(undefined);
+
+      setError(
+        "The agreement could not be copied. Use Print to save a copy instead.",
+      );
+    }
   }
 
   function emailContract() {
@@ -595,21 +578,49 @@ export function RentalAgreement({
                 )}
 
               {status === "approved" && (
-                <button
-                  className={
-                    mailerConfigured
-                      ? "button button-secondary compact"
-                      : "button button-primary compact"
-                  }
-                  type="button"
-                  disabled={busy}
-                  onClick={
-                    emailFromMailClient
-                  }
-                >
-                  <Send size={15} />
-                  Send from my mail app
-                </button>
+                <>
+                  <button
+                    className={
+                      mailerConfigured
+                        ? "button button-secondary compact"
+                        : "button button-primary compact"
+                    }
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      handToMailClient(
+                        "gmail",
+                      )
+                    }
+                  >
+                    <Send size={15} />
+                    Send with Gmail
+                  </button>
+
+                  <button
+                    className="button button-secondary compact"
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      handToMailClient("app")
+                    }
+                  >
+                    <Mail size={15} />
+                    Send from my mail app
+                  </button>
+
+                  <button
+                    className="button button-secondary compact"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      void copyAgreementText();
+                    }}
+                  >
+                    <ClipboardCopy size={15} />
+                    Copy agreement
+                  </button>
+                </>
               )}
             </div>
           </div>
@@ -649,12 +660,13 @@ export function RentalAgreement({
             !mailerConfigured && (
               <p className="form-help">
                 Automatic delivery is not
-                configured in this deployment,
-                so “Send from my mail app”
-                opens the agreement in your own
-                email client instead. It can
-                also be printed or saved as a
-                PDF.
+                configured, so the agreement is
+                sent from the office&apos;s own
+                account: Print to save the
+                signed copy as a PDF, then
+                “Send with Gmail” to open a
+                message with everything filled
+                in and attach it.
               </p>
             )}
 

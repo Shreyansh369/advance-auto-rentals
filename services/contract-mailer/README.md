@@ -51,8 +51,34 @@ service account key to deploy, rotate or leak.
 | `IDENTITY_BASE_URL` | no | Override, for pointing the tests at the emulator. |
 | `RESEND_BASE_URL` | no | Override, for pointing the tests at a stub provider. |
 
-The sending domain has to be verified in Resend first, or
-every send comes back as a recorded failure.
+## Before this can send anything: the domain
+
+Resend's free tier covers 3,000 emails a month and 100 a day,
+which is far more than this business sends. The cost is not
+the obstacle. **The domain is.**
+
+Resend will only deliver to arbitrary recipients from a domain
+you have verified with DNS records. Until then an account can
+only send to its own address, so a customer never receives
+anything.
+
+A Gmail address cannot be verified: `gmail.com` is not yours,
+and no provider will let you send as it — Google's own
+anti-spoofing rules are what stop it. So
+`advanceautobvi@gmail.com` cannot be the sending address here,
+whatever provider is chosen.
+
+This endpoint is therefore worth switching on **only once the
+business owns a domain** (`advanceautobvi.com`, say) and has
+verified it in Resend. `CONTRACT_FROM_EMAIL` then becomes
+something like
+`Advance Auto Rental & Repairs <contracts@advanceautobvi.com>`
+and `CONTRACT_REPLY_TO` can still point at the Gmail address
+so replies land where the office already reads them.
+
+Until then, the agreement screen sends through the office's
+own Gmail account instead — see **Sending without a domain**
+below. Nothing needs to be deployed for that to work.
 
 ## Deploying
 
@@ -85,13 +111,52 @@ it leaves the page:
   the request.
 
 Leave `NEXT_PUBLIC_CONTRACT_MAILER_URL` unset and the feature
-stays switched off: the agreement screen says email delivery
-is not configured and offers print and save-as-PDF instead.
+stays switched off: the agreement screen sends through the
+office's own mail account instead.
+
+## Sending without a domain
+
+This is what the application does today, and it needs no
+provider, no domain, no deployment and no money.
+
+On an approved agreement the screen offers:
+
+- **Send with Gmail** — opens Gmail's compose window with the
+  customer's address, the subject and the filled-in agreement
+  already written. On a phone the Gmail app takes the link
+  over. The operator attaches the saved PDF and presses send.
+- **Send from my mail app** — the same message, handed to
+  whatever mail client is installed.
+- **Copy agreement** — the same text on the clipboard, for
+  WhatsApp or anything else.
+
+Because the message is sent from the office's own account, it
+arrives from the address the renter would reply to, and there
+is no deliverability question at all.
+
+The clauses are deliberately not in the body: fourteen of them
+do not fit in a compose URL, and the copy the renter signs is
+the printed one, which the operator attaches. `Print` on the
+same screen saves it as a PDF.
 
 ## Tests
 
 `tests/rules/contract-mailer.test.ts` exercises the whole
 path against the Firebase emulators with a stub provider: a
 real token, real rules, real REST reads and writes. Run it
-with `pnpm test:rules`. The rendering and configuration are
-covered by `tests/unit/contract-mailer.test.ts`.
+with `pnpm test:rules`.
+
+`tests/unit/contract-mailer-handler.test.ts` runs the whole
+endpoint with the identity toolkit, Firestore and the provider
+stubbed, and asserts what actually reaches the provider: the
+recipient, the subject, the filled-in form and all fourteen
+clauses, plus the receipt written for a success and for a
+refusal.
+
+`tests/unit/contract-mailer.test.ts` covers the rendering and
+the configuration, and compares this directory's copy of the
+agreement wording against `lib/agreement.ts` — the two are not
+allowed to drift.
+
+`tests/unit/contract-message.test.ts` covers the Gmail and
+mail-app messages the browser builds.
