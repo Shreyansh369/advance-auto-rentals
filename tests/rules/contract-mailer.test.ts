@@ -139,6 +139,9 @@ function snapshotFor(reservationId: string) {
       telephone: "+1 555 0100",
       email: "riley@example.test",
       address: "12 Harbour Road",
+      state: "Tortola",
+      localAddress: null,
+      dateOfBirth: "1990-04-02",
       licenceNumber: "D1234567",
       licenceCountry: "US",
       licenceExpiresAt: "2030-01-01",
@@ -159,16 +162,43 @@ function snapshotFor(reservationId: string) {
     dropoffLocation: "Airport terminal",
     notes: null,
     preparedBy: "Sam Operations",
-    chargedDays: 2,
-    baseRentalCents: 16000,
+    rentalId: "mailer_rental",
 
-    rateSnapshot: {
-      dailyCents: 8000,
-      weeklyCents: null,
-      monthlyCents: null,
+    /* What checkout captured, as `reviewContract` freezes it
+       onto the approved version. */
+    agreement: {
+      dateOut: "2026-09-10T14:00:00.000Z",
+      dateIn: "2026-09-12T14:00:00.000Z",
+      actualTimeIn: null,
+      odometerOut: { value: 42000, unit: "km" },
+      odometerIn: null,
+      gasOut: "quarter",
+      gasIn: null,
+      extraHours: 0,
+      depositCents: 30000,
+
+      waivers: {
+        liabilityWaiver: true,
+        windscreenWaiver: false,
+        personalAccidentInsurance: false,
+      },
+
+      charges: {
+        daily: 16000,
+        detailing: 12000,
+      },
+
+      chargeTotalCents: 28000,
+      paymentMethod: "credit",
+      paymentReferenceLast4: "4242",
+      paymentHolderName: "Riley Customer",
+      specialInstructions: null,
+      additionalDriver: null,
+      checkedOutBy: "Sam Operations",
     },
 
     signedByNameSnapshot: "Riley Customer",
+    signatureMethod: "typed",
     signatureCapturedAt: "2026-09-01T09:30:00.000Z",
   };
 }
@@ -376,9 +406,19 @@ describe("contract mailer endpoint", () => {
 
     /* The money in the email is the approved figure, not the
        one the request tried to substitute. */
-    expect(sent.text).toContain("$160.00");
-    expect(sent.html).toContain("$160.00");
+    expect(sent.text).toContain("Daily: $160.00");
+    expect(sent.text).toContain("TOTAL: $280.00");
+    expect(sent.html).toContain("$280.00");
     expect(sent.html).toContain("RT-900");
+
+    /* It is the client's form that goes out, filled in. */
+    expect(sent.text).toContain("KM out: 42000 km");
+    expect(sent.text).toContain("Deposit: $300.00");
+    expect(sent.text).toContain("**** 4242");
+
+    expect(sent.text).toContain(
+      "Accepted by: Riley Customer",
+    );
 
     const records = await deliveries(RESERVATION);
 

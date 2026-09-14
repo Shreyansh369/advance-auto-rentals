@@ -2706,6 +2706,150 @@ const PAYMENT_METHODS = [
  * a document the renter signs: an undefined or a stray string
  * would show up as a blank on a legal form.
  */
+/*
+ * What an approved contract records of the agreement the
+ * renter signed at checkout. The signature images are left
+ * on the rental: repeating two 400 KB data URLs in every
+ * approved version would push the document towards the
+ * Firestore size limit for no gain, so the snapshot keeps
+ * who accepted it and how.
+ */
+function approvedAgreementSnapshot(
+  rental: Record<string, unknown>,
+): Record<string, unknown> {
+  const agreement = (rental.agreement ??
+    {}) as Record<string, unknown>;
+
+  const waiverInput = (agreement.waivers ??
+    {}) as Record<string, unknown>;
+
+  const chargeInput = (agreement.charges ??
+    {}) as Record<string, unknown>;
+
+  const driver = (agreement.additionalDriver ??
+    null) as Record<string, unknown> | null;
+
+  const waivers: Record<string, boolean> = {};
+
+  for (const key of WAIVER_KEYS) {
+    waivers[key] = waiverInput[key] === true;
+  }
+
+  const charges: Record<string, number> = {};
+
+  let chargeTotalCents = 0;
+
+  for (const key of CHARGE_KEYS) {
+    const cents = Number(
+      chargeInput[key] ?? 0,
+    );
+
+    charges[key] = Number.isFinite(cents)
+      ? cents
+      : 0;
+
+    chargeTotalCents += charges[key];
+  }
+
+  return {
+    dateOut: toIso(rental.pickupAt),
+
+    dateIn: toIso(rental.expectedReturnAt),
+
+    actualTimeIn:
+      rental.actualReturnAt == null
+        ? null
+        : toIso(rental.actualReturnAt),
+
+    odometerOut:
+      rental.pickupOdometerValue == null
+        ? null
+        : {
+            value: Number(
+              rental.pickupOdometerValue,
+            ),
+            unit: String(
+              rental.pickupOdometerUnit ?? "km",
+            ),
+          },
+
+    odometerIn:
+      rental.returnOdometerValue == null
+        ? null
+        : {
+            value: Number(
+              rental.returnOdometerValue,
+            ),
+            unit: String(
+              rental.returnOdometerUnit ?? "km",
+            ),
+          },
+
+    gasOut: fuelToGas(rental.pickupFuelLevel),
+
+    gasIn: fuelToGas(rental.returnFuelLevel),
+
+    extraHours: Number(
+      agreement.extraHours ?? 0,
+    ),
+
+    depositCents: Number(
+      agreement.depositCents ?? 0,
+    ),
+
+    waivers,
+
+    charges,
+
+    chargeTotalCents,
+
+    paymentMethod: trimmedOrNull(
+      agreement.paymentMethod,
+    ),
+
+    paymentReferenceLast4: trimmedOrNull(
+      agreement.paymentReferenceLast4,
+    ),
+
+    paymentHolderName: trimmedOrNull(
+      agreement.paymentHolderName,
+    ),
+
+    specialInstructions: trimmedOrNull(
+      rental.checkoutNotes,
+    ),
+
+    additionalDriver: driver
+      ? {
+          fullName: String(
+            driver.fullName ?? "",
+          ),
+          address: trimmedOrNull(driver.address),
+          state: trimmedOrNull(driver.state),
+          localAddress: trimmedOrNull(
+            driver.localAddress,
+          ),
+          dateOfBirth: trimmedOrNull(
+            driver.dateOfBirth,
+          ),
+          licenceNumber: trimmedOrNull(
+            driver.licenceNumber,
+          ),
+          licenceExpiresAt: trimmedOrNull(
+            driver.licenceExpiresAt,
+          ),
+          telephone: trimmedOrNull(
+            driver.telephone,
+          ),
+        }
+      : null,
+
+    checkedOutBy: String(
+      rental.checkedOutByNameSnapshot ?? "",
+    ),
+  };
+}
+
 function agreementRecord(
   input: Partial<AgreementInput>,
 ): Record<string, unknown> {
@@ -6842,30 +6986,53 @@ async function reviewContract(
           updatedAt: nowTimestamp(),
         });
       } else {
-        const [customerSnapshot, vehicleSnapshot] =
-          await Promise.all([
-            transaction.get(
-              doc(
-                db,
-                "customers",
-                String(reservation.customerId),
-              ),
-            ),
+        /*
+         * The agreement is issued at checkout and lives on
+         * the rental, so the approved snapshot has to be
+         * taken from there. Without it the emailed copy
+         * would carry the booking's bare details and none of
+         * what the renter actually signed.
+         */
+        const rentalId = trimmedOrNull(
+          existing.get("rentalId"),
+        );
 
-            transaction.get(
-              doc(
-                db,
-                "vehicles",
-                String(reservation.vehicleId),
-              ),
+        const [
+          customerSnapshot,
+          vehicleSnapshot,
+          rentalSnapshot,
+        ] = await Promise.all([
+          transaction.get(
+            doc(
+              db,
+              "customers",
+              String(reservation.customerId),
             ),
-          ]);
+          ),
+
+          transaction.get(
+            doc(
+              db,
+              "vehicles",
+              String(reservation.vehicleId),
+            ),
+          ),
+
+          rentalId
+            ? transaction.get(
+                doc(db, "rentals", rentalId),
+              )
+            : Promise.resolve(null),
+        ]);
 
         const customer =
           customerSnapshot.data() ?? {};
 
         const vehicle =
           vehicleSnapshot.data() ?? {};
+
+        const rental =
+          rentalSnapshot?.data() ?? {};
 
         const rateSnapshot = (reservation.rateSnapshot ??
           {}) as Record<string, unknown>;
@@ -6918,6 +7085,18 @@ async function reviewContract(
 
               licenceExpiresAt: trimmedOrNull(
                 customer.licenceExpiresAt,
+              ),
+
+              state: trimmedOrNull(
+                customer.state,
+              ),
+
+              localAddress: trimmedOrNull(
+                customer.localAddress,
+              ),
+
+              dateOfBirth: trimmedOrNull(
+                customer.dateOfBirth,
               ),
             },
 
@@ -7002,33 +7181,43 @@ async function reviewContract(
                     ),
             },
 
+            rentalId,
+
             /*
-             * The signature image itself stays on the
-             * reservation. Repeating a 400 KB data URL in
-             * every approved version would put the document
-             * close to the Firestore size limit for no gain,
-             * so the snapshot records who signed and when.
+             * Everything the renter actually signed for:
+             * readings, gas, waivers, deposit, payment and
+             * the charge table, as the printed form shows
+             * them.
              */
+            agreement:
+              approvedAgreementSnapshot(rental),
+
             signedByNameSnapshot: String(
-              reservation.customerSignatureName ??
+              (
+                (rental.agreement ??
+                  {}) as Record<string, unknown>
+              ).customerSignatureName ??
                 customer.fullName ??
                 reservation.customerNameSnapshot ??
                 "",
             ),
 
             signatureMethod:
-              reservation.customerSignatureMethod ===
+              (
+                (rental.agreement ??
+                  {}) as Record<string, unknown>
+              ).customerSignatureMethod ===
               "typed"
                 ? "typed"
                 : "drawn",
 
+            /* The rental is created by the checkout that
+               took the signature, so its creation is when
+               the renter accepted. */
             signatureCapturedAt:
-              reservation.customerSignatureCapturedAt ==
-              null
+              rental.createdAt == null
                 ? null
-                : toIso(
-                    reservation.customerSignatureCapturedAt,
-                  ),
+                : toIso(rental.createdAt),
           },
         );
 
