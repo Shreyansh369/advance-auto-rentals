@@ -44,14 +44,14 @@ The supplied `Deploy` workflow is manual-only and uses protected GitHub environm
 
 ## Contract email
 
-Emailing an approved agreement is optional and off until it is configured. It runs on a separate serverless deployment, `services/contract-mailer/`, because the mail provider's API key must never reach a browser.
+Emailing an approved agreement needs no deployment of its own. The browser renders the agreement to a PDF and posts it to the Gmail API as the signed-in employee, so there is no provider, no sending domain and no key.
 
-1. Verify the sending domain in Resend and create an API key.
-2. Deploy `services/contract-mailer` (Vercel, Netlify, Cloudflare Workers and Deno Deploy all accept the handler as it stands; only `api/send-contract.ts` is platform-specific).
-3. Set `FIREBASE_PROJECT_ID`, `FIREBASE_API_KEY` (the public web key), `RESEND_API_KEY`, `CONTRACT_FROM_EMAIL` and `CONTRACT_MAILER_ALLOWED_ORIGINS` on that deployment.
-4. Set `NEXT_PUBLIC_CONTRACT_MAILER_URL` on the web build, add the mailer origin to the `connect-src` directive in `firebase.json`, and redeploy hosting.
+Two things must be on for it to work, both in the Firebase project's own Google Cloud project:
 
-Miss step 4 and the browser is blocked before the request leaves the page — by CORS if the origin is not allowed, by the Content-Security-Policy if `connect-src` was not extended. Leave `NEXT_PUBLIC_CONTRACT_MAILER_URL` unset and the agreement screen simply says email delivery is not configured and offers print and save-as-PDF. Full details are in `services/contract-mailer/README.md`.
+1. **Google sign-in** enabled as a Firebase Authentication provider.
+2. **The Gmail API** enabled, and the OAuth consent screen configured with the `https://www.googleapis.com/auth/gmail.send` scope. While the consent screen is unverified, add each member of staff as a test user; they will see Google's "unverified app" notice once per grant and can continue past it.
+
+`connect-src` in `firebase.json` already allows `https://*.googleapis.com`, which covers the send. Staff who do not sign in with Google can still use **Save PDF** and send the agreement themselves. Full details, including what to do at handover, are in `docs/handover.md`.
 
 ## Release checks
 

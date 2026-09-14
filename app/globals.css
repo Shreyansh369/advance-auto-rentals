@@ -6227,7 +6227,11 @@ canvas {
   text-transform: uppercase;
 }
 
-@media (max-width: 900px) {
+/* The paper form is two columns, and so is the printed and
+   emailed copy. A4 is about 794px wide, so the collapse has
+   to sit well below that or every printout comes out as one
+   long column that looks nothing like the form. */
+@media (max-width: 700px) {
   .sheet-renters,
   .sheet-columns,
   .sheet-signatures {

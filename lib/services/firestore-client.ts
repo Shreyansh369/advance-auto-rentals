@@ -10,6 +10,7 @@ import {
   query,
   runTransaction,
   serverTimestamp,
+  setDoc,
   startAfter,
   Timestamp,
   where,
@@ -6476,6 +6477,99 @@ function contractStatusOf(
     : "not_submitted";
 }
 
+/*
+ * Records that the agreement was emailed.
+ *
+ * The send now happens in the browser, through the operator's
+ * own Gmail account, so the receipt is written here rather
+ * than by a server. It is append-only under the rules: a
+ * delivery can be added and read, never edited or removed, so
+ * the record of what went to a renter cannot be quietly
+ * rewritten afterwards.
+ */
+async function recordContractDelivery(
+  input: {
+    reservationId: string;
+    recipientEmail: string;
+    recipientNameSnapshot: string;
+    contractVersion: number;
+    providerMessageId: string;
+    sentFrom: string | null;
+  },
+): Promise<{ deliveryId: string }> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const reservationId = trimmedOrNull(
+    input.reservationId,
+  );
+
+  if (!reservationId) {
+    throw new Error(
+      "A booking reference is required.",
+    );
+  }
+
+  const recipientEmail = trimmedOrNull(
+    input.recipientEmail,
+  );
+
+  if (!recipientEmail) {
+    throw new Error(
+      "A recipient address is required.",
+    );
+  }
+
+  const reference = doc(
+    collection(
+      db,
+      "reservationContracts",
+      reservationId,
+      "deliveries",
+    ),
+  );
+
+  await setDoc(reference, {
+    reservationId,
+
+    provider: "gmail",
+
+    status: "sent",
+
+    recipientEmail,
+
+    recipientNameSnapshot: String(
+      input.recipientNameSnapshot ?? "",
+    ),
+
+    contractVersion: Number(
+      input.contractVersion ?? 0,
+    ),
+
+    providerMessageId: trimmedOrNull(
+      input.providerMessageId,
+    ),
+
+    /* Which mailbox it actually left from, which is not
+       necessarily the account signed in to the desk. */
+    sentFromEmail: trimmedOrNull(input.sentFrom),
+
+    sentBy: actorUid,
+
+    sentByNameSnapshot:
+      await signedInAccountName(actorUid),
+
+    failureReason: null,
+
+    sentAt: nowTimestamp(),
+
+    createdAt: nowTimestamp(),
+  });
+
+  return { deliveryId: reference.id };
+}
+
 async function getContractWorkflow(
   input: { reservationId: string },
 ): Promise<ContractWorkflow> {
@@ -7506,6 +7600,20 @@ export async function callFirestoreOperation<
           data as {
             customerId?: string | null;
             limit?: number;
+          },
+        )) as TResult
+      );
+
+    case "recordContractDelivery":
+      return (
+        (await recordContractDelivery(
+          data as {
+            reservationId: string;
+            recipientEmail: string;
+            recipientNameSnapshot: string;
+            contractVersion: number;
+            providerMessageId: string;
+            sentFrom: string | null;
           },
         )) as TResult
       );

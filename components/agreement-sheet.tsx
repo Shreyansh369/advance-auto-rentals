@@ -692,9 +692,7 @@ export function AgreementSheet({
 
           <div>
             <div className="sheet-signature-line">
-              <span>
-                {agreement.checkedOutBy}
-              </span>
+              <span>{COMPANY.owner}</span>
             </div>
 
             <small>OWNER SIGNATURE</small>

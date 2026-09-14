@@ -9,4 +9,7 @@ allowBuilds:
   re2: true
   unrs-resolver: true
   onlyBuiltDependencies:
-  - re2
+    - re2
+  # Its only build step prints a funding notice; jsPDF ships its
+  # own polyfills and does not need it to run.
+  core-js: false

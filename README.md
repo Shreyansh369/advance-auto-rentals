@@ -9,7 +9,7 @@ Secure operations software for Advance Auto Rentals. It is a separate applicatio
 - Transactional reservation, checkout, extension, return, pricing and payment workflows that run in the browser against Firestore, so no Blaze-plan Cloud Functions are required
 - Cloudinary media capture for vehicle condition photos, fleet photos and driver's licence images
 - Printable rental agreement rebuilt from the stored booking, with an employee review workflow — submit, approve or reject, then email — and an immutable snapshot of what was approved
-- Optional contract email through a separate serverless endpoint (`services/contract-mailer/`) so the mail provider's key never reaches the browser
+- The approved rental agreement emailed as a PDF from the operator's own Gmail account, so there is no mail provider, no domain to verify and no key to keep
 - Append-only audit and financial ledger records
 - Spreadsheet import that defaults to dry-run and produces a validation report
 - Emulator configuration, security-rule tests, unit tests, CI, and deployment/recovery documentation
@@ -46,3 +46,5 @@ pnpm verify
 ```
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), and [`docs/deployment.md`](docs/deployment.md).
+
+To move the application onto the client's own Firebase and Cloudinary accounts, follow [`docs/handover.md`](docs/handover.md) — it covers the data, the staff sign-ins, the images and the Gmail permission, in the order they have to happen.

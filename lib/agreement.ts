@@ -16,6 +16,14 @@ export const COMPANY = {
   email: "advanceautobvi@gmail.com",
   address:
     "P.O. Box 4396 Road Town, Tortola, VG1110, BVI",
+
+  /*
+   * The owner the agreement is made with. The form's OWNER
+   * SIGNATURE line is his, not the clerk's: whoever handed
+   * the keys over is recorded separately as who checked the
+   * vehicle out.
+   */
+  owner: "Kendell Parsons",
 } as const;
 
 /** Charge defaults, taken from the terms overleaf. */

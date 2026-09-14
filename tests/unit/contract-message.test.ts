@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   agreementBody,
   agreementSubject,
-  gmailComposeUrl,
   mailtoUrl,
 } from "../../lib/contract-message";
 
@@ -134,43 +133,6 @@ describe("the agreement handed to the office's own mail account", () => {
     );
   });
 
-  /*
-   * The message travels in a URL, so a body that outgrows one
-   * would be silently truncated by the mail client. The form
-   * without the clauses stays well inside what Gmail accepts.
-   */
-  it("stays short enough to survive a compose URL", () => {
-    expect(
-      gmailComposeUrl(agreement).length,
-    ).toBeLessThan(8000);
-  });
-
-  it("addresses Gmail's compose window to the renter", () => {
-    const url = new URL(
-      gmailComposeUrl(agreement),
-    );
-
-    expect(url.origin).toBe(
-      "https://mail.google.com",
-    );
-
-    expect(url.searchParams.get("view")).toBe(
-      "cm",
-    );
-
-    expect(url.searchParams.get("to")).toBe(
-      "riley@example.test",
-    );
-
-    expect(url.searchParams.get("su")).toBe(
-      agreementSubject(agreement),
-    );
-
-    expect(url.searchParams.get("body")).toBe(
-      agreementBody(agreement),
-    );
-  });
-
   it("leaves the recipient blank when the customer has no address", () => {
     const anonymous = {
       ...agreement,
@@ -180,12 +142,6 @@ describe("the agreement handed to the office's own mail account", () => {
         email: null,
       },
     } as RentalAgreementView;
-
-    expect(
-      new URL(
-        gmailComposeUrl(anonymous),
-      ).searchParams.get("to"),
-    ).toBe("");
 
     expect(
       mailtoUrl(anonymous).startsWith("mailto:?"),

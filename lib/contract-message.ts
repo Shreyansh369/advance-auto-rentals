@@ -11,19 +11,17 @@ import { formatMoney } from "@/lib/presentation";
 import type { RentalAgreementView } from "@/lib/services/firestore-client";
 
 /*
- * The agreement as an email the office sends itself.
+ * The message the agreement travels in.
  *
- * Sending through a provider needs a domain the business owns
- * and an endpoint to keep the key on. Handing the finished
- * message to the account the office already has needs
- * neither, costs nothing, and the renter gets it from the
- * address they would reply to anyway — so this is the route
- * that works on the day it is installed.
+ * Sending through a provider would need a domain the business
+ * owns and a key kept on a server. Sending as the operator
+ * needs neither, costs nothing, and the renter gets it from
+ * the address they would reply to anyway.
  *
- * The body is the filled-in form. The terms are not repeated
- * in it: fourteen clauses do not survive a URL, and the copy
- * the renter signs is the printed one, which the operator
- * attaches.
+ * The body is the filled-in form, short enough to read in a
+ * mail client without scrolling. The clauses are not repeated
+ * here: the whole agreement, terms included, is the PDF
+ * attached to the message.
  */
 function moment(value: string | null): string {
   if (!value) {
@@ -215,26 +213,10 @@ export function agreementBody(
 }
 
 /*
- * Gmail's compose window, opened with the message already
- * written. `view=cm` is the compose view and `fs=1` makes it
- * a full window rather than a docked panel; on a phone the
- * Gmail app takes the link over from the browser.
+ * The same message for whatever mail client is installed, for
+ * a staff account that does not sign in with Google. The PDF
+ * is saved separately and attached by hand on this route.
  */
-export function gmailComposeUrl(
-  agreement: RentalAgreementView,
-): string {
-  const params = new URLSearchParams({
-    view: "cm",
-    fs: "1",
-    to: agreement.renter.email ?? "",
-    su: agreementSubject(agreement),
-    body: agreementBody(agreement),
-  });
-
-  return `https://mail.google.com/mail/?${params.toString()}`;
-}
-
-/** The same message, for whatever mail client is installed. */
 export function mailtoUrl(
   agreement: RentalAgreementView,
 ): string {

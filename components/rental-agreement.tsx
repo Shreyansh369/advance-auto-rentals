@@ -2,7 +2,7 @@
 
 import {
   CheckCircle2,
-  ClipboardCopy,
+  FileDown,
   Mail,
   Printer,
   Send,
@@ -14,6 +14,7 @@ import { createPortal } from "react-dom";
 
 import {
   useEffect,
+  useRef,
   useState,
   useSyncExternalStore,
 } from "react";
@@ -30,14 +31,18 @@ import {
 } from "@/lib/services/firestore-client";
 
 import {
-  contractMailerConfigured,
-  sendContractEmail,
-} from "@/lib/services/contract-mailer";
+  agreementFilename,
+  agreementPdf,
+} from "@/lib/agreement-pdf";
+
+import {
+  GmailSendError,
+  sendAgreementByGmail,
+} from "@/lib/services/gmail-sender";
 
 import {
   agreementBody,
   agreementSubject,
-  gmailComposeUrl,
   mailtoUrl,
 } from "@/lib/contract-message";
 
@@ -144,6 +149,9 @@ export function RentalAgreement({
   const [reviewNote, setReviewNote] =
     useState("");
 
+  const sheetRef =
+    useRef<HTMLDivElement>(null);
+
   /*
    * Every decision rewrites the workflow record, so the panel
    * is re-read from Firestore afterwards instead of being
@@ -223,9 +231,6 @@ export function RentalAgreement({
     workflow?.status ?? "not_submitted";
 
   const isAdmin = role === "admin";
-
-  const mailerConfigured =
-    contractMailerConfigured();
 
   const recipientEmail =
     agreement?.renter.email ?? null;
@@ -324,85 +329,209 @@ export function RentalAgreement({
   }
 
   /*
-   * Sending through a provider needs a domain the business
-   * owns and an endpoint to keep the key on. Handing the
-   * finished message to the account the office already signs
-   * in to needs neither, and the renter receives it from the
-   * address they would reply to. Gmail opens in a new tab;
-   * the mail-app route hands the same message to whatever
-   * client is installed.
+   * Sends the agreement, as a PDF, from the operator's own
+   * Gmail account.
+   *
+   * The PDF is captured from the sheet already rendered
+   * below, so what the renter receives is the sheet the
+   * office prints — nobody saves a file and attaches it by
+   * hand, and the two cannot fall out of step.
    */
-  function handToMailClient(
-    route: "gmail" | "app",
-  ) {
-    if (!agreement) {
+  function sendWithGmail() {
+    const sheet = sheetRef.current;
+
+    if (!agreement || !sheet) {
       return;
     }
 
     const to = agreement.renter.email ?? "";
 
-    if (route === "gmail") {
-      window.open(
-        gmailComposeUrl(agreement),
-        "_blank",
-        "noopener,noreferrer",
+    if (!to) {
+      setNotice(undefined);
+
+      setError(
+        "This customer has no email address on file. Add one on the customers screen and try again.",
       );
-    } else {
-      window.location.href =
-        mailtoUrl(agreement);
+
+      return;
     }
 
+    setBusy(true);
     setError(undefined);
+    setNotice("Preparing the agreement...");
 
-    const where =
-      route === "gmail"
-        ? "Gmail"
-        : "your mail app";
+    void (async () => {
+      try {
+        const pdf = await agreementPdf(
+          sheet,
+          agreement,
+        );
 
-    setNotice(
-      to
-        ? `Opening ${where} with the agreement addressed to ${to}. Attach the saved copy, then send it.`
-        : `Opening ${where} with the agreement. This customer has no email address on file, so add the recipient yourself.`,
-    );
+        setNotice(
+          `Sending to ${to}. Accept the Google request if you are asked.`,
+        );
+
+        const sent =
+          await sendAgreementByGmail({
+            to,
+            subject:
+              agreementSubject(agreement),
+            body: agreementBody(agreement),
+
+            attachment: {
+              filename: pdf.filename,
+              base64: pdf.base64,
+            },
+          });
+
+        /*
+         * The receipt is written after the send, never
+         * before: a record of a message that never left
+         * would be worse than no record at all.
+         */
+        try {
+          await callFirestoreOperation<
+            {
+              reservationId: string;
+              recipientEmail: string;
+              recipientNameSnapshot: string;
+              contractVersion: number;
+              providerMessageId: string;
+              sentFrom: string | null;
+            },
+            { deliveryId: string }
+          >("recordContractDelivery", {
+            reservationId:
+              agreement.reservationId,
+            recipientEmail: to,
+
+            recipientNameSnapshot:
+              agreement.renter.fullName,
+
+            contractVersion:
+              workflow?.approvedVersion ??
+              workflow?.version ??
+              0,
+
+            providerMessageId: sent.messageId,
+            sentFrom: sent.sentFrom,
+          });
+        } catch {
+          /* The renter has the agreement; only the receipt
+             failed. Say so rather than implying the send
+             did not happen. */
+          setNotice(
+            `Sent to ${to}, but the delivery could not be recorded against the contract.`,
+          );
+
+          setReloadToken(
+            (token) => token + 1,
+          );
+
+          return;
+        }
+
+        setNotice(
+          `Agreement sent to ${to} from ${
+            sent.sentFrom ?? "your Google account"
+          }, with the PDF attached.`,
+        );
+
+        setReloadToken((token) => token + 1);
+      } catch (cause) {
+        setNotice(undefined);
+
+        setError(
+          cause instanceof GmailSendError
+            ? cause.message
+            : firebaseErrorMessage(cause),
+        );
+      } finally {
+        setBusy(false);
+      }
+    })();
   }
 
   /*
-   * The printed copy is what the renter signs, so the operator
-   * saves it first and attaches it to the message.
+   * When Gmail is not an option — a staff member signed in
+   * without a Google account, say — the same message can go
+   * out through whatever mail client is installed, with the
+   * PDF saved alongside it to attach.
    */
-  async function copyAgreementText() {
+  function sendFromMailApp() {
     if (!agreement) {
       return;
     }
 
-    try {
-      await navigator.clipboard.writeText(
-        `${agreementSubject(agreement)}\n\n${agreementBody(agreement)}`,
-      );
+    window.location.href =
+      mailtoUrl(agreement);
 
-      setError(undefined);
+    setError(undefined);
 
-      setNotice(
-        "The agreement was copied. Paste it into any message.",
-      );
-    } catch {
-      setNotice(undefined);
-
-      setError(
-        "The agreement could not be copied. Use Print to save a copy instead.",
-      );
-    }
+    setNotice(
+      "Opening your mail app with the agreement. Use “Save PDF” to attach the signed copy.",
+    );
   }
 
-  function emailContract() {
-    void run(async () => {
-      const result =
-        await sendContractEmail(
-          agreement?.reservationId ?? "",
+  /* The PDF on its own, for filing or for attaching by hand. */
+  function saveAgreementPdf() {
+    const sheet = sheetRef.current;
+
+    if (!agreement || !sheet) {
+      return;
+    }
+
+    setBusy(true);
+    setError(undefined);
+    setNotice("Preparing the agreement...");
+
+    void (async () => {
+      try {
+        const pdf = await agreementPdf(
+          sheet,
+          agreement,
         );
 
-      return `Agreement emailed to ${result.recipientEmail}.`;
-    });
+        const blob = new Blob(
+          [
+            Uint8Array.from(
+              atob(pdf.base64),
+              (character) =>
+                character.charCodeAt(0),
+            ),
+          ],
+          { type: "application/pdf" },
+        );
+
+        const href =
+          URL.createObjectURL(blob);
+
+        const link =
+          document.createElement("a");
+
+        link.href = href;
+
+        link.download = agreementFilename(
+          agreement,
+        );
+
+        link.click();
+
+        URL.revokeObjectURL(href);
+
+        setNotice(
+          `Saved as ${link.download}.`,
+        );
+      } catch (cause) {
+        setNotice(undefined);
+
+        setError(
+          firebaseErrorMessage(cause),
+        );
+      } finally {
+        setBusy(false);
+      }
+    })();
   }
 
   if (!hydrated) {
@@ -559,39 +688,15 @@ export function RentalAgreement({
                   </>
                 )}
 
-              {status === "approved" &&
-                mailerConfigured && (
+              {status === "approved" && (
+                <>
                   <button
                     className="button button-primary compact"
                     type="button"
                     disabled={
-                      busy ||
-                      !recipientEmail
+                      busy || !recipientEmail
                     }
-                    onClick={
-                      emailContract
-                    }
-                  >
-                    <Mail size={15} />
-                    Email to customer
-                  </button>
-                )}
-
-              {status === "approved" && (
-                <>
-                  <button
-                    className={
-                      mailerConfigured
-                        ? "button button-secondary compact"
-                        : "button button-primary compact"
-                    }
-                    type="button"
-                    disabled={busy}
-                    onClick={() =>
-                      handToMailClient(
-                        "gmail",
-                      )
-                    }
+                    onClick={sendWithGmail}
                   >
                     <Send size={15} />
                     Send with Gmail
@@ -601,24 +706,20 @@ export function RentalAgreement({
                     className="button button-secondary compact"
                     type="button"
                     disabled={busy}
-                    onClick={() =>
-                      handToMailClient("app")
-                    }
+                    onClick={saveAgreementPdf}
                   >
-                    <Mail size={15} />
-                    Send from my mail app
+                    <FileDown size={15} />
+                    Save PDF
                   </button>
 
                   <button
                     className="button button-secondary compact"
                     type="button"
                     disabled={busy}
-                    onClick={() => {
-                      void copyAgreementText();
-                    }}
+                    onClick={sendFromMailApp}
                   >
-                    <ClipboardCopy size={15} />
-                    Copy agreement
+                    <Mail size={15} />
+                    Send from my mail app
                   </button>
                 </>
               )}
@@ -657,26 +758,27 @@ export function RentalAgreement({
             )}
 
           {status === "approved" &&
-            !mailerConfigured && (
+            recipientEmail && (
               <p className="form-help">
-                Automatic delivery is not
-                configured, so the agreement is
-                sent from the office&apos;s own
-                account: Print to save the
-                signed copy as a PDF, then
-                “Send with Gmail” to open a
-                message with everything filled
-                in and attach it.
+                “Send with Gmail” attaches the
+                agreement as a PDF and sends it
+                to {recipientEmail} from your own
+                Google account. The first send
+                on a device asks Google for
+                permission to send mail as you;
+                nothing else is granted.
               </p>
             )}
 
           {status === "approved" &&
-            mailerConfigured &&
             !recipientEmail && (
               <p className="form-help">
                 This customer has no email
                 address on file, so the
-                agreement cannot be emailed.
+                agreement cannot be emailed. Add
+                one on the customers screen, or
+                use “Save PDF” and send it
+                yourself.
               </p>
             )}
 
@@ -785,11 +887,16 @@ export function RentalAgreement({
             )}
         </section>
 
-        {agreement && (
-          <AgreementSheet
-            agreement={agreement}
-          />
-        )}
+        {/* The PDF is captured from this element, so the
+            emailed copy is the sheet on screen rather than a
+            second rendering of it. */}
+        <div ref={sheetRef}>
+          {agreement && (
+            <AgreementSheet
+              agreement={agreement}
+            />
+          )}
+        </div>
 
       </section>
     </div>,
