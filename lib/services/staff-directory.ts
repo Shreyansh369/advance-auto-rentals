@@ -43,7 +43,6 @@ export type StaffMember = {
   decidedAt: string | null;
   decidedByNameSnapshot: string | null;
   decisionNote: string | null;
-  notifiedAt: string | null;
 };
 
 function trimmedOrNull(
@@ -130,43 +129,12 @@ export async function listStaff(): Promise<
 > {
   const { db } = getFirebaseClient();
 
-  const [profiles, notifications] =
-    await Promise.all([
-      getDocs(
-        query(
-          collection(db, "users"),
-          limit(STAFF_LIMIT),
-        ),
-      ),
-
-      /*
-       * Whether the office was told is useful on the screen,
-       * but it must never keep the queue from loading: the
-       * receipts are a convenience, the queue is the point.
-       */
-      getDocs(
-        query(
-          collection(
-            db,
-            "staffAccessRequests",
-          ),
-          limit(STAFF_LIMIT),
-        ),
-      ).catch(() => null),
-    ]);
-
-  const notifiedAt = new Map<string, string>();
-
-  for (const entry of notifications?.docs ??
-    []) {
-    const moment = toIsoOrNull(
-      entry.get("notifiedAt"),
-    );
-
-    if (moment) {
-      notifiedAt.set(entry.id, moment);
-    }
-  }
+  const profiles = await getDocs(
+    query(
+      collection(db, "users"),
+      limit(STAFF_LIMIT),
+    ),
+  );
 
   const members = profiles.docs.map(
     (snapshot): StaffMember => {
@@ -223,9 +191,6 @@ export async function listStaff(): Promise<
         decisionNote: trimmedOrNull(
           snapshot.get("decisionNote"),
         ),
-
-        notifiedAt:
-          notifiedAt.get(snapshot.id) ?? null,
       };
     },
   );

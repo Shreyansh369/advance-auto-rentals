@@ -9,6 +9,14 @@ import {
 import { signOut } from "firebase/auth";
 
 import {
+  collection,
+  limit,
+  onSnapshot,
+  query,
+  where,
+} from "firebase/firestore";
+
+import {
   BarChart3,
   CalendarDays,
   CarFront,
@@ -61,8 +69,15 @@ const navigation = [
     label: "Staff",
     icon: UserRoundCheck,
     admin: true,
+    countsPendingStaff: true,
   },
 ];
+
+/*
+ * More than this and the badge says "lots", which is all an
+ * administrator needs to know before opening the screen.
+ */
+const PENDING_BADGE_CEILING = 99;
 
 type AppShellProps = {
   children: React.ReactNode;
@@ -123,6 +138,52 @@ export function AppShell({
 
   const [loggingOut, setLoggingOut] =
     useState(false);
+
+  /*
+   * Nothing emails an administrator when somebody registers,
+   * so the count beside Staff is what surfaces a waiting
+   * request from anywhere in the application. It is a live
+   * listener rather than a read on mount: an account that
+   * registers while the workspace is open should appear
+   * without a refresh.
+   */
+  const [pendingStaff, setPendingStaff] =
+    useState(0);
+
+  useEffect(() => {
+    if (role !== "admin") {
+      return;
+    }
+
+    let unsubscribe:
+      | (() => void)
+      | undefined;
+
+    try {
+      const { db } = getFirebaseClient();
+
+      unsubscribe = onSnapshot(
+        query(
+          collection(db, "users"),
+          where("status", "==", "pending"),
+          limit(PENDING_BADGE_CEILING + 1),
+        ),
+
+        (snapshot) =>
+          setPendingStaff(snapshot.size),
+
+        /*
+         * A badge is not worth breaking the shell over: a
+         * refused or failed read simply shows no count.
+         */
+        () => setPendingStaff(0),
+      );
+    } catch {
+      // Firebase is unconfigured; the shell reports that itself.
+    }
+
+    return () => unsubscribe?.();
+  }, [role]);
 
   /*
    * Prevent the mobile menu from scrolling
@@ -219,34 +280,54 @@ export function AppShell({
               href,
               label,
               icon: Icon,
-            }) => (
-              <Link
-                className={
-                  pathname === href
-                    ? "active"
-                    : ""
-                }
-                href={href}
-                onClick={() =>
-                  setOpen(false)
-                }
-                key={href}
-                aria-current={
-                  pathname === href
-                    ? "page"
-                    : undefined
-                }
-              >
-                <Icon
-                  size={19}
-                  strokeWidth={2.1}
-                />
+              countsPendingStaff,
+            }) => {
+              const waiting =
+                countsPendingStaff
+                  ? pendingStaff
+                  : 0;
 
-                <span>
-                  {label}
-                </span>
-              </Link>
-            ),
+              return (
+                <Link
+                  className={
+                    pathname === href
+                      ? "active"
+                      : ""
+                  }
+                  href={href}
+                  onClick={() =>
+                    setOpen(false)
+                  }
+                  key={href}
+                  aria-current={
+                    pathname === href
+                      ? "page"
+                      : undefined
+                  }
+                >
+                  <Icon
+                    size={19}
+                    strokeWidth={2.1}
+                  />
+
+                  <span>
+                    {label}
+                  </span>
+
+                  {waiting > 0 && (
+                    <b
+                      className="nav-count"
+                      aria-label={`${waiting} awaiting approval`}
+                    >
+                      {waiting >
+                      PENDING_BADGE_CEILING
+                        ? `${PENDING_BADGE_CEILING}+`
+                        : waiting}
+                    </b>
+                  )}
+                </Link>
+              );
+            },
           )}
         </nav>
 

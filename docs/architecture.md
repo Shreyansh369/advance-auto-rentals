@@ -8,7 +8,9 @@ Firebase Authentication identifies the caller. Authorisation is resolved from th
 
 Because the workflows now run client-side, input validation in `lib/services/firestore-client.ts` is a correctness control rather than a trust boundary. Amounts are validated as whole non-negative cents within a fixed ceiling, odometer readings are converted and range-checked once, enum values are checked against fixed lists, and no `undefined` is ever written. Rate and quote snapshots are still read from the vehicle record inside the transaction rather than accepted from the form, so a tampered browser cannot change what a rental is priced at — but a determined staff account could write a financial document the rules allow it to write. Restoring server-side enforcement requires the Blaze plan and the callable functions kept in `functions/`.
 
-Two workflows do need a server, and share one of their own. Emailing an approved rental agreement, and telling the administrators that a staff account is waiting for approval, both require a mail provider's API key, which cannot be handed to a browser, so `services/contract-mailer/` is deployed separately as a single serverless function with a route for each. It is not a privileged service: it acts as the account that called it, presenting that account's own Firebase ID token to Firestore, so the same rules apply to it as to the browser and there is no service-account key anywhere in the system. What it does hold is the Resend credential. See `services/contract-mailer/README.md`.
+One workflow does need a server, and has one of its own. Emailing an approved rental agreement requires a mail provider's API key, which cannot be handed to a browser, so `services/contract-mailer/` is deployed separately as a single serverless function. It is not a privileged service: it acts as the employee who called it, presenting that employee's own Firebase ID token to Firestore, so the same rules apply to it as to the browser and there is no service-account key anywhere in the system. What it does hold is the Resend credential. See `services/contract-mailer/README.md`.
+
+Staff approval needs no server at all. An administrator decides on the Staff screen, and a waiting request is surfaced by a count beside that screen in the navigation rather than by anything being sent.
 
 The `functions/` directory is retained as the reference implementation of these workflows. It is not built, deployed or called by the application.
 
@@ -24,7 +26,6 @@ The `functions/` directory is retained as the reference implementation of these 
 | `refunds`, `financialLedger`, `vehicleExpenses` | Profit reporting | Admin read; staff may append ledger and expense entries but never edit or delete them |
 | `auditLogs` | Security trail | Admin read; staff append-only |
 | `users` | Staff identity, requested role, assigned role and approval status | Self read; admin read, list, update and delete. A browser creates only its own pending profile and can never write `role` or `status` for itself |
-| `staffAccessRequests` | One receipt per account recording that the administrators were told it is waiting | Self read and create-only; admin read, list and delete |
 | `reservationContracts` | Contract review state: status, version and review metadata | Staff read; staff may submit for review; only an admin may approve or reject, and an approved contract is final |
 | `reservationContracts/{id}/versions` | The frozen agreement as approved | Staff read; admin create only; never updated or deleted |
 | `reservationContracts/{id}/deliveries` | Email delivery receipts | Staff read and create only; never updated or deleted |

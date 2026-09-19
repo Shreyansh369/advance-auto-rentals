@@ -9,8 +9,6 @@ A role only takes effect once an administrator sets `role` and `status: "approve
 
 That decision is made on the **Staff** screen, which only an administrator can list `users` to see, and every approval, refusal, suspension and role change is written together with its audit entry in one transaction. An administrator cannot act on their own account there: withdrawing the last administrator's own access would leave the project with nobody able to approve anyone, and it is the one change the screen refuses to make.
 
-A pending account may announce itself to the administrators once, through the staff notification endpoint. The recipients are fixed in that deployment's configuration rather than taken from the request, and the receipt at `staffAccessRequests/{uid}` is create-only, so an account waiting for approval can ask to be noticed but cannot choose who is written to, what is said, or how often.
-
 ## Controls and residual responsibilities
 
 | Threat | Implemented control |
@@ -27,7 +25,6 @@ A pending account may announce itself to the administrators once, through the st
 | Data exfiltration | Financial and audit documents are admin-only; every query is capped |
 | Contract tampering before delivery | An agreement can only be emailed after an administrator approves it; approval freezes a snapshot in a subcollection the rules make immutable, and the mailer renders from that snapshot alone |
 | Forged contract email | The endpoint takes only a booking reference from the browser. The recipient address, the customer identity and every monetary figure are read from Firestore under the caller's own ID token, which Google's identity toolkit verifies first |
-| Staff notifier used as a mail relay | The recipients come from `STAFF_NOTIFICATION_EMAILS` on the deployment, never from the request; the announcement is refused unless the caller's own profile is `status: "pending"`, and the create-only receipt at `staffAccessRequests/{uid}` stops a retry loop becoming a stream of mail. A decision notice additionally requires an approved administrator and reaches only the address on the reviewed profile |
 | Mail credential exposure | The Resend key lives only in the serverless function's environment. The browser bundle never contains it |
 | Customer deletion covering tracks | Deletion is admin-only, is refused while any booking or rental references the customer, and writes an audit entry naming the record removed |
 | XSS/injection | React rendering, no raw HTML rendering; the emailed agreement escapes every value that came from a person |

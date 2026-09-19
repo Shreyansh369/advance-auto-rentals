@@ -5,12 +5,12 @@ Secure operations software for Advance Auto Rentals. It is a separate applicatio
 ## Included
 
 - Next.js operations dashboard with Firebase Authentication gate
-- Self-service staff registration with an administrator approval screen, role assignment and optional email notification of each request
+- Self-service staff registration with an administrator approval screen and role assignment
 - Firestore/Storage security rules and indexes
 - Transactional reservation, checkout, extension, return, pricing and payment workflows that run in the browser against Firestore, so no Blaze-plan Cloud Functions are required
 - Cloudinary media capture for vehicle condition photos, fleet photos and driver's licence images
 - Printable rental agreement rebuilt from the stored booking, with an employee review workflow — submit, approve or reject, then email — and an immutable snapshot of what was approved
-- Optional contract email and staff access notifications through a separate serverless endpoint (`services/contract-mailer/`) so the mail provider's key never reaches the browser
+- Optional contract email through a separate serverless endpoint (`services/contract-mailer/`) so the mail provider's key never reaches the browser
 - Append-only audit and financial ledger records
 - Spreadsheet import that defaults to dry-run and produces a validation report
 - Emulator configuration, security-rule tests, unit tests, CI, and deployment/recovery documentation
@@ -55,6 +55,6 @@ Two things have to be true before anyone can register at all:
 - **Email/Password and Google must be enabled** in Firebase Authentication → Sign-in method. They are off in a new project, and until then sign-in fails with `auth/operation-not-allowed` however correct the credentials are.
 - **One administrator must exist already**, because approval is an administrator's decision. Seed the first one by hand — see [`docs/deployment.md`](docs/deployment.md).
 
-Set `NEXT_PUBLIC_STAFF_MAILER_URL` and `STAFF_NOTIFICATION_EMAILS` and each request is also emailed to the administrators; leave them unset and requests still queue on the Staff screen, which says so.
+Nothing is emailed when somebody registers. A waiting request shows as a count beside **Staff** in the sidebar, so an administrator sees it from any screen.
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), and [`docs/deployment.md`](docs/deployment.md).

@@ -24,21 +24,6 @@ export type MailerEnv = {
 
   replyToEmail: string | null;
 
-  /**
-   * Where a staff access request is announced. Approval is
-   * an administrator's decision, so the addresses are fixed
-   * in the deployment rather than taken from the request:
-   * an applicant can ask for access, never choose who hears
-   * about it. Empty disables the staff notifications only.
-   */
-  staffNotificationEmails: string[];
-
-  /**
-   * Origin of the deployed application, used to link an
-   * administrator straight to the approval screen. Optional.
-   */
-  appBaseUrl: string | null;
-
   /** Browser origins allowed to call this endpoint. */
   allowedOrigins: string[];
 
@@ -101,20 +86,6 @@ export function readEnv(
     replyToEmail:
       (source.CONTRACT_REPLY_TO ?? "").trim() ||
       null,
-
-    staffNotificationEmails: optional(
-      source,
-      "STAFF_NOTIFICATION_EMAILS",
-      "",
-    )
-      .split(",")
-      .map((address) => address.trim())
-      .filter(Boolean),
-
-    appBaseUrl:
-      (source.APP_BASE_URL ?? "")
-        .trim()
-        .replace(/\/+$/, "") || null,
 
     allowedOrigins: optional(
       source,
