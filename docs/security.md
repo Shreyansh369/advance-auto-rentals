@@ -24,7 +24,7 @@ That decision is made on the **Staff** screen, which only an administrator can l
 | Privilege escalation | Role and approval live in a document the account itself cannot modify |
 | Data exfiltration | Financial and audit documents are admin-only; every query is capped |
 | Contract tampering before delivery | An agreement can only be sent after an administrator approves it; approval freezes a snapshot in a subcollection the rules make immutable, and the message is rendered from that snapshot alone |
-| Mail credential exposure | No mail provider is used. An agreement leaves from the office's own mail account, so the system holds no sending credential to expose |
+| Mail credential exposure | The deployed application uses no mail provider: an agreement leaves from the office's own mail account, so there is no sending credential to expose. The provider-based send in the unbuilt `functions/` reference reads its key from a secret, never from the bundle |
 | Customer deletion covering tracks | Deletion is admin-only, is refused while any booking or rental references the customer, and writes an audit entry naming the record removed |
 | XSS/injection | React rendering, no raw HTML rendering; the emailed agreement escapes every value that came from a person |
 

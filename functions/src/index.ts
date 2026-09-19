@@ -5,6 +5,7 @@ import {
   onCall,
 } from "firebase-functions/https";
 import { logger } from "firebase-functions";
+import { defineSecret } from "firebase-functions/params";
 import { onSchedule } from "firebase-functions/scheduler";
 import { onObjectFinalized } from "firebase-functions/storage";
 import { getStorage } from "firebase-admin/storage";
@@ -32,6 +33,7 @@ import {
   customerSchema,
   customerLicenseDocumentSchema,
   reservationSignatureSchema,
+  sendReservationContractSchema,
   expenseSchema,
   extensionSchema,
   financialOverviewSchema,
@@ -47,6 +49,7 @@ import {
 } from "./services/schemas";
 
 import { financialOverview } from "./services/reporting";
+import { sendReservationContractEmail } from "./services/contracts";
 import {
   requireAdmin,
   requireRole,
@@ -62,6 +65,8 @@ import {
  */
 const enforceAppCheck =
   process.env.FUNCTIONS_EMULATOR !== "true";
+
+const resendApiKey = defineSecret("RESEND_API_KEY");
 
 /**
  * Existing reservation schema + vehicle evidence.
@@ -548,6 +553,61 @@ async function createReservationWorkflow(
     input,
   );
 }
+
+export const sendReservationContract =
+  onCall(
+    {
+      enforceAppCheck,
+      region: "us-central1",
+      secrets: [resendApiKey],
+    },
+    async (request) => {
+      try {
+        const actor = await requireRole(
+          request,
+          "admin",
+          "operations",
+        );
+
+        const parsed = sendReservationContractSchema.safeParse(request.data);
+        if (!parsed.success) {
+          throw new HttpsError(
+            "invalid-argument",
+            "Invalid request data.",
+            parsed.error.flatten(),
+          );
+        }
+
+        const key = resendApiKey.value();
+        if (!key) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Contract email is not configured on the server.",
+          );
+        }
+
+        const fromEmail =
+          process.env.CONTRACT_EMAIL_FROM?.trim();
+
+        if (!fromEmail) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Contract sender email is not configured on the server.",
+          );
+        }
+
+        return await sendReservationContractEmail({
+          reservationId: parsed.data.reservationId,
+          actorUid: actor.uid,
+          resendApiKey: key,
+          fromEmail,
+          signatureDataUrl: null,
+        });
+      } catch (error) {
+        return safeError(error);
+      }
+    },
+  );
 
 /* =========================================================
    CHECKOUT

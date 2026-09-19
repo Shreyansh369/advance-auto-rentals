@@ -12,7 +12,7 @@ No workflow needs a server of its own, and none has one. An approved agreement i
 
 Staff approval needs no server either. An administrator decides on the Staff screen, and a waiting request is surfaced by a count beside that screen in the navigation rather than by anything being sent.
 
-The `functions/` directory is retained as the reference implementation of these workflows. It is not built, deployed or called by the application.
+The `functions/` directory is retained as the reference implementation of these workflows, including a provider-based contract send that the application does not use. It is not built, deployed or called.
 
 ## Collections
 
