@@ -30,11 +30,6 @@ import {
 } from "@/lib/services/firestore-client";
 
 import {
-  contractMailerConfigured,
-  sendContractEmail,
-} from "@/lib/services/contract-mailer";
-
-import {
   agreementBody,
   agreementSubject,
   gmailComposeUrl,
@@ -224,12 +219,6 @@ export function RentalAgreement({
 
   const isAdmin = role === "admin";
 
-  const mailerConfigured =
-    contractMailerConfigured();
-
-  const recipientEmail =
-    agreement?.renter.email ?? null;
-
   async function run(
     action: () => Promise<string>,
   ) {
@@ -394,17 +383,6 @@ export function RentalAgreement({
     }
   }
 
-  function emailContract() {
-    void run(async () => {
-      const result =
-        await sendContractEmail(
-          agreement?.reservationId ?? "",
-        );
-
-      return `Agreement emailed to ${result.recipientEmail}.`;
-    });
-  }
-
   if (!hydrated) {
     return null;
   }
@@ -559,32 +537,10 @@ export function RentalAgreement({
                   </>
                 )}
 
-              {status === "approved" &&
-                mailerConfigured && (
-                  <button
-                    className="button button-primary compact"
-                    type="button"
-                    disabled={
-                      busy ||
-                      !recipientEmail
-                    }
-                    onClick={
-                      emailContract
-                    }
-                  >
-                    <Mail size={15} />
-                    Email to customer
-                  </button>
-                )}
-
               {status === "approved" && (
                 <>
                   <button
-                    className={
-                      mailerConfigured
-                        ? "button button-secondary compact"
-                        : "button button-primary compact"
-                    }
+                    className="button button-primary compact"
                     type="button"
                     disabled={busy}
                     onClick={() =>
@@ -656,29 +612,16 @@ export function RentalAgreement({
               </p>
             )}
 
-          {status === "approved" &&
-            !mailerConfigured && (
-              <p className="form-help">
-                Automatic delivery is not
-                configured, so the agreement is
-                sent from the office&apos;s own
-                account: Print to save the
-                signed copy as a PDF, then
-                “Send with Gmail” to open a
-                message with everything filled
-                in and attach it.
-              </p>
-            )}
-
-          {status === "approved" &&
-            mailerConfigured &&
-            !recipientEmail && (
-              <p className="form-help">
-                This customer has no email
-                address on file, so the
-                agreement cannot be emailed.
-              </p>
-            )}
+          {status === "approved" && (
+            <p className="form-help">
+              The agreement is sent from the
+              office&apos;s own account: Print
+              to save the signed copy as a PDF,
+              then “Send with Gmail” to open a
+              message with everything filled in
+              and attach it.
+            </p>
+          )}
 
           {workflow && (
             <dl className="agreement-review-meta">

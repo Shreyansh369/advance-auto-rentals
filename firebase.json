@@ -23,7 +23,7 @@
       "**/.*",
       "**/node_modules/**"
     ],
-    "//csp": "connect-src lists every origin the browser may call. If the contract mailer (services/contract-mailer) is deployed, add its origin here as well as to NEXT_PUBLIC_CONTRACT_MAILER_URL, or the policy blocks the send.",
+    "//csp": "connect-src lists every origin the browser may call. Adding an outbound integration means adding its origin here, or the policy blocks the request.",
 
     "headers": [
       {

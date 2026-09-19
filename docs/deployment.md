@@ -41,18 +41,20 @@ Before the first staging deployment:
 5. Deploy rules and indexes first to staging: `pnpm exec firebase deploy --project <staging-project-id> --only firestore:rules,firestore:indexes`. Pass `--project` explicitly rather than relying on the `.firebaserc` default, which points at the emulator project.
 6. Deploy web hosting only after `pnpm verify`, `pnpm test:rules`, and an approved staging acceptance run. Cloud Functions are not part of the deployment: the project stays on the Spark plan and every workflow runs in the browser.
 
-The supplied `Deploy` workflow is manual-only and uses protected GitHub environments. In each `staging` and `production` environment, configure `GCP_WIF_PROVIDER`, `GCP_DEPLOYER_SERVICE_ACCOUNT`, and `FIREBASE_PROJECT_ID`; set the remaining public web configuration as GitHub environment variables named `FIREBASE_*` and `RECAPTCHA_ENTERPRISE_SITE_KEY`, plus `CONTRACT_MAILER_URL` if the contract mailer is deployed (the workflow maps each one explicitly, so a variable it does not name never reaches the build); require production reviewer approval. The deployer service account needs only the Firebase Hosting and Firestore rules/index deployment permissions. App Check enforcement and a named rollback owner must be confirmed before its first production run.
+The supplied `Deploy` workflow is manual-only and uses protected GitHub environments. In each `staging` and `production` environment, configure `GCP_WIF_PROVIDER`, `GCP_DEPLOYER_SERVICE_ACCOUNT`, and `FIREBASE_PROJECT_ID`; set the remaining public web configuration as GitHub environment variables named `FIREBASE_*` and `RECAPTCHA_ENTERPRISE_SITE_KEY` (the workflow maps each one explicitly, so a variable it does not name never reaches the build); require production reviewer approval. The deployer service account needs only the Firebase Hosting and Firestore rules/index deployment permissions. App Check enforcement and a named rollback owner must be confirmed before its first production run.
 
-## Contract email
+## Sending an approved agreement
 
-Emailing an approved agreement is optional and off until it is configured. It runs on a separate serverless deployment, `services/contract-mailer/`, because the mail provider's API key must never reach a browser.
+There is nothing to configure and nothing to deploy. Once an administrator approves a contract, the agreement screen offers:
 
-1. Verify the sending domain in Resend and create an API key.
-2. Deploy `services/contract-mailer` (Vercel, Netlify, Cloudflare Workers and Deno Deploy all accept the handler as it stands; only `api/send-contract.ts` is platform-specific).
-3. Set `FIREBASE_PROJECT_ID`, `FIREBASE_API_KEY` (the public web key), `RESEND_API_KEY`, `CONTRACT_FROM_EMAIL` and `CONTRACT_MAILER_ALLOWED_ORIGINS` on that deployment.
-4. Set `NEXT_PUBLIC_CONTRACT_MAILER_URL` on the web build, add the mailer origin to the `connect-src` directive in `firebase.json`, and redeploy hosting.
+- **Print** — saves the signed copy as a PDF.
+- **Send with Gmail** — opens a compose window addressed to the customer, subject and body already written; the operator attaches the PDF and sends.
+- **Send from my mail app** — the same message handed to whatever mail client is installed.
+- **Copy agreement** — the same text on the clipboard, for WhatsApp or anything else.
 
-Miss step 4 and the browser is blocked before the request leaves the page — by CORS if the origin is not allowed, by the Content-Security-Policy if `connect-src` was not extended. Leave `NEXT_PUBLIC_CONTRACT_MAILER_URL` unset and the agreement screen simply says email delivery is not configured and offers print and save-as-PDF. Full details are in `services/contract-mailer/README.md`.
+Because the message leaves the office's own account, it arrives from the address the renter would reply to and there is no deliverability question, no sending domain to verify and no mail-provider credential anywhere in the system.
+
+The clauses are deliberately not in the message body: fourteen of them do not fit in a compose URL, and the copy the renter signs is the printed one, which the operator attaches.
 
 ## Staff approval
 

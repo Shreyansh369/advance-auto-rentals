@@ -188,13 +188,6 @@ export const reservationSignatureSchema =
   })
   .strict();
 
-export const sendReservationContractSchema =
-  z.object({
-    reservationId:
-      id,
-  })
-  .strict();
-
 export const checkoutSchema =
   z.object({
     reservationId:
