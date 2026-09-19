@@ -17,6 +17,11 @@ import { useRouter } from "next/navigation";
 import { firebaseErrorMessage } from "@/lib/presentation";
 import { getFirebaseClient } from "@/lib/firebase/client";
 
+import {
+  notifyStaffAccessRequest,
+  staffMailerConfigured,
+} from "@/lib/services/staff-mailer";
+
 import { useFirebaseAuth } from "./firebase-provider";
 
 function GoogleMark() {
@@ -68,6 +73,9 @@ export function LoginForm() {
     useState(false);
 
   const [signingOut, setSigningOut] =
+    useState(false);
+
+  const [notifying, setNotifying] =
     useState(false);
 
   /*
@@ -373,6 +381,40 @@ export function LoginForm() {
       }
     }
 
+    async function notifyAdministrators() {
+      if (notifying) {
+        return;
+      }
+
+      setNotifying(true);
+      setError(undefined);
+      setNotice(undefined);
+
+      try {
+        const result =
+          await notifyStaffAccessRequest();
+
+        setNotice(
+          result === "already_notified"
+            ? "The administrators have already been told about this account. They will approve it from the Staff screen."
+            : "The administrators have been emailed about your account.",
+        );
+      } catch (cause) {
+        console.error(
+          "Staff access notification failed:",
+          cause,
+        );
+
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "The notification could not be sent.",
+        );
+      } finally {
+        setNotifying(false);
+      }
+    }
+
     const message =
       auth.message ?? "";
 
@@ -447,6 +489,15 @@ export function LoginForm() {
             </div>
           )}
 
+          {notice && (
+            <div
+              className="auth-inline-success"
+              role="status"
+            >
+              {notice}
+            </div>
+          )}
+
           {registrationRequired && (
             <button
               type="button"
@@ -464,6 +515,36 @@ export function LoginForm() {
               </span>
             </button>
           )}
+
+          {/*
+            * An account that registered before the
+            * notification existed has nobody watching for
+            * it, and the applicant is the only person in a
+            * position to say so. The endpoint answers a
+            * second attempt with the first one's result, so
+            * this cannot be used to bury the office in mail.
+            */}
+          {pendingApproval &&
+            staffMailerConfigured() && (
+              <button
+                type="button"
+                className="auth-primary-small"
+                onClick={() =>
+                  void notifyAdministrators()
+                }
+                disabled={notifying}
+              >
+                <span>
+                  {notifying
+                    ? "Sending..."
+                    : "Notify the administrators"}
+                </span>
+
+                <span aria-hidden="true">
+                  →
+                </span>
+              </button>
+            )}
 
           <button
             type="button"

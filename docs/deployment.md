@@ -34,11 +34,12 @@ Create three separate Firebase projects: development, staging and production. Re
 
 Before the first staging deployment:
 
-1. Enable Email/Password and Google in Firebase Authentication. Staff register themselves from the Sign up screen, which creates a pending profile; an administrator then sets `role` and `status: "approved"` on that `users/{uid}` document. Seed the very first administrator directly in the Firestore console, because approval requires an existing administrator.
-2. Create the Firestore database. Do **not** set up Firebase Storage — see below. Set the Cloudinary cloud name and unsigned upload preset, and the reCAPTCHA Enterprise site key, in the corresponding hosting environment.
-3. Replace `.firebaserc` aliases with real staging/production project IDs locally only if the repository is private; preferably use `firebase use --add` and keep deployment mapping in a secure CI environment.
-4. Deploy rules and indexes first to staging: `pnpm exec firebase deploy --project <staging-project-id> --only firestore:rules,firestore:indexes`. Pass `--project` explicitly rather than relying on the `.firebaserc` default, which points at the emulator project.
-5. Deploy web hosting only after `pnpm verify`, `pnpm test:rules`, and an approved staging acceptance run. Cloud Functions are not part of the deployment: the project stays on the Spark plan and every workflow runs in the browser.
+1. Enable **Email/Password** and **Google** in Firebase Authentication → Sign-in method. Both are off in a new project, and until Email/Password is switched on every sign-in and registration fails with `auth/operation-not-allowed`, which the screens report as "Email and password sign-in is not enabled in Firebase Authentication". No amount of approval in this application works around it: the account cannot authenticate at all.
+2. Seed the very first administrator directly in the Firestore console — approval requires an existing administrator, so nobody can approve the first one. Create the Authentication user, then write `users/{uid}` with `role: "admin"`, `status: "approved"` and `requestedRole: "admin"`. Every administrator after that is approved from the **Staff** screen in the application. Staff register themselves from the Sign up screen, which creates the pending profile the Staff screen lists.
+3. Create the Firestore database. Do **not** set up Firebase Storage — see below. Set the Cloudinary cloud name and unsigned upload preset, and the reCAPTCHA Enterprise site key, in the corresponding hosting environment.
+4. Replace `.firebaserc` aliases with real staging/production project IDs locally only if the repository is private; preferably use `firebase use --add` and keep deployment mapping in a secure CI environment.
+5. Deploy rules and indexes first to staging: `pnpm exec firebase deploy --project <staging-project-id> --only firestore:rules,firestore:indexes`. Pass `--project` explicitly rather than relying on the `.firebaserc` default, which points at the emulator project.
+6. Deploy web hosting only after `pnpm verify`, `pnpm test:rules`, and an approved staging acceptance run. Cloud Functions are not part of the deployment: the project stays on the Spark plan and every workflow runs in the browser.
 
 The supplied `Deploy` workflow is manual-only and uses protected GitHub environments. In each `staging` and `production` environment, configure `GCP_WIF_PROVIDER`, `GCP_DEPLOYER_SERVICE_ACCOUNT`, and `FIREBASE_PROJECT_ID`; set the remaining public web configuration as GitHub environment variables named `FIREBASE_*` and `RECAPTCHA_ENTERPRISE_SITE_KEY`; require production reviewer approval. The deployer service account needs only the Firebase Hosting and Firestore rules/index deployment permissions. App Check enforcement and a named rollback owner must be confirmed before its first production run.
 
@@ -52,6 +53,19 @@ Emailing an approved agreement is optional and off until it is configured. It ru
 4. Set `NEXT_PUBLIC_CONTRACT_MAILER_URL` on the web build, add the mailer origin to the `connect-src` directive in `firebase.json`, and redeploy hosting.
 
 Miss step 4 and the browser is blocked before the request leaves the page — by CORS if the origin is not allowed, by the Content-Security-Policy if `connect-src` was not extended. Leave `NEXT_PUBLIC_CONTRACT_MAILER_URL` unset and the agreement screen simply says email delivery is not configured and offers print and save-as-PDF. Full details are in `services/contract-mailer/README.md`.
+
+## Staff approval and its notifications
+
+A staff account that registers is stored with `status: "pending"` and reaches no data at all until an administrator approves it. That approval happens on the **Staff** screen, which is visible to administrators and lists every account waiting, with the role each one asked for. Approving assigns the role, declining and suspending withdraw access, and each decision is written with an audit record.
+
+Telling the administrators that somebody is waiting is a separate, optional piece, and it runs on the same deployment as the contract mailer:
+
+1. Set `STAFF_NOTIFICATION_EMAILS` on the mailer deployment to the administrator addresses that should hear about a request, and `APP_BASE_URL` to the workspace origin so the mail can link straight to the Staff screen.
+2. Set `NEXT_PUBLIC_STAFF_MAILER_URL` to `https://<deployment>/api/notify-staff` on the web build, and make sure the mailer origin is in `connect-src` and in `CONTRACT_MAILER_ALLOWED_ORIGINS`.
+
+Unlike the contract email, this one is worth switching on **before the business owns a verified domain**: providers let an account mail its own address, so if `STAFF_NOTIFICATION_EMAILS` is the address the Resend account was opened with, the notifications work today.
+
+Leave `NEXT_PUBLIC_STAFF_MAILER_URL` unset and nothing is lost except the nudge — requests still appear on the Staff screen, and the screen says the notifier is not configured so the absence of email is never mistaken for an absence of requests.
 
 ## Release checks
 

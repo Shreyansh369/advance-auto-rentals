@@ -1,6 +1,8 @@
 # Contract mailer
 
-Sends an approved rental agreement to the customer by email.
+Sends an approved rental agreement to the customer by email,
+and tells the administrators when a staff account is waiting
+for approval.
 
 The rental workspace is published as a static export with no
 server of its own, and the mail provider's API key must never
@@ -46,6 +48,8 @@ service account key to deploy, rotate or leak.
 | `RESEND_API_KEY` | yes | Resend credential. Private — this is why the endpoint exists. |
 | `CONTRACT_FROM_EMAIL` | yes | Verified sender, e.g. `Advance Auto Rental & Repairs <contracts@yourdomain.com>`. |
 | `CONTRACT_REPLY_TO` | no | Reply address shown to the customer. |
+| `STAFF_NOTIFICATION_EMAILS` | for staff notices | Comma-separated administrator addresses told about a new staff access request. Fixed here, never taken from the request. |
+| `APP_BASE_URL` | no | Origin of the deployed workspace, e.g. `https://your-project.web.app`, used to link an administrator straight to the Staff screen. |
 | `CONTRACT_MAILER_ALLOWED_ORIGINS` | yes | Comma-separated browser origins allowed to call this endpoint, e.g. `https://your-project.web.app`. |
 | `FIRESTORE_BASE_URL` | no | Override, for pointing the tests at the emulator. |
 | `IDENTITY_BASE_URL` | no | Override, for pointing the tests at the emulator. |
@@ -99,6 +103,7 @@ application at the deployed URL:
 
 ```
 NEXT_PUBLIC_CONTRACT_MAILER_URL=https://<deployment>/api/send-contract
+NEXT_PUBLIC_STAFF_MAILER_URL=https://<deployment>/api/notify-staff
 ```
 
 Two things have to line up or the browser call fails before
@@ -139,6 +144,47 @@ do not fit in a compose URL, and the copy the renter signs is
 the printed one, which the operator attaches. `Print` on the
 same screen saves it as a PDF.
 
+## Staff access notifications
+
+`api/notify-staff.ts` is the second route on the same
+deployment. It exists because an account that registers sits
+at `status: "pending"` until an administrator approves it, and
+an administrator cannot approve what nobody told them about.
+
+It takes one field, `action`:
+
+- `access_requested` — sent by the applicant's own browser
+  right after registration. The endpoint reads
+  `users/{uid}`, requires `status: "pending"`, and mails the
+  addresses in `STAFF_NOTIFICATION_EMAILS`. The recipients
+  come from the deployment, never from the request: an
+  applicant can ask for access, not choose who hears about
+  it. A receipt at `staffAccessRequests/{uid}` makes this
+  once per account, so a retry loop cannot become a stream of
+  mail to the office. An administrator deletes that receipt
+  to let an account announce itself again.
+- `decision` — sent by an administrator's browser after
+  approving or declining. The caller must be an approved
+  administrator, and the message goes to the address on the
+  reviewed profile.
+
+Neither call is allowed to fail the thing it reports on.
+Registration completes and approval takes effect whether or
+not the mail goes out, and the Staff screen says so when the
+notifier is not configured.
+
+**This route works without a verified domain**, as long as
+the address in `STAFF_NOTIFICATION_EMAILS` is the one the
+Resend account was opened with — providers let you mail
+yourself before you have proved a domain. The contract route
+does not, because it writes to customers. So the staff
+notifications can be switched on today and the contract send
+switched on when the domain is ready.
+
+Leave `NEXT_PUBLIC_STAFF_MAILER_URL` unset and nothing
+breaks: new registrations still appear on the Staff screen,
+they just arrive silently.
+
 ## Tests
 
 `tests/rules/contract-mailer.test.ts` exercises the whole
@@ -160,3 +206,8 @@ allowed to drift.
 
 `tests/unit/contract-message.test.ts` covers the Gmail and
 mail-app messages the browser builds.
+
+`tests/unit/staff-notification-handler.test.ts` runs the
+staff route the same way: who may call it, what is sent, that
+the recipients cannot be steered from the request, and that a
+second announcement does not reach the provider.
