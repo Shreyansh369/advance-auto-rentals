@@ -32,6 +32,11 @@ import {
   firebaseErrorMessage,
 } from "@/lib/presentation";
 
+import {
+  notifyStaffAccessRequest,
+  staffMailerConfigured,
+} from "@/lib/services/staff-mailer";
+
 type AuthMethod =
   | "choose"
   | "google"
@@ -349,6 +354,26 @@ export function SignupForm() {
           );
         },
       );
+
+      /*
+       * The profile exists, so the account is now waiting on
+       * a decision nobody has been told to make. The
+       * announcement goes out while this session still
+       * holds a token, and it is deliberately not allowed to
+       * fail the registration: an applicant who is on the
+       * administrator's screen but not in their inbox is far
+       * better off than one who was turned away here.
+       */
+      if (staffMailerConfigured()) {
+        try {
+          await notifyStaffAccessRequest();
+        } catch (cause) {
+          console.error(
+            "Staff access notification failed:",
+            cause,
+          );
+        }
+      }
 
       /*
        * The application profile is now created.
@@ -762,7 +787,10 @@ export function SignupForm() {
 
               <p className="auth-small-note">
                 New accounts require
-                administrator approval.
+                administrator approval. Your
+                request is sent to the
+                administrators as soon as you
+                register.
               </p>
             </>
           )}

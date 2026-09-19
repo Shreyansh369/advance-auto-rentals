@@ -449,4 +449,95 @@ describe("Firestore access policy", () => {
     await assertFails(getDoc(doc(asUser(OPS), "users", ADMIN)));
     await assertSucceeds(getDoc(doc(asUser(ADMIN), "users", OPS)));
   });
+
+  it("lets an administrator see the approval queue and decide it", async () => {
+    const db = asUser(ADMIN);
+
+    await assertSucceeds(
+      getDocs(query(collection(db, "users"), where("status", "==", "pending"))),
+    );
+
+    await assertSucceeds(
+      updateDoc(doc(db, "users", PENDING), {
+        status: "approved",
+        role: "operations",
+        decidedBy: ADMIN,
+      }),
+    );
+
+    /* Put the fixture back for the tests that follow. */
+    await assertSucceeds(
+      updateDoc(doc(db, "users", PENDING), { status: "pending", role: null }),
+    );
+  });
+
+  it("stops operations listing or deciding staff accounts", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(getDocs(collection(db, "users")));
+
+    await assertFails(
+      updateDoc(doc(db, "users", PENDING), { status: "approved", role: "operations" }),
+    );
+  });
+
+  it("lets a pending account record that it announced itself, exactly once", async () => {
+    const db = asUser(PENDING);
+
+    const receipt = {
+      uid: PENDING,
+      fullName: "Pending Person",
+      email: "pending@example.test",
+      requestedRole: "operations",
+      notifiedAt: "2026-09-18T19:28:00.000Z",
+      createdAt: "2026-09-18T19:28:00.000Z",
+      provider: "resend",
+      providerMessageId: "msg_staff_1",
+      recipientCount: 2,
+    };
+
+    await assertSucceeds(
+      setDoc(doc(db, "staffAccessRequests", PENDING), receipt),
+    );
+
+    /* A receipt records something that already happened. */
+    await assertFails(
+      updateDoc(doc(db, "staffAccessRequests", PENDING), {
+        notifiedAt: "2026-09-19T08:00:00.000Z",
+      }),
+    );
+
+    await assertFails(deleteDoc(doc(db, "staffAccessRequests", PENDING)));
+
+    await assertSucceeds(getDoc(doc(db, "staffAccessRequests", PENDING)));
+  });
+
+  it("stops an account writing a receipt for somebody else or smuggling fields into one", async () => {
+    const db = asUser(PENDING);
+
+    await assertFails(
+      setDoc(doc(db, "staffAccessRequests", OPS), { uid: OPS }),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "staffAccessRequests", PENDING), { uid: ADMIN }),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "staffAccessRequests", PENDING), {
+        uid: PENDING,
+        role: "admin",
+        status: "approved",
+      }),
+    );
+  });
+
+  it("keeps the receipts to administrators, who may clear one to allow a resend", async () => {
+    await assertFails(getDoc(doc(asUser(OPS), "staffAccessRequests", PENDING)));
+
+    const db = asUser(ADMIN);
+
+    await assertSucceeds(getDocs(collection(db, "staffAccessRequests")));
+    await assertSucceeds(deleteDoc(doc(db, "staffAccessRequests", PENDING)));
+  });
 });

@@ -11,7 +11,7 @@ export async function sendEmail(options: {
   baseUrl: string;
   apiKey: string;
   from: string;
-  to: string;
+  to: string | string[];
   replyTo: string | null;
   subject: string;
   html: string;
@@ -36,7 +36,11 @@ export async function sendEmail(options: {
         },
         body: JSON.stringify({
           from: options.from,
-          to: [options.to],
+
+          to: Array.isArray(options.to)
+            ? options.to
+            : [options.to],
+
           subject: options.subject,
           html: options.html,
           text: options.text,

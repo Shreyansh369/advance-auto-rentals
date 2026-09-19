@@ -15,6 +15,7 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  UserRoundCheck,
   UsersRound,
   X,
 } from "lucide-react";
@@ -53,6 +54,12 @@ const navigation = [
     href: "/finance",
     label: "Finance",
     icon: BarChart3,
+    admin: true,
+  },
+  {
+    href: "/staff",
+    label: "Staff",
+    icon: UserRoundCheck,
     admin: true,
   },
 ];
