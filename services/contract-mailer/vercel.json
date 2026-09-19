@@ -1,7 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+
+  "//": "Both routes share this deployment: api/send-contract.ts emails an approved agreement, api/notify-staff.ts carries the staff access notifications. The glob is what keeps a new route from silently missing the pinned runtime.",
+
   "functions": {
-    "api/send-contract.ts": {
+    "api/*.ts": {
       "runtime": "@vercel/node@5",
       "maxDuration": 15
     }

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Serverless endpoint that emails an approved rental agreement.",
+  "description": "Serverless endpoint that emails an approved rental agreement and announces staff access requests.",
   "engines": {
     "node": ">=20"
   }
