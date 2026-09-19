@@ -92,10 +92,6 @@ function env(): MailerEnv {
     resendApiKey: "test-resend-key",
     fromEmail: "Advance Auto <contracts@example.test>",
     replyToEmail: "office@example.test",
-    staffNotificationEmails: [
-      "admin@example.test",
-    ],
-    appBaseUrl: ORIGIN,
     allowedOrigins: [ORIGIN],
     firestoreBaseUrl: `http://${firestoreHost}`,
     identityBaseUrl: `http://${authHost}/identitytoolkit.googleapis.com`,

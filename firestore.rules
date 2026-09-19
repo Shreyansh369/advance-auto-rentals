@@ -107,47 +107,6 @@ allow list: if isAdmin();
 
 
     /* =========================================================
-       STAFF ACCESS REQUEST RECEIPTS
-       ========================================================= */
-
-    match /staffAccessRequests/{userId} {
-
-      /* One receipt per account, written by the notification
-         endpoint as the applicant. Its only job is to record
-         that the administrators have been told, so a retry
-         loop cannot turn into a stream of mail to the office.
-         Nothing here grants access: approval is still the
-         administrator's write to users/{uid}. */
-      allow get: if signedIn()
-        && request.auth.uid == userId;
-
-      allow get, list: if isAdmin();
-
-      allow create: if signedIn()
-        && request.auth.uid == userId
-        && request.resource.data.uid == userId
-        && request.resource.data.keys().hasOnly([
-          "uid",
-          "fullName",
-          "email",
-          "requestedRole",
-          "notifiedAt",
-          "createdAt",
-          "provider",
-          "providerMessageId",
-          "recipientCount"
-        ]);
-
-      /* A receipt is a record of something that has already
-         happened, so it is never rewritten. An administrator
-         deletes one to let an account announce itself again. */
-      allow update: if false;
-
-      allow delete: if isAdmin();
-    }
-
-
-    /* =========================================================
        VEHICLES
        ========================================================= */
 

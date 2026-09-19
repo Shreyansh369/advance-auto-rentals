@@ -2,7 +2,6 @@
 
 import {
   BadgeCheck,
-  MailWarning,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
@@ -33,11 +32,6 @@ import {
   type StaffRole,
   type StaffStatus,
 } from "@/lib/services/staff-directory";
-
-import {
-  notifyStaffDecision,
-  staffMailerConfigured,
-} from "@/lib/services/staff-mailer";
 
 const STATUS_LABEL: Record<
   StaffStatus,
@@ -178,33 +172,6 @@ export function StaffDirectory() {
     };
   }, [reloadToken, role]);
 
-  /*
-   * The decision is the write to users/{uid}. Telling the
-   * applicant is a courtesy on top of it, so a mail provider
-   * that is unset or unreachable reports itself without
-   * making the approval look like it failed.
-   */
-  async function announce(
-    uid: string,
-    outcome: string,
-  ): Promise<string> {
-    if (!staffMailerConfigured()) {
-      return `${outcome} No email was sent: the staff notifier is not configured.`;
-    }
-
-    try {
-      await notifyStaffDecision(uid);
-
-      return `${outcome} They have been emailed.`;
-    } catch (cause) {
-      return `${outcome} The email could not be sent: ${
-        cause instanceof Error
-          ? cause.message
-          : "the provider rejected it"
-      }`;
-    }
-  }
-
   async function approve(member: StaffMember) {
     if (busyUid) {
       return;
@@ -230,12 +197,9 @@ export function StaffDirectory() {
       reload();
 
       setNotice(
-        await announce(
-          member.uid,
-          `${member.fullName} can now sign in as ${roleLabel(
-            chosen,
-          ).toLowerCase()}.`,
-        ),
+        `${member.fullName} can now sign in as ${roleLabel(
+          chosen,
+        ).toLowerCase()}.`,
       );
     } catch (cause) {
       setError(firebaseErrorMessage(cause));
@@ -267,10 +231,7 @@ export function StaffDirectory() {
 
       setNotice(
         outcome === "reject"
-          ? await announce(
-              member.uid,
-              `${member.fullName}'s request was declined.`,
-            )
+          ? `${member.fullName}'s request was declined.`
           : `${member.fullName} no longer has access.`,
       );
     } catch (cause) {
@@ -382,27 +343,6 @@ export function StaffDirectory() {
           role="status"
         >
           {notice}
-        </div>
-      )}
-
-      {!staffMailerConfigured() && (
-        <div className="staff-config-note">
-          <MailWarning size={16} />
-
-          <p>
-            Staff notification email is not
-            configured, so new registrations
-            arrive here silently. Set
-            <code>
-              NEXT_PUBLIC_STAFF_MAILER_URL
-            </code>
-            and
-            <code>
-              STAFF_NOTIFICATION_EMAILS
-            </code>
-            to have each request announced by
-            email.
-          </p>
         </div>
       )}
 
@@ -536,11 +476,10 @@ export function StaffDirectory() {
 
                 <footer>
                   <span className="quiet">
-                    {member.notifiedAt
-                      ? `Administrators notified ${formatMoment(
-                          member.notifiedAt,
-                        )}`
-                      : "No notification email recorded"}
+                    Requested{" "}
+                    {formatMoment(
+                      member.createdAt,
+                    )}
                   </span>
 
                   <div className="row-actions">

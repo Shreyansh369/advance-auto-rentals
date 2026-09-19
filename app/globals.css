@@ -449,6 +449,26 @@ a {
   box-shadow: inset 3px 0 #6187ff;
 }
 
+/*
+ * Accounts waiting for approval. Nothing emails an
+ * administrator when somebody registers, so this is what
+ * carries a waiting request out of the Staff screen and into
+ * every other one.
+ */
+.sidebar-nav .nav-count {
+  min-width: 21px;
+  height: 21px;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #e2574c;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 21px;
+  text-align: center;
+}
+
 .profile {
   display: grid;
   grid-template-columns: 34px 1fr 36px;
@@ -5503,10 +5523,9 @@ canvas {
   line-height: 1.65;
 }
 
-.auth-status-card .auth-inline-error,
-.auth-status-card .auth-inline-success {
+.auth-status-card
+  .auth-inline-error {
   margin-top: 18px;
-  margin-bottom: 0;
 }
 
 .auth-status-card
