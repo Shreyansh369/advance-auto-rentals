@@ -36,7 +36,8 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SERVICE_ACCOUNT }}
       - run: pnpm exec firebase deploy --project "$FIREBASE_PROJECT_ID" --only hosting,firestore:rules,firestore:indexes --non-interactive
-        env: { FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }} }
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
   production:
     if: inputs.target == 'production'
     environment: production
@@ -62,4 +63,5 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SERVICE_ACCOUNT }}
       - run: pnpm exec firebase deploy --project "$FIREBASE_PROJECT_ID" --only hosting,firestore:rules,firestore:indexes --non-interactive
-        env: { FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }} }
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
