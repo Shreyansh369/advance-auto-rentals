@@ -454,6 +454,7 @@ export function RentalHistory({
             {COLUMNS.map((column) => (
               <th
                 key={column.key}
+                className="is-sortable"
                 aria-sort={
                   sort.key === column.key
                     ? sort.ascending

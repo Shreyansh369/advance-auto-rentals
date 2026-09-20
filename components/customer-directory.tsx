@@ -1393,7 +1393,12 @@ export function CustomerDirectory({
                 );
               }}
             >
-              <PlusCircle size={16} />
+              {showPastBooking ? (
+                <X size={16} />
+              ) : (
+                <PlusCircle size={16} />
+              )}
+
               {showPastBooking
                 ? "Close"
                 : "Record a past booking"}

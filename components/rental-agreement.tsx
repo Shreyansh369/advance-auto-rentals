@@ -523,7 +523,7 @@ export function RentalAgreement({
         <header className="agreement-modal-header">
           <div>
             <p className="page-kicker">
-              Rental agreement
+              Rental file
             </p>
 
             <h2>
@@ -559,7 +559,7 @@ export function RentalAgreement({
               className="icon-button"
               type="button"
               onClick={onClose}
-              aria-label="Close rental agreement"
+              aria-label="Close rental file"
             >
               <X size={18} />
             </button>

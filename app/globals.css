@@ -192,7 +192,7 @@ a {
   display: grid;
   gap: 10px;
   margin-top: 8px;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(186px, 1fr));
 }
 
 .checkout-waivers,
@@ -6956,7 +6956,12 @@ canvas {
    Sortable tables and the past-booking panel
    --------------------------------------------------------- */
 
-.sortable-table th {
+/*
+ * Only the headers that became buttons give up their padding
+ * — the button supplies its own. Zeroing it on every header
+ * ran the plain ones into each other.
+ */
+.sortable-table th.is-sortable {
   padding: 0;
 }
 
