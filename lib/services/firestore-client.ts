@@ -3949,6 +3949,14 @@ async function returnRental(
       amountCents: number;
       note: string;
     }>;
+    /*
+     * The waivers taken and the hours run over are settled
+     * when the vehicle comes back, so they are recorded here
+     * and merged into the stored agreement rather than
+     * guessed at the counter.
+     */
+    waivers?: Record<string, unknown> | null;
+    extraHours?: number | null;
     notes: string | null;
     returnMedia: Array<Record<string, unknown>>;
   },
@@ -4021,6 +4029,33 @@ async function returnRental(
   ) {
     throw new Error(
       "Select an adjustment type.",
+    );
+  }
+
+  const waiverInput = (input.waivers ??
+    {}) as Record<string, unknown>;
+
+  const returnWaivers: Record<
+    string,
+    boolean
+  > = {};
+
+  for (const key of WAIVER_KEYS) {
+    returnWaivers[key] =
+      waiverInput[key] === true;
+  }
+
+  const extraHours = Number(
+    input.extraHours ?? 0,
+  );
+
+  if (
+    !Number.isFinite(extraHours) ||
+    extraHours < 0 ||
+    extraHours > 999
+  ) {
+    throw new Error(
+      "Extra hours must be a whole number of hours.",
     );
   }
 
@@ -4123,6 +4158,17 @@ async function returnRental(
           "Only active or overdue rentals can be returned.",
         );
       }
+
+      /*
+       * Read before any write: a Firestore transaction
+       * refuses a read once it has started writing, and the
+       * rental update below is the first one.
+       */
+      const returnedByNameSnapshot =
+        await actorNameSnapshot(
+          transaction,
+          actorUid,
+        );
 
       const actualReturnAt =
         asTimestamp(
@@ -4266,8 +4312,30 @@ async function returnRental(
 
           adjustments,
 
+          /*
+           * The agreement is rebuilt from the rental every
+           * time it is opened, so recording the waivers and
+           * the overrun here puts them on the printed copy.
+           * An approved contract snapshot is a separate,
+           * immutable document and is untouched.
+           */
+          agreement: {
+            ...((rental.agreement ??
+              {}) as Record<
+              string,
+              unknown
+            >),
+
+            waivers: returnWaivers,
+
+            extraHours:
+              Math.trunc(extraHours),
+          },
+
           returnedBy:
             actorUid,
+
+          returnedByNameSnapshot,
 
           updatedAt:
             nowTimestamp(),
@@ -7483,7 +7551,12 @@ export type RentalHistoryEntry = {
   status: string;
   /** Typed in from the paper file rather than run here. */
   isHistorical: boolean;
+  /** Who booked it, handed it over and took it back. */
+  bookedByName: string;
+  rentedOutByName: string;
+  returnedByName: string | null;
   pickupAt: string | null;
+  expectedReturnAt: string | null;
   actualReturnAt: string | null;
   baseRentalCents: number;
   adjustmentCents: number;
@@ -7493,16 +7566,19 @@ export type RentalHistoryEntry = {
 };
 
 /*
- * History is read from rentalFinancials rather than by joining
- * rentals to their totals: that one document already carries
- * the vehicle, the customer, the dates and the money, so a
- * page of history is a single query instead of one read per
- * row.
+ * History joins the two records a rental keeps: `rentals`,
+ * which carries the dates, the status and the name of every
+ * employee who touched it, and `rentalFinancials`, which
+ * carries the money under the same document id.
  *
- * Neither shape below needs a composite index. The whole-fleet
- * view orders on a single field; the per-customer view filters
- * on a single field and is ordered here, which keeps the
- * feature from requiring an index deployment to work.
+ * It is two capped collection reads and an in-memory join
+ * rather than one read per row: a page of fifty rentals used
+ * to be a single query and is now two, which is still two.
+ *
+ * Neither shape needs a composite index. The whole-fleet view
+ * orders on a single field; the per-customer view filters on
+ * a single field and is ordered here, which keeps the feature
+ * from requiring an index deployment to work.
  */
 async function listRentalHistory(
   input: {
@@ -7524,30 +7600,78 @@ async function listRentalHistory(
     200,
   );
 
-  const snapshot = await getDocs(
-    customerId
-      ? query(
-          collection(db, "rentalFinancials"),
-          where(
-            "customerId",
-            "==",
-            customerId,
-          ),
-          limit(cap),
-        )
-      : query(
-          collection(db, "rentalFinancials"),
-          orderBy("createdAt", "desc"),
-          limit(cap),
-        ),
+  const [rentals, financials] =
+    await Promise.all([
+      getDocs(
+        customerId
+          ? query(
+              collection(db, "rentals"),
+              where(
+                "customerId",
+                "==",
+                customerId,
+              ),
+              limit(cap),
+            )
+          : query(
+              collection(db, "rentals"),
+              orderBy("createdAt", "desc"),
+              limit(cap),
+            ),
+      ),
+
+      getDocs(
+        customerId
+          ? query(
+              collection(
+                db,
+                "rentalFinancials",
+              ),
+              where(
+                "customerId",
+                "==",
+                customerId,
+              ),
+              limit(cap),
+            )
+          : query(
+              collection(
+                db,
+                "rentalFinancials",
+              ),
+              orderBy("createdAt", "desc"),
+              limit(cap),
+            ),
+      ),
+    ]);
+
+  /* The financial record is keyed by the rental's own id. */
+  const money = new Map(
+    financials.docs.map((entry) => [
+      String(
+        entry.get("rentalId") ?? entry.id,
+      ),
+      entry,
+    ]),
   );
 
-  return snapshot.docs
+  const now = Date.now();
+
+  return rentals.docs
     .map((entry) => {
+      const financial = money.get(entry.id);
+
       const pickupAt =
         entry.get("pickupAt") == null
           ? null
           : toIso(entry.get("pickupAt"));
+
+      const expectedReturnAt =
+        entry.get("expectedReturnAt") == null
+          ? null
+          : toIso(
+              entry.get("expectedReturnAt"),
+            );
 
       const actualReturnAt =
         entry.get("actualReturnAt") == null
@@ -7556,10 +7680,41 @@ async function listRentalHistory(
               entry.get("actualReturnAt"),
             );
 
+      const isHistorical =
+        entry.get("isHistorical") === true;
+
+      const stored = String(
+        entry.get("status") ?? "active",
+      );
+
+      /*
+       * Overdue is derived from the expected return time, the
+       * same rule the dashboard applies: nothing sweeps the
+       * collection on a schedule, so a stored flag would be
+       * stale rather than merely wrong.
+       */
+      const status =
+        stored === "returned"
+          ? "returned"
+          : stored === "overdue" ||
+              (expectedReturnAt !== null &&
+                Date.parse(
+                  expectedReturnAt,
+                ) < now)
+            ? "overdue"
+            : stored;
+
+      const bookedByName = String(
+        entry.get("createdByNameSnapshot") ??
+          "Not recorded",
+      );
+
+      const totalCents = Number(
+        financial?.get("totalCents") ?? 0,
+      );
+
       return {
-        rentalId: String(
-          entry.get("rentalId") ?? entry.id,
-        ),
+        rentalId: entry.id,
 
         customerId: String(
           entry.get("customerId") ?? "",
@@ -7575,39 +7730,63 @@ async function listRentalHistory(
         ),
 
         vehicleRegistration: String(
-          entry.get("vehicleRegistration") ??
-            "Unknown vehicle",
+          entry.get(
+            "vehicleRegistrationSnapshot",
+          ) ?? "Unknown vehicle",
         ),
 
-        status: String(
-          entry.get("rentalStatus") ?? "active",
+        status,
+
+        isHistorical,
+
+        bookedByName,
+
+        /*
+         * Who actually handed the keys over. It falls back to
+         * whoever booked it, because a rental checked out
+         * before the snapshot existed has no other record of
+         * it and a blank column answers nothing.
+         */
+        rentedOutByName: String(
+          entry.get(
+            "checkedOutByNameSnapshot",
+          ) ?? bookedByName,
         ),
 
-        isHistorical:
-          entry.get("isHistorical") === true,
+        returnedByName: trimmedOrNull(
+          entry.get(
+            "returnedByNameSnapshot",
+          ),
+        ),
 
         pickupAt,
+
+        expectedReturnAt,
 
         actualReturnAt,
 
         baseRentalCents: Number(
-          entry.get("baseRentalCents") ?? 0,
+          financial?.get(
+            "baseRentalCents",
+          ) ?? 0,
         ),
 
         adjustmentCents: Number(
-          entry.get("adjustmentCents") ?? 0,
+          financial?.get(
+            "adjustmentCents",
+          ) ?? 0,
         ),
 
-        totalCents: Number(
-          entry.get("totalCents") ?? 0,
-        ),
+        totalCents,
 
         paidCents: Number(
-          entry.get("paidCents") ?? 0,
+          financial?.get("paidCents") ?? 0,
         ),
 
         outstandingCents: Number(
-          entry.get("outstandingCents") ?? 0,
+          financial?.get(
+            "outstandingCents",
+          ) ?? 0,
         ),
 
         /* Sort key only; not part of the result. */
@@ -7620,10 +7799,8 @@ async function listRentalHistory(
     })
     .sort((a, b) => b.sortAt - a.sortAt)
     .map(
-      ({
-        sortAt: _sortAt,
-        ...entry
-      }) => entry,
+      ({ sortAt: _sortAt, ...entry }) =>
+        entry,
     );
 }
 
@@ -8284,187 +8461,6 @@ async function recordPastRental(
 }
 
 /* =========================================================
-   Rental records
-   ========================================================= */
-
-export type RentalRecord = {
-  rentalId: string;
-  reservationId: string | null;
-  customerId: string;
-  customerName: string;
-  vehicleId: string;
-  vehicleRegistration: string;
-  /** Who booked it, handed it over and took it back. */
-  bookedByName: string;
-  checkedOutByName: string;
-  returnedByName: string | null;
-  pickupAt: string | null;
-  expectedReturnAt: string | null;
-  actualReturnAt: string | null;
-  status:
-    | "active"
-    | "overdue"
-    | "returned"
-    | "historical";
-  isHistorical: boolean;
-};
-
-/*
- * Every rental the office has, live or closed, with the
- * employee who handled it attached.
- *
- * It reads `rentals` rather than `rentalFinancials` on
- * purpose: this is the operational record, so it carries no
- * money and an operations account can be shown all of it.
- *
- * Overdue is derived from the expected return time at read
- * time, the same rule the dashboard applies, because nothing
- * sweeps the collection on a schedule.
- */
-async function listRentalRecords(
-  input: {
-    limit?: number;
-  },
-): Promise<RentalRecord[]> {
-  const { db } = getFirebaseClient();
-
-  const cap = Math.min(
-    Math.max(
-      Number(input?.limit ?? 200) || 200,
-      1,
-    ),
-    500,
-  );
-
-  const snapshot = await getDocs(
-    query(
-      collection(db, "rentals"),
-      orderBy("createdAt", "desc"),
-      limit(cap),
-    ),
-  );
-
-  const now = Date.now();
-
-  return snapshot.docs
-    .map((entry) => {
-      const pickupAt =
-        entry.get("pickupAt") == null
-          ? null
-          : toIso(entry.get("pickupAt"));
-
-      const expectedReturnAt =
-        entry.get("expectedReturnAt") == null
-          ? null
-          : toIso(
-              entry.get("expectedReturnAt"),
-            );
-
-      const actualReturnAt =
-        entry.get("actualReturnAt") == null
-          ? null
-          : toIso(
-              entry.get("actualReturnAt"),
-            );
-
-      const isHistorical =
-        entry.get("isHistorical") === true;
-
-      const stored = String(
-        entry.get("status") ?? "active",
-      );
-
-      const status: RentalRecord["status"] =
-        isHistorical
-          ? "historical"
-          : stored === "returned"
-            ? "returned"
-            : stored === "overdue" ||
-                (expectedReturnAt !== null &&
-                  Date.parse(
-                    expectedReturnAt,
-                  ) < now)
-              ? "overdue"
-              : "active";
-
-      const bookedByName = String(
-        entry.get("createdByNameSnapshot") ??
-          "Not recorded",
-      );
-
-      return {
-        rentalId: entry.id,
-
-        reservationId:
-          trimmedOrNull(
-            entry.get("reservationId"),
-          ),
-
-        customerId: String(
-          entry.get("customerId") ?? "",
-        ),
-
-        customerName: String(
-          entry.get("customerNameSnapshot") ??
-            "Unknown customer",
-        ),
-
-        vehicleId: String(
-          entry.get("vehicleId") ?? "",
-        ),
-
-        vehicleRegistration: String(
-          entry.get(
-            "vehicleRegistrationSnapshot",
-          ) ?? "Unknown vehicle",
-        ),
-
-        bookedByName,
-
-        checkedOutByName: String(
-          entry.get(
-            "checkedOutByNameSnapshot",
-          ) ?? bookedByName,
-        ),
-
-        returnedByName: trimmedOrNull(
-          entry.get(
-            "returnedByNameSnapshot",
-          ),
-        ),
-
-        pickupAt,
-
-        expectedReturnAt,
-
-        actualReturnAt,
-
-        status,
-
-        isHistorical,
-
-        /* Sort key only; dropped below. */
-        sortAt: Date.parse(
-          pickupAt ?? "",
-        ),
-      };
-    })
-    .sort(
-      (a, b) =>
-        (Number.isNaN(b.sortAt)
-          ? 0
-          : b.sortAt) -
-        (Number.isNaN(a.sortAt)
-          ? 0
-          : a.sortAt),
-    )
-    .map(
-      ({ sortAt: _sortAt, ...record }) =>
-        record,
-    );
-}
-
-/* =========================================================
    Expense records
    ========================================================= */
 
@@ -8817,13 +8813,6 @@ export async function callFirestoreOperation<
         )) as TResult
       );
 
-    case "listRentalRecords":
-      return (
-        (await listRentalRecords(
-          data as { limit?: number },
-        )) as TResult
-      );
-
     case "listRentalHistory":
       return (
         (await listRentalHistory(
@@ -8966,6 +8955,11 @@ export async function callFirestoreOperation<
               amountCents: number;
               note: string;
             }>;
+            waivers?: Record<
+              string,
+              unknown
+            > | null;
+            extraHours?: number | null;
             notes: string | null;
             returnMedia: Array<
               Record<string, unknown>

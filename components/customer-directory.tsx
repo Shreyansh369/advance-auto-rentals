@@ -15,6 +15,7 @@ import {
   History,
   Pencil,
   Plus,
+  PlusCircle,
   Search,
   Trash2,
   UserRound,
@@ -31,6 +32,7 @@ import {
 import { AppShell } from "./app-shell";
 import { CountrySelect } from "./country-select";
 import { useFirebaseAuth } from "./firebase-provider";
+import { PastBookingForm } from "./past-booking-form";
 import { RentalHistory } from "./rental-history";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 
@@ -367,6 +369,17 @@ export function CustomerDirectory({
    * Removing a customer is irreversible, so the row asks for
    * a second click rather than deleting on the first one.
    */
+  /*
+   * A rental the office ran before this system belongs with
+   * the history it is missing from, not among the live
+   * booking workflows.
+   */
+  const [showPastBooking, setShowPastBooking] =
+    useState(false);
+
+  const [historyReloadToken, setHistoryReloadToken] =
+    useState(0);
+
   const [pendingDeleteId, setPendingDeleteId] =
     useState<string | null>(null);
 
@@ -1305,7 +1318,7 @@ export function CustomerDirectory({
                 tab === "customers"
                   ? "Search name, telephone or licence"
                   : tab === "history"
-                    ? "Search customer or vehicle"
+                    ? "Search renter, vehicle or staff member"
                     : "Search customer, vehicle or staff"
               }
               aria-label={
@@ -1364,6 +1377,26 @@ export function CustomerDirectory({
             >
               <Plus size={16} />
               Add customer
+            </button>
+          )}
+
+          {tab === "history" && (
+            <button
+              className="button button-primary compact"
+              type="button"
+              onClick={() => {
+                setError(undefined);
+                setNotice(undefined);
+
+                setShowPastBooking(
+                  (open) => !open,
+                );
+              }}
+            >
+              <PlusCircle size={16} />
+              {showPastBooking
+                ? "Close"
+                : "Record a past booking"}
             </button>
           )}
 
@@ -1596,12 +1629,6 @@ export function CustomerDirectory({
                       autoComplete="bday"
                     />
 
-                    <p className="form-help">
-                      Printed on the rental
-                      agreement and used to
-                      judge the under-25
-                      insurance premium.
-                    </p>
                   </div>
 
                   <div className="field">
@@ -2398,10 +2425,34 @@ export function CustomerDirectory({
         )}
 
         {tab === "history" && (
-          <RentalHistory
-            limit={200}
-            search={rentalSearch}
-          />
+          <>
+            {showPastBooking && (
+              <PastBookingForm
+                onRecorded={() => {
+                  setShowPastBooking(false);
+
+                  setHistoryReloadToken(
+                    (token) => token + 1,
+                  );
+
+                  setNotice(
+                    "Past booking recorded. It is listed below as a past booking.",
+                  );
+                }}
+                onCancel={() =>
+                  setShowPastBooking(false)
+                }
+              />
+            )}
+
+            <RentalHistory
+              limit={200}
+              search={rentalSearch}
+              reloadToken={
+                historyReloadToken
+              }
+            />
+          </>
         )}
       </section>
     </AppShell>

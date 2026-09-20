@@ -1,5 +1,7 @@
 "use client";
 
+import { ArrowUpDown } from "lucide-react";
+
 import { useEffect, useState } from "react";
 
 import {
@@ -89,6 +91,92 @@ function statusTone(status: string): string {
   }
 }
 
+type SortKey =
+  | "time"
+  | "rentedOutBy"
+  | "renter"
+  | "vehicle"
+  | "date"
+  | "amount";
+
+const COLUMNS: Array<{
+  key: SortKey;
+  label: string;
+}> = [
+  { key: "vehicle", label: "Vehicle" },
+  { key: "renter", label: "Renter" },
+  {
+    key: "rentedOutBy",
+    label: "Rented out by",
+  },
+  { key: "date", label: "Picked up" },
+  { key: "time", label: "Returned" },
+  { key: "amount", label: "Rent" },
+];
+
+function millis(
+  value: string | null,
+): number {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = Date.parse(value);
+
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function compareOn(
+  key: SortKey,
+  left: RentalHistoryEntry,
+  right: RentalHistoryEntry,
+): number {
+  switch (key) {
+    case "rentedOutBy":
+      return left.rentedOutByName.localeCompare(
+        right.rentedOutByName,
+      );
+
+    case "renter":
+      return left.customerName.localeCompare(
+        right.customerName,
+      );
+
+    case "vehicle":
+      return left.vehicleRegistration.localeCompare(
+        right.vehicleRegistration,
+      );
+
+    case "date":
+      return (
+        millis(left.pickupAt) -
+        millis(right.pickupAt)
+      );
+
+    case "amount":
+      return (
+        left.totalCents - right.totalCents
+      );
+
+    /*
+     * "Time" is when the rental last moved — its return, or
+     * its pickup while it is still out — which is the order
+     * the list opens in.
+     */
+    default:
+      return (
+        millis(
+          left.actualReturnAt ??
+            left.pickupAt,
+        ) -
+        millis(
+          right.actualReturnAt ??
+            right.pickupAt,
+        )
+      );
+  }
+}
+
 export function RentalHistory({
   customerId = null,
   limit = 50,
@@ -112,6 +200,37 @@ export function RentalHistory({
    */
   const [openRentalId, setOpenRentalId] =
     useState<string>();
+
+  /*
+   * The table sorts on whichever column the office is asking
+   * a question about: who rented this out, who rented it, for
+   * how much, and when.
+   */
+  const [sort, setSort] = useState<{
+    key: SortKey;
+    ascending: boolean;
+  }>({ key: "time", ascending: false });
+
+  function sortBy(key: SortKey) {
+    setSort((current) =>
+      current.key === key
+        ? {
+            key,
+            ascending: !current.ascending,
+          }
+        : {
+            key,
+
+            /* Dates and money read newest and largest
+               first; names read A to Z. */
+            ascending: !(
+              key === "time" ||
+              key === "date" ||
+              key === "amount"
+            ),
+          },
+    );
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -166,22 +285,39 @@ export function RentalHistory({
     .trim()
     .toLowerCase();
 
-  const visible = needle
+  const matched = needle
     ? entries.filter((entry) =>
         [
           entry.customerName,
           entry.vehicleRegistration,
+          entry.rentedOutByName,
+          entry.bookedByName,
+          entry.returnedByName,
           entry.status,
           entry.isHistorical
             ? "past booking"
             : "",
         ].some((value) =>
-          String(value)
+          String(value ?? "")
             .toLowerCase()
             .includes(needle),
         ),
       )
     : entries;
+
+  const visible = [...matched].sort(
+    (left, right) => {
+      const order = compareOn(
+        sort.key,
+        left,
+        right,
+      );
+
+      return sort.ascending
+        ? order
+        : -order;
+    },
+  );
 
   if (loading) {
     return (
@@ -312,14 +448,42 @@ export function RentalHistory({
 
   return (
     <div className="table-wrap customer-table-wrap">
-      <table>
+      <table className="sortable-table">
         <thead>
           <tr>
-            <th>Vehicle</th>
-            <th>Customer</th>
-            <th>Picked up</th>
-            <th>Returned</th>
-            <th>Rent</th>
+            {COLUMNS.map((column) => (
+              <th
+                key={column.key}
+                aria-sort={
+                  sort.key === column.key
+                    ? sort.ascending
+                      ? "ascending"
+                      : "descending"
+                    : "none"
+                }
+              >
+                <button
+                  type="button"
+                  className="column-sort"
+                  onClick={() =>
+                    sortBy(column.key)
+                  }
+                >
+                  {column.label}
+
+                  <ArrowUpDown
+                    size={13}
+                    aria-hidden="true"
+                    className={
+                      sort.key === column.key
+                        ? "is-sorted"
+                        : undefined
+                    }
+                  />
+                </button>
+              </th>
+            ))}
+
             <th>Outstanding</th>
             <th>Status</th>
           </tr>
@@ -338,7 +502,7 @@ export function RentalHistory({
                 <button
                   type="button"
                   className="text-button history-open"
-                  title={`Open the agreement for ${entry.customerName}`}
+                  title={`Open the rental file for ${entry.customerName}`}
                   onClick={() =>
                     setOpenRentalId(
                       entry.rentalId,
@@ -347,6 +511,20 @@ export function RentalHistory({
                 >
                   {entry.customerName}
                 </button>
+              </td>
+
+              <td>
+                <strong>
+                  {entry.rentedOutByName}
+                </strong>
+
+                {entry.returnedByName &&
+                  entry.returnedByName !==
+                    entry.rentedOutByName && (
+                    <span>
+                      {`Returned to ${entry.returnedByName}`}
+                    </span>
+                  )}
               </td>
 
               <td>{day(entry.pickupAt)}</td>

@@ -773,11 +773,6 @@ export function StaffDirectory() {
                 disabled
               />
 
-              <p className="form-help">
-                The sign-in address belongs to
-                Firebase Authentication and
-                cannot be changed from here.
-              </p>
             </div>
 
             <div className="form-actions">

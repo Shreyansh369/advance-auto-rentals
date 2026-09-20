@@ -6951,3 +6951,65 @@ canvas {
     padding: 12px;
   }
 }
+
+/* ---------------------------------------------------------
+   Sortable tables and the past-booking panel
+   --------------------------------------------------------- */
+
+.sortable-table th {
+  padding: 0;
+}
+
+.column-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 11px 13px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  text-transform: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.column-sort:hover {
+  color: var(--blue);
+}
+
+/*
+ * The arrow is always there so the header does not jump when
+ * the sort moves to it; only the sorted column's is inked.
+ */
+.column-sort svg {
+  flex: 0 0 auto;
+  opacity: 0.32;
+}
+
+.column-sort svg.is-sorted {
+  color: var(--blue);
+  opacity: 1;
+}
+
+.past-booking-panel {
+  margin-bottom: 16px;
+  padding: 20px;
+  border: 1px solid #cbd7ff;
+  border-radius: var(--radius);
+  background: #f9fbff;
+}
+
+@media (max-width: 720px) {
+  .past-booking-panel {
+    padding: 16px 14px;
+  }
+
+  .column-sort {
+    padding: 10px 11px;
+  }
+}

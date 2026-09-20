@@ -369,13 +369,6 @@ export function ExpenseRecorder() {
 
             <h2>Record an expense</h2>
 
-            <p>
-              What the business spent running
-              a vehicle. Each entry is
-              recorded against your account
-              and cannot be edited or deleted
-              afterwards.
-            </p>
           </div>
         </div>
 

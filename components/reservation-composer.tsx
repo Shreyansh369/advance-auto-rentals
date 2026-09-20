@@ -18,8 +18,6 @@ import {
   ClipboardCheck,
   CreditCard,
   FileText,
-  History,
-  ListChecks,
   Plus,
   Search,
   UserRound,
@@ -39,7 +37,6 @@ import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
 import { CustomerSignaturePad } from "./customer-signature-pad";
 import { RentalAgreement } from "./rental-agreement";
-import { RentalRecords } from "./rental-records";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
@@ -64,18 +61,12 @@ import {
   type ContractQueueEntry,
 } from "@/lib/services/firestore-client";
 
-import {
-  listAssignableStaff,
-} from "@/lib/services/staff-directory";
-
 type Tab =
   | "booking"
   | "checkout"
   | "extend"
   | "return"
-  | "payment"
-  | "past"
-  | "records";
+  | "payment";
 
 type CustomerMode =
   | "existing"
@@ -179,16 +170,6 @@ const tabs: Array<{
     label: "Payment",
     icon: CreditCard,
   },
-  {
-    id: "past",
-    label: "Past booking",
-    icon: History,
-  },
-  {
-    id: "records",
-    label: "Rental records",
-    icon: ListChecks,
-  },
 ];
 
 /*
@@ -204,10 +185,7 @@ const tabs: Array<{
  * — they restate the booking's own quote.
  */
 const CHECKOUT_CHARGE_KEYS = [
-  "extraHours",
   "insurance",
-  "liabilityWaiver",
-  "windscreenWaiver",
   "carSeat",
   "other",
 ] as const;
@@ -228,6 +206,18 @@ const returnAdjustmentOptions = [
   {
     type: "extension",
     label: "Extension",
+  },
+  {
+    type: "extra_hours",
+    label: "Extra hours",
+  },
+  {
+    type: "liability_waiver",
+    label: "Liability waiver",
+  },
+  {
+    type: "windscreen_waiver",
+    label: "Windscreen waiver",
   },
   {
     type: "cleaning",
@@ -323,12 +313,10 @@ const PAYMENT_FEE_STAGES = [
   {
     id: "checkout",
     heading: "Collected at checkout",
-    hint: "Insurance and car seats are settled when the renter takes the vehicle. The deposit is taken on the checkout screen: it is held, not earned, so it never joins the rental balance.",
   },
   {
     id: "return",
     heading: "Collected at return",
-    hint: "Extensions, cleaning, detailing and refuelling are settled when the vehicle comes back.",
   },
 ] as const;
 
@@ -617,12 +605,9 @@ export function ReservationComposer() {
    */
   const [agreementCharges, setAgreementCharges] =
     useState<Record<string, string>>({
-      liabilityWaiver: "",
-      windscreenWaiver: "",
       insurance: "",
       carSeat: "",
       other: "",
-      extraHours: "",
     });
 
   /*
@@ -649,11 +634,19 @@ export function ReservationComposer() {
       ).toFixed(2),
     );
 
+  /*
+   * The waivers taken and the hours run over are known when
+   * the vehicle comes back, not when it goes out, so they are
+   * collected at return and merged into the stored agreement.
+   */
   const [waivers, setWaivers] = useState({
     liabilityWaiver: false,
     windscreenWaiver: false,
     personalAccidentInsurance: false,
   });
+
+  const [returnExtraHours, setReturnExtraHours] =
+    useState("0");
 
   const [paymentMethod, setPaymentMethod] =
     useState<AgreementPaymentMethod | "">("");
@@ -702,20 +695,6 @@ export function ReservationComposer() {
    * from another, or an administrator can never reach the
    * agreement they are supposed to approve.
    */
-  /*
-   * Who a past booking can be attributed to. Only an
-   * administrator may list staff, so an operations account
-   * gets itself back and records the rental under its own
-   * name; see listAssignableStaff.
-   */
-  const [assignableStaff, setAssignableStaff] =
-    useState<
-      Array<{
-        uid: string;
-        fullName: string;
-      }>
-    >([]);
-
   /*
    * The directory grows without limit, and a list of every
    * matching name pushed the rest of the booking form off the
@@ -1273,149 +1252,6 @@ export function ReservationComposer() {
       cancelled = true;
     };
   }, [tab]);
-
-  useEffect(() => {
-    if (tab !== "past") {
-      return;
-    }
-
-    let cancelled = false;
-
-    async function loadStaff() {
-      const staff =
-        await listAssignableStaff();
-
-      if (!cancelled) {
-        setAssignableStaff(staff);
-      }
-    }
-
-    void loadStaff();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [tab]);
-
-  /*
-   * A rental the office already ran, typed in from the paper
-   * file. Nothing is reserved and no vehicle changes status:
-   * the record is written as a closed rental and flagged as
-   * historical so no screen counts it as a car that is out.
-   */
-  function recordPastBooking(
-    event: React.FormEvent<HTMLFormElement>,
-  ) {
-    event.preventDefault();
-
-    const formElement =
-      event.currentTarget;
-
-    const form = new FormData(
-      formElement,
-    );
-
-    const paidCents = dollarsToCents(
-      form.get("paidAmount"),
-    );
-
-    void run(async () => {
-      /* Parsed inside the task so a malformed date is
-         reported through the screen's error banner rather
-         than thrown past it. */
-      const pickupAt = localToIso(
-        form.get("pickupAt"),
-      );
-
-      const returnedAt = localToIso(
-        form.get("returnedAt"),
-      );
-
-      await callFirestoreOperation<
-        {
-          customerId: string;
-          vehicleId: string;
-          pickupAt: string;
-          returnedAt: string;
-          handledByUid: string | null;
-          baseRentalCents: number;
-          additionalChargesCents: number;
-          paidCents: number;
-          paymentMethod: string | null;
-          pickupLocation: string | null;
-          dropoffLocation: string | null;
-          notes: string | null;
-          idempotencyKey: string;
-        },
-        {
-          rentalId: string;
-          reservationId: string;
-        }
-      >("recordPastRental", {
-        customerId: String(
-          form.get("customerId") ?? "",
-        ),
-
-        vehicleId: String(
-          form.get("vehicleId") ?? "",
-        ),
-
-        pickupAt,
-
-        returnedAt,
-
-        handledByUid:
-          String(
-            form.get("handledByUid") ?? "",
-          ).trim() || null,
-
-        baseRentalCents: dollarsToCents(
-          form.get("rentalAmount"),
-        ),
-
-        additionalChargesCents:
-          dollarsToCents(
-            form.get("additionalAmount"),
-          ),
-
-        paidCents,
-
-        paymentMethod:
-          paidCents > 0
-            ? String(
-                form.get("paymentMethod") ??
-                  "cash",
-              )
-            : null,
-
-        pickupLocation:
-          String(
-            form.get("pickupLocation") ?? "",
-          ).trim() || null,
-
-        dropoffLocation:
-          String(
-            form.get("dropoffLocation") ??
-              "",
-          ).trim() || null,
-
-        notes:
-          String(
-            form.get("notes") ?? "",
-          ).trim() || null,
-
-        idempotencyKey: operationKey(
-          "past-rental",
-        ),
-      });
-
-      releaseOperationKey("past-rental");
-
-      formElement.reset();
-
-      return "Past booking recorded. It is listed under Rental records as a past booking.";
-    });
-  }
 
   async function run(
     task: () => Promise<string>,
@@ -2128,7 +1964,7 @@ export function ReservationComposer() {
                   ? additionalDriver
                   : null,
 
-              waivers,
+              waivers: {},
 
               depositCents: dollarsToCents(
                 form.get("depositAmount"),
@@ -2157,9 +1993,7 @@ export function ReservationComposer() {
                   form.get("notes"),
                 ).trim() || null,
 
-              extraHours: Number(
-                form.get("extraHours") ?? 0,
-              ),
+              extraHours: 0,
             },
           );
 
@@ -2178,18 +2012,9 @@ export function ReservationComposer() {
         );
 
         setAgreementCharges({
-          liabilityWaiver: "",
-          windscreenWaiver: "",
           insurance: "",
           carSeat: "",
           other: "",
-          extraHours: "",
-        });
-
-        setWaivers({
-          liabilityWaiver: false,
-          windscreenWaiver: false,
-          personalAccidentInsurance: false,
         });
 
         setAdditionalDriver({
@@ -2372,6 +2197,11 @@ export function ReservationComposer() {
                 amountCents: number;
                 note: string;
               }>;
+              waivers: Record<
+                string,
+                boolean
+              >;
+              extraHours: number;
               notes:
                 | string
                 | null;
@@ -2417,6 +2247,12 @@ export function ReservationComposer() {
 
               adjustments,
 
+              waivers,
+
+              extraHours: Number(
+                returnExtraHours || 0,
+              ),
+
               notes:
                 String(
                   form.get(
@@ -2438,6 +2274,13 @@ export function ReservationComposer() {
         setReturnRentalId("");
         setReturnAdjustments({});
         setReturnAdjustmentNotes({});
+        setReturnExtraHours("0");
+
+        setWaivers({
+          liabilityWaiver: false,
+          windscreenWaiver: false,
+          personalAccidentInsurance: false,
+        });
 
         /*
          * A return that leaves a balance goes straight to the
@@ -2919,321 +2762,7 @@ export function ReservationComposer() {
           </section>
         )}
 
-      {tab === "records" && (
-        <section className="surface ledger-surface">
-          <div className="section-heading">
-            <div>
-              <p className="section-kicker">
-                Rental records
-              </p>
-
-              <h2>
-                Who rented what, and to whom
-              </h2>
-
-              <p>
-                Every rental the office has
-                run, live or closed, with the
-                staff member who handled it.
-                Bookings typed in from the
-                paper file are marked as past
-                bookings.
-              </p>
-            </div>
-          </div>
-
-          <RentalRecords limit={300} />
-        </section>
-      )}
-
-      {/* The records tab renders its own surface above. */}
-      {tab !== "records" && (
       <section className="workflow-shell surface">
-        {tab === "past" && (
-          <form
-            className="form-grid"
-            onSubmit={recordPastBooking}
-          >
-            <div className="form-section">
-              <p className="section-kicker">
-                Past booking
-              </p>
-
-              <h2>
-                Record a rental that already
-                happened
-              </h2>
-
-              <p>
-                For a rental the office ran
-                before this system, or while
-                it was unavailable. Nothing is
-                reserved and no vehicle
-                changes status: the record is
-                written as a closed rental and
-                listed as a past booking.
-              </p>
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-customer">
-                Customer
-              </label>
-
-              <select
-                id="past-customer"
-                name="customerId"
-                required
-                defaultValue=""
-              >
-                <option value="" disabled>
-                  Select customer
-                </option>
-
-                {customers.map(
-                  (customer) => (
-                    <option
-                      value={customer.id}
-                      key={customer.id}
-                    >
-                      {customer.fullName}
-                      {" · "}
-                      {customer.telephone}
-                    </option>
-                  ),
-                )}
-              </select>
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-vehicle">
-                Vehicle
-              </label>
-
-              <select
-                id="past-vehicle"
-                name="vehicleId"
-                required
-                defaultValue=""
-              >
-                <option value="" disabled>
-                  Select vehicle
-                </option>
-
-                {vehicles.map((vehicle) => (
-                  <option
-                    value={vehicle.id}
-                    key={vehicle.id}
-                  >
-                    {
-                      vehicle.registrationNumber
-                    }
-                    {" · "}
-                    {vehicle.make}
-                    {" "}
-                    {vehicle.model}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-pickup">
-                Rental start
-              </label>
-
-              <input
-                id="past-pickup"
-                name="pickupAt"
-                type="datetime-local"
-                max={todayDateTime()}
-                required
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-return">
-                Return
-              </label>
-
-              <input
-                id="past-return"
-                name="returnedAt"
-                type="datetime-local"
-                max={todayDateTime()}
-                required
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-handled-by">
-                Handled by
-              </label>
-
-              <select
-                id="past-handled-by"
-                name="handledByUid"
-                defaultValue=""
-              >
-                <option value="">
-                  Me
-                </option>
-
-                {assignableStaff.map(
-                  (member) => (
-                    <option
-                      value={member.uid}
-                      key={member.uid}
-                    >
-                      {member.fullName}
-                    </option>
-                  ),
-                )}
-              </select>
-
-              <p className="form-help">
-                The staff member who rented the
-                vehicle out at the time. The
-                name is read from their own
-                profile, not from this form.
-              </p>
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-rental-amount">
-                Rental charged (USD)
-              </label>
-
-              <input
-                id="past-rental-amount"
-                name="rentalAmount"
-                type="number"
-                min="0.01"
-                max="100000"
-                step="0.01"
-                inputMode="decimal"
-                required
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-additional-amount">
-                Additional charges (USD)
-              </label>
-
-              <input
-                id="past-additional-amount"
-                name="additionalAmount"
-                type="number"
-                min="0"
-                max="100000"
-                step="0.01"
-                inputMode="decimal"
-                defaultValue="0"
-              />
-
-              <p className="form-help">
-                Fuel, cleaning, damage and the
-                rest, as one figure.
-              </p>
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-paid-amount">
-                Amount received (USD)
-              </label>
-
-              <input
-                id="past-paid-amount"
-                name="paidAmount"
-                type="number"
-                min="0"
-                max="100000"
-                step="0.01"
-                inputMode="decimal"
-                defaultValue="0"
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-payment-method">
-                Payment method
-              </label>
-
-              <select
-                id="past-payment-method"
-                name="paymentMethod"
-                defaultValue="cash"
-              >
-                <option value="cash">
-                  Cash
-                </option>
-
-                <option value="card">
-                  Card
-                </option>
-
-                <option value="bank_transfer">
-                  Bank transfer
-                </option>
-
-                <option value="other">
-                  Other
-                </option>
-              </select>
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-pickup-location">
-                Pickup location
-              </label>
-
-              <input
-                id="past-pickup-location"
-                name="pickupLocation"
-                maxLength={160}
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="past-dropoff-location">
-                Drop-off location
-              </label>
-
-              <input
-                id="past-dropoff-location"
-                name="dropoffLocation"
-                maxLength={160}
-              />
-            </div>
-
-            <div className="field full">
-              <label htmlFor="past-notes">
-                Notes
-              </label>
-
-              <textarea
-                id="past-notes"
-                name="notes"
-                maxLength={1000}
-              />
-            </div>
-
-            <div className="form-actions">
-              <button
-                className="button button-primary"
-                disabled={
-                  busy ||
-                  !customers.length ||
-                  !vehicles.length
-                }
-              >
-                Record past booking
-              </button>
-            </div>
-          </form>
-        )}
-
         {tab ===
           "booking" && (
           <form
@@ -4468,22 +3997,6 @@ export function ReservationComposer() {
             </div>
 
             <div className="field">
-              <label htmlFor="extra-hours">
-                Extra hours
-              </label>
-
-              <input
-                id="extra-hours"
-                name="extraHours"
-                type="number"
-                min={0}
-                max={999}
-                step={1}
-                defaultValue={0}
-              />
-            </div>
-
-            <div className="field">
               <label htmlFor="deposit">
                 Deposit (USD)
               </label>
@@ -4502,13 +4015,6 @@ export function ReservationComposer() {
                 }
               />
 
-              <p className="form-help">
-                Taken at the counter and held
-                against the rental. It is
-                refundable, so it is recorded
-                beside the balance rather than
-                added to it.
-              </p>
             </div>
 
             {/* ------------------ waivers and charges */}
@@ -4517,17 +4023,6 @@ export function ReservationComposer() {
                 Due at checkout
               </legend>
 
-              <p className="form-help">
-                What the renter settles at the
-                counter: the rental days from
-                the booking quote, the deposit
-                above, and the insurance,
-                waivers and car seats below.
-                Fuel, cleaning and detailing
-                are not entered here — they are
-                raised at return, when the
-                vehicle has been seen.
-              </p>
 
               <div className="checkout-charges">
                 {agreementChargeRows.map(
@@ -4568,47 +4063,6 @@ export function ReservationComposer() {
                 )}
               </div>
 
-              <div className="checkout-waivers">
-                {[
-                  [
-                    "liabilityWaiver",
-                    "Liability waiver",
-                  ],
-                  [
-                    "windscreenWaiver",
-                    "Windscreen waiver",
-                  ],
-                  [
-                    "personalAccidentInsurance",
-                    "Personal accident insurance",
-                  ],
-                ].map(([key, label]) => (
-                  <label
-                    className="checkbox-row"
-                    key={key}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={
-                        waivers[
-                          key as keyof typeof waivers
-                        ]
-                      }
-                      onChange={(event) =>
-                        setWaivers(
-                          (current) => ({
-                            ...current,
-                            [key]:
-                              event.target
-                                .checked,
-                          }),
-                        )
-                      }
-                    />
-                    {label}
-                  </label>
-                ))}
-              </div>
             </fieldset>
 
             {checkoutReservationQuote && (
@@ -5167,22 +4621,80 @@ export function ReservationComposer() {
               </select>
             </div>
 
+            <div className="field">
+              <label htmlFor="return-extra-hours">
+                Extra hours
+              </label>
+
+              <input
+                id="return-extra-hours"
+                type="number"
+                min={0}
+                max={999}
+                step={1}
+                value={returnExtraHours}
+                onChange={(event) =>
+                  setReturnExtraHours(
+                    event.target.value,
+                  )
+                }
+              />
+            </div>
+
             {/* ------------------ charges raised at return */}
+            <fieldset className="field full checkout-block">
+              <legend>
+                Waivers taken
+              </legend>
+
+              <div className="checkout-waivers">
+                {[
+                  [
+                    "liabilityWaiver",
+                    "Liability waiver",
+                  ],
+                  [
+                    "windscreenWaiver",
+                    "Windscreen waiver",
+                  ],
+                  [
+                    "personalAccidentInsurance",
+                    "Personal accident insurance",
+                  ],
+                ].map(([key, label]) => (
+                  <label
+                    className="checkbox-row"
+                    key={key}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={
+                        waivers[
+                          key as keyof typeof waivers
+                        ]
+                      }
+                      onChange={(event) =>
+                        setWaivers(
+                          (current) => ({
+                            ...current,
+                            [key]:
+                              event.target
+                                .checked,
+                          }),
+                        )
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
             <fieldset className="field full checkout-block">
               <legend>
                 Due at return
               </legend>
 
-              <p className="form-help">
-                What the renter owes now the
-                vehicle is back: an extension,
-                cleaning or detailing,
-                refuelling, damage and
-                anything else. Leave a row
-                empty and it is not charged. A
-                discount is taken off the
-                balance.
-              </p>
 
               <div className="checkout-charges">
                 {returnAdjustmentOptions.map(
@@ -5279,18 +4791,6 @@ export function ReservationComposer() {
                   </div>
                 </dl>
 
-                {returnRental &&
-                  returnRental.depositCents >
-                    0 && (
-                    <p className="form-help">
-                      The deposit is refundable
-                      and is not part of the
-                      balance. Return it, or
-                      settle the charges above
-                      against it, at the
-                      counter.
-                    </p>
-                  )}
               </div>
             </fieldset>
 
@@ -5474,9 +4974,6 @@ export function ReservationComposer() {
                   {stage.heading}
                 </legend>
 
-                <p className="form-help">
-                  {stage.hint}
-                </p>
 
                 <div className="checkout-charges">
                   {paymentFeeOptions
@@ -5629,7 +5126,6 @@ export function ReservationComposer() {
           </form>
         )}
       </section>
-      )}
     </AppShell>
   );
 }
