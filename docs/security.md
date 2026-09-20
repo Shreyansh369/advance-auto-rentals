@@ -3,7 +3,19 @@
 ## Roles
 
 - **Administrator:** all operational reads and writes plus the financial reporting reads (expenses, ledger, refunds, audit logs) and staff-profile administration.
-- **Operations:** the operational workflows — customers, vehicles, reservations, checkout, extension, return, payment and expense recording. Operations cannot read expenses, the ledger, refunds or audit logs, and the Finance screen is closed to them.
+- **Operations:** the operational workflows — customers, vehicles, reservations, checkout, extension, return, payment, past-booking entry and expense recording. Operations cannot read the ledger, refunds, audit logs or anybody else's expenses, and the Finance screen is closed to them.
+
+### Where the line between the two falls
+
+Revenue reporting is administrator-only, and that is enforced in three places rather than one:
+
+- The **Finance** link is not rendered in the navigation for an operations account, and the screen itself refuses to load for one.
+- `getFinancialOverview` re-reads the caller's own `users/{uid}` profile and refuses before it issues a single read, so the refusal is a sentence the office can read rather than a raw permission error.
+- The rules are the boundary that actually holds: `refunds`, `financialLedger` and `auditLogs` are admin-read, and `vehicleExpenses` is admin-read except for the entries the caller recorded itself. Opening `/finance` directly, or calling the same reads from a console, is refused by Firestore whatever the browser believes.
+
+What operations keeps is what running a rental needs: a rental's own balance, so a payment can be taken at the counter, and the ability to record an expense. Recording an expense is operational work — the person holding the garage invoice is the one who took the car in — so it has a screen of its own at `/expenses`, separate from revenue reporting. An operations account reads back only the expenses it recorded; the cost side of the business as a whole stays with an administrator.
+
+Editing a staff member's own details — name, mobile, age — is an administrator's write and leaves an audit entry. It deliberately cannot touch `role` or `status`: those are access decisions with their own controls, and the rules refuse a self-update that reaches for either.
 
 A role only takes effect once an administrator sets `role` and `status: "approved"` on the staff member's `users/{uid}` document. Sign-up can only create its own profile with `status: "pending"` and `role: null`, and the rules refuse any self-update that touches `role`, `status` or `requestedRole`, so an account cannot promote itself.
 
@@ -19,6 +31,9 @@ That decision is made on the **Staff** screen, which only an administrator can l
 | Duplicate customer records | An edit writes back to the same customer document; a new document is only created when no customer id is supplied |
 | Direct database manipulation / IDOR | Deny-by-default rules; role and approval read from `users/{uid}` inside the rules |
 | Financial-history mutation | Payments are create-only for staff; ledger, expense and audit entries cannot be edited or deleted except by an administrator |
+| Expense attributed to somebody else | An expense can only be created with `recordedBy` equal to the caller's own uid, so an entry cannot be filed under another account |
+| Revenue reporting reached by a direct URL or API call | Admin-only in the navigation, in the screen, in the service call and — the part that binds — in the rules |
+| Historical rental used to rewrite live state | A past booking is refused unless its whole window is in the past; it changes no vehicle status, holds no reservation and is flagged `isHistorical`, and its idempotency key stops the same record being entered twice |
 | Invalid monetary or sensor values | Amounts rejected unless whole non-negative cents within a fixed ceiling; odometer and fuel values validated against fixed ranges and enums; `undefined` is never written |
 | Malicious uploads | Image-only MIME allow-list and size ceiling before upload; unsigned Cloudinary preset carries no credential |
 | Privilege escalation | Role and approval live in a document the account itself cannot modify |

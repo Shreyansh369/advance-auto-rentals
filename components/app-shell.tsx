@@ -23,6 +23,7 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  ReceiptText,
   UserRoundCheck,
   UsersRound,
   X,
@@ -57,6 +58,14 @@ const navigation = [
     href: "/vehicles",
     label: "Fleet",
     icon: CarFront,
+  },
+  {
+    /* Recording what the fleet costs to run is operational
+       work, so it sits outside the administrator-only
+       Finance screen. */
+    href: "/expenses",
+    label: "Expenses",
+    icon: ReceiptText,
   },
   {
     href: "/finance",

@@ -18,6 +18,7 @@ import {
 import { getFirebaseClient } from "@/lib/firebase/client";
 import {
   calculateBalance,
+  chargedRentalDays,
   quoteRental,
 } from "@/packages/domain/src/pricing";
 import type {
@@ -1105,6 +1106,88 @@ async function getPayableRentals(): Promise<PayableRental[]> {
    Customer
    ========================================================= */
 
+/*
+ * A date of birth is printed on the rental agreement and is
+ * what an under-25 insurance premium is judged from, so a
+ * typo that lands in the future or a century ago has to be
+ * refused rather than quietly stored.
+ */
+const MIN_RENTER_AGE_YEARS = 16;
+const MAX_RENTER_AGE_YEARS = 120;
+
+function assertDateOfBirth(
+  value: unknown,
+): string | null {
+  const text =
+    trimmedOrNull(value);
+
+  if (!text) {
+    return null;
+  }
+
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(
+      text,
+    )
+  ) {
+    throw new Error(
+      "Enter the date of birth as a calendar date.",
+    );
+  }
+
+  const born =
+    new Date(
+      `${text}T00:00:00`,
+    );
+
+  if (
+    Number.isNaN(
+      born.getTime(),
+    )
+  ) {
+    throw new Error(
+      "Enter a valid date of birth.",
+    );
+  }
+
+  const today =
+    new Date();
+
+  today.setHours(0, 0, 0, 0);
+
+  if (
+    born.getTime() >
+    today.getTime()
+  ) {
+    throw new Error(
+      "Date of birth cannot be in the future.",
+    );
+  }
+
+  const years =
+    (today.getTime() -
+      born.getTime()) /
+    (365.2425 * 86_400_000);
+
+  if (
+    years < MIN_RENTER_AGE_YEARS
+  ) {
+    throw new Error(
+      `A customer must be at least ${MIN_RENTER_AGE_YEARS} years old.`,
+    );
+  }
+
+  if (
+    years > MAX_RENTER_AGE_YEARS
+  ) {
+    throw new Error(
+      "Check the date of birth: that age is not plausible.",
+    );
+  }
+
+  return text;
+}
+
 async function createOrUpdateCustomer(
   input: Record<string, unknown>,
 ): Promise<{
@@ -1258,11 +1341,9 @@ async function createOrUpdateCustomer(
     licenceExpiresAt,
 
     dateOfBirth:
-      input.dateOfBirth == null
-        ? null
-        : String(
-            input.dateOfBirth,
-          ),
+      assertDateOfBirth(
+        input.dateOfBirth,
+      ),
 
     notes:
       trimmedOrNull(
@@ -2691,6 +2772,7 @@ const CHARGE_KEYS = [
   "liabilityWaiver",
   "windscreenWaiver",
   "insurance",
+  "carSeat",
   "other",
 ] as const;
 
@@ -3096,6 +3178,7 @@ async function checkoutReservation(
     "liabilityWaiver",
     "windscreenWaiver",
     "insurance",
+    "carSeat",
     "other",
   ].reduce(
     (sum, key) =>
@@ -3330,7 +3413,18 @@ async function checkoutReservation(
           refundedPaymentCents:
             0,
 
-          depositHeldCents: 0,
+          /*
+           * The renter pays the deposit at the counter, so
+           * the record has to say what is being held. It is
+           * refundable and therefore never part of the
+           * rental total: it is tracked beside it, and the
+           * balance the till collects is the total plus
+           * whatever is still to be lodged as a deposit.
+           */
+          depositHeldCents:
+            Number(
+              agreement.depositCents ?? 0,
+            ),
 
           refundedDepositCents:
             0,
@@ -3414,6 +3508,56 @@ async function checkoutReservation(
             actorUid,
         },
       );
+
+      /*
+       * A deposit is money held, not money earned, so it is
+       * recorded at zero value against the period's revenue
+       * and carries its own amount for the desk to refund
+       * against.
+       */
+      const depositCents = Number(
+        agreement.depositCents ?? 0,
+      );
+
+      if (depositCents > 0) {
+        transaction.set(
+          doc(
+            collection(
+              db,
+              "financialLedger",
+            ),
+          ),
+          {
+            rentalId:
+              rentalRef.id,
+
+            vehicleId:
+              String(
+                reservation.vehicleId,
+              ),
+
+            vehicleRegistration,
+
+            customerId:
+              String(
+                reservation.customerId,
+              ),
+
+            entryType:
+              "deposit_held",
+
+            amountCents: 0,
+
+            depositCents,
+
+            occurredAt:
+              nowTimestamp(),
+
+            recordedBy:
+              actorUid,
+          },
+        );
+      }
     },
   );
 
@@ -4257,9 +4401,25 @@ async function returnRental(
    Payment
    ========================================================= */
 
+/*
+ * What can be added to a payment on top of the rental.
+ *
+ * Which of them belong to which end of the hire is a matter
+ * for the till — the insurance and the car seats are settled
+ * at checkout, and an extension, the cleaning and the
+ * refuelling at return — but all of them can legitimately be
+ * collected late, so the list is not split here.
+ *
+ * The deposit is deliberately absent. It is taken at the
+ * counter and held rather than earned, so it is recorded on
+ * the agreement as `depositHeldCents` and never raises the
+ * rental total; charging it here would turn refundable money
+ * into revenue and count it twice.
+ */
 const ADDITIONAL_FEE_TYPES = [
   "car_seat",
   "insurance",
+  "extension",
   "cleaning",
   "smoke_fee",
   "refueling",
@@ -5695,6 +5855,39 @@ async function recordVehicleExpense(
    Financial overview
    ========================================================= */
 
+/*
+ * Revenue reporting is an administrator's screen.
+ *
+ * The security rules are the real boundary — `refunds`,
+ * `financialLedger` and `vehicleExpenses` are admin-read, so
+ * an operations account is refused by Firestore whatever the
+ * browser does. This check is there so the refusal is a
+ * sentence the office can read instead of a raw permission
+ * error, and so a non-administrator never issues the reads
+ * at all.
+ */
+async function assertAdmin(
+  action: string,
+): Promise<void> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const profile = await getDoc(
+    doc(db, "users", actorUid),
+  );
+
+  if (
+    !profile.exists() ||
+    profile.get("status") !== "approved" ||
+    profile.get("role") !== "admin"
+  ) {
+    throw new Error(
+      `${action} is restricted to administrators.`,
+    );
+  }
+}
+
 async function getFinancialOverview(
   input: {
     from: string;
@@ -5702,6 +5895,10 @@ async function getFinancialOverview(
     vehicleId: string | null;
   },
 ): Promise<FinancialOverview> {
+  await assertAdmin(
+    "Financial reporting",
+  );
+
   const { db } =
     getFirebaseClient();
 
@@ -7284,6 +7481,8 @@ export type RentalHistoryEntry = {
   vehicleId: string;
   vehicleRegistration: string;
   status: string;
+  /** Typed in from the paper file rather than run here. */
+  isHistorical: boolean;
   pickupAt: string | null;
   actualReturnAt: string | null;
   baseRentalCents: number;
@@ -7384,6 +7583,9 @@ async function listRentalHistory(
           entry.get("rentalStatus") ?? "active",
         ),
 
+        isHistorical:
+          entry.get("isHistorical") === true,
+
         pickupAt,
 
         actualReturnAt,
@@ -7426,6 +7628,971 @@ async function listRentalHistory(
 }
 
 /* =========================================================
+   Historical rental entry
+   ========================================================= */
+
+/* How a payment was taken; the same list the till offers. */
+const RENTAL_PAYMENT_METHODS = [
+  "cash",
+  "card",
+  "bank_transfer",
+  "other",
+] as const;
+
+export type PastRentalInput = {
+  customerId: string;
+  vehicleId: string;
+  pickupAt: string;
+  returnedAt: string;
+  /** The employee who handed the vehicle over at the time. */
+  handledByUid: string | null;
+  baseRentalCents: number;
+  additionalChargesCents: number;
+  paidCents: number;
+  paymentMethod: string | null;
+  pickupLocation: string | null;
+  dropoffLocation: string | null;
+  notes: string | null;
+  idempotencyKey: string;
+};
+
+/*
+ * A rental the office ran before this system existed, or one
+ * that was written on paper while it was down.
+ *
+ * It is deliberately not the booking workflow with the dates
+ * changed: nothing is reserved, no vehicle changes status and
+ * no agreement is issued, because all of that already
+ * happened. What is written is the record — who rented what,
+ * from whom, between which dates and for how much — flagged
+ * as historical so no screen mistakes it for a live booking.
+ */
+async function recordPastRental(
+  input: PastRentalInput,
+): Promise<{
+  rentalId: string;
+  reservationId: string;
+}> {
+  const { db } =
+    getFirebaseClient();
+
+  const actorUid =
+    getActorUid();
+
+  const pickupAt =
+    asTimestamp(
+      input.pickupAt,
+    );
+
+  const returnedAt =
+    asTimestamp(
+      input.returnedAt,
+    );
+
+  if (
+    returnedAt.toMillis() <=
+    pickupAt.toMillis()
+  ) {
+    throw new Error(
+      "The return must be after the pickup.",
+    );
+  }
+
+  /*
+   * A "past" booking that has not happened yet would sit in
+   * the records as a completed rental for a vehicle still on
+   * the forecourt, so the whole window has to be behind us.
+   */
+  if (
+    returnedAt.toMillis() >
+    Date.now()
+  ) {
+    throw new Error(
+      "A past booking cannot end in the future. Use the booking workflow instead.",
+    );
+  }
+
+  const baseRentalCents =
+    assertMoneyCents(
+      input.baseRentalCents,
+      "Rental amount",
+    );
+
+  if (baseRentalCents <= 0) {
+    throw new Error(
+      "Enter what the rental was charged at.",
+    );
+  }
+
+  const additionalChargesCents =
+    assertMoneyCents(
+      input.additionalChargesCents ?? 0,
+      "Additional charges",
+    );
+
+  const paidCents =
+    assertMoneyCents(
+      input.paidCents ?? 0,
+      "Amount received",
+    );
+
+  const totalCents =
+    baseRentalCents +
+    additionalChargesCents;
+
+  if (paidCents > totalCents) {
+    throw new Error(
+      "The amount received is more than the rental was charged at.",
+    );
+  }
+
+  const paymentMethod =
+    trimmedOrNull(
+      input.paymentMethod,
+    );
+
+  if (
+    paidCents > 0 &&
+    (!paymentMethod ||
+      !(
+        RENTAL_PAYMENT_METHODS as readonly string[]
+      ).includes(paymentMethod))
+  ) {
+    throw new Error(
+      "Select how the payment was taken.",
+    );
+  }
+
+  const idempotencyKey =
+    trimmedOrNull(
+      input.idempotencyKey,
+    );
+
+  if (!idempotencyKey) {
+    throw new Error(
+      "A past booking needs an operation key.",
+    );
+  }
+
+  const handledByUid =
+    trimmedOrNull(
+      input.handledByUid,
+    ) ?? actorUid;
+
+  const operationRef =
+    doc(
+      db,
+      "idempotencyKeys",
+      `past_rental_${idempotencyKey}`,
+    );
+
+  const reservationRef =
+    doc(
+      collection(
+        db,
+        "reservations",
+      ),
+    );
+
+  const rentalRef =
+    doc(
+      collection(
+        db,
+        "rentals",
+      ),
+    );
+
+  let recordedRentalId =
+    rentalRef.id;
+
+  let recordedReservationId =
+    reservationRef.id;
+
+  await runTransaction(
+    db,
+    async (transaction) => {
+      const previous =
+        await transaction.get(
+          operationRef,
+        );
+
+      /*
+       * A repeated submission replays what was written the
+       * first time rather than entering the same historical
+       * rental twice.
+       */
+      if (previous.exists()) {
+        const response =
+          previous.get(
+            "response",
+          ) as {
+            rentalId?: string;
+            reservationId?: string;
+          };
+
+        recordedRentalId =
+          response?.rentalId ??
+          recordedRentalId;
+
+        recordedReservationId =
+          response?.reservationId ??
+          recordedReservationId;
+
+        return;
+      }
+
+      const [
+        vehicleSnapshot,
+        customerSnapshot,
+      ] = await Promise.all([
+        transaction.get(
+          doc(
+            db,
+            "vehicles",
+            String(
+              input.vehicleId,
+            ),
+          ),
+        ),
+
+        transaction.get(
+          doc(
+            db,
+            "customers",
+            String(
+              input.customerId,
+            ),
+          ),
+        ),
+      ]);
+
+      if (!vehicleSnapshot.exists()) {
+        throw new Error(
+          "Vehicle was not found.",
+        );
+      }
+
+      if (!customerSnapshot.exists()) {
+        throw new Error(
+          "Customer was not found.",
+        );
+      }
+
+      const recordedByNameSnapshot =
+        await actorNameSnapshot(
+          transaction,
+          actorUid,
+        );
+
+      /*
+       * The name of the employee who handled the rental is
+       * read from their own profile, never taken from the
+       * form, so the attribution on a historical record is
+       * as trustworthy as it is on a live one.
+       */
+      const handledByNameSnapshot =
+        handledByUid === actorUid
+          ? recordedByNameSnapshot
+          : await actorNameSnapshot(
+              transaction,
+              handledByUid,
+            );
+
+      const customerNameSnapshot =
+        String(
+          customerSnapshot.get(
+            "fullName",
+          ) ?? "",
+        );
+
+      const vehicleRegistrationSnapshot =
+        String(
+          vehicleSnapshot.get(
+            "registrationNumber",
+          ) ?? "",
+        );
+
+      const notes =
+        trimmedOrNull(
+          input.notes,
+        );
+
+      const shared = {
+        customerId:
+          customerSnapshot.id,
+
+        customerNameSnapshot,
+
+        vehicleId:
+          vehicleSnapshot.id,
+
+        vehicleRegistrationSnapshot,
+
+        pickupAt,
+
+        expectedReturnAt:
+          returnedAt,
+
+        pickupLocation:
+          trimmedOrNull(
+            input.pickupLocation,
+          ),
+
+        dropoffLocation:
+          trimmedOrNull(
+            input.dropoffLocation,
+          ),
+
+        /*
+         * What separates this record from a live one. Every
+         * screen that lists rentals reads it, so a rental
+         * typed in from the paper file is never counted as
+         * a vehicle that is out.
+         */
+        isHistorical: true,
+
+        source: "manual_past_entry",
+
+        createdBy: handledByUid,
+
+        createdByNameSnapshot:
+          handledByNameSnapshot,
+
+        handledBy: handledByUid,
+
+        handledByNameSnapshot,
+
+        recordedBy: actorUid,
+
+        recordedByNameSnapshot,
+
+        notes,
+
+        createdAt: nowTimestamp(),
+
+        updatedAt: nowTimestamp(),
+      };
+
+      transaction.set(
+        reservationRef,
+        {
+          ...shared,
+
+          status: "completed",
+
+          bookingMedia: [],
+
+          rentalId: rentalRef.id,
+
+          completedAt: returnedAt,
+
+          rateSnapshot: {
+            currency: "USD",
+            dailyCents: null,
+            weeklyCents: null,
+            monthlyCents: null,
+            quotedAt:
+              new Date().toISOString(),
+            vehicleId:
+              vehicleSnapshot.id,
+            vehicleRegistration:
+              vehicleRegistrationSnapshot,
+          },
+
+          quote: {
+            chargedDays:
+              chargedRentalDays({
+                pickupAt:
+                  pickupAt
+                    .toDate()
+                    .toISOString(),
+                expectedReturnAt:
+                  returnedAt
+                    .toDate()
+                    .toISOString(),
+              }),
+            dailyUnits: 0,
+            weeklyUnits: 0,
+            monthlyUnits: 0,
+            baseRentalCents,
+            currency: "USD",
+          },
+        },
+      );
+
+      transaction.set(
+        rentalRef,
+        {
+          ...shared,
+
+          reservationId:
+            reservationRef.id,
+
+          status: "returned",
+
+          actualReturnAt: returnedAt,
+
+          checkedOutBy: handledByUid,
+
+          checkedOutByNameSnapshot:
+            handledByNameSnapshot,
+
+          returnedBy: handledByUid,
+
+          returnedByNameSnapshot:
+            handledByNameSnapshot,
+
+          checkoutNotes: notes,
+
+          returnNotes: notes,
+
+          checkoutMedia: [],
+
+          returnMedia: [],
+
+          adjustments: [],
+        },
+      );
+
+      transaction.set(
+        doc(
+          db,
+          "rentalFinancials",
+          rentalRef.id,
+        ),
+        {
+          rentalId: rentalRef.id,
+
+          vehicleId:
+            vehicleSnapshot.id,
+
+          vehicleRegistration:
+            vehicleRegistrationSnapshot,
+
+          customerId:
+            customerSnapshot.id,
+
+          customerNameSnapshot,
+
+          rentalStatus: "returned",
+
+          isHistorical: true,
+
+          handledByNameSnapshot,
+
+          pickupAt,
+
+          actualReturnAt: returnedAt,
+
+          baseRentalCents,
+
+          adjustmentCents:
+            additionalChargesCents,
+
+          totalCents,
+
+          paidCents,
+
+          refundedCents: 0,
+
+          refundedPaymentCents: 0,
+
+          depositHeldCents: 0,
+
+          refundedDepositCents: 0,
+
+          outstandingCents:
+            totalCents - paidCents,
+
+          currency: "USD",
+
+          createdAt: nowTimestamp(),
+
+          updatedAt: nowTimestamp(),
+        },
+      );
+
+      if (paidCents > 0) {
+        transaction.set(
+          doc(
+            collection(
+              db,
+              "payments",
+            ),
+          ),
+          {
+            rentalId: rentalRef.id,
+
+            vehicleId:
+              vehicleSnapshot.id,
+
+            customerId:
+              customerSnapshot.id,
+
+            amountCents: paidCents,
+
+            method: paymentMethod,
+
+            externalReference: null,
+
+            isHistorical: true,
+
+            receivedAt: returnedAt,
+
+            recordedBy: actorUid,
+
+            createdAt: nowTimestamp(),
+          },
+        );
+      }
+
+      transaction.set(
+        doc(
+          collection(
+            db,
+            "financialLedger",
+          ),
+        ),
+        {
+          rentalId: rentalRef.id,
+
+          vehicleId:
+            vehicleSnapshot.id,
+
+          vehicleRegistration:
+            vehicleRegistrationSnapshot,
+
+          customerId:
+            customerSnapshot.id,
+
+          entryType:
+            "historical_rental",
+
+          amountCents: totalCents,
+
+          occurredAt: returnedAt,
+
+          recordedBy: actorUid,
+        },
+      );
+
+      /*
+       * Money received is counted from the ledger, dated when
+       * the payment was taken, so a historical payment needs
+       * the same entry a live one writes or the period it
+       * belongs to will not show it.
+       */
+      if (paidCents > 0) {
+        transaction.set(
+          doc(
+            collection(
+              db,
+              "financialLedger",
+            ),
+          ),
+          {
+            rentalId: rentalRef.id,
+
+            vehicleId:
+              vehicleSnapshot.id,
+
+            vehicleRegistration:
+              vehicleRegistrationSnapshot,
+
+            customerId:
+              customerSnapshot.id,
+
+            entryType: "payment",
+
+            amountCents: paidCents,
+
+            isHistorical: true,
+
+            occurredAt: returnedAt,
+
+            recordedBy: actorUid,
+          },
+        );
+      }
+
+      transaction.set(
+        doc(
+          collection(
+            db,
+            "auditLogs",
+          ),
+        ),
+        {
+          actorUid,
+
+          action:
+            "rental.past_recorded",
+
+          resource: {
+            collection: "rentals",
+            id: rentalRef.id,
+          },
+
+          details: {
+            customerId:
+              customerSnapshot.id,
+
+            vehicleId:
+              vehicleSnapshot.id,
+
+            handledBy: handledByUid,
+
+            handledByNameSnapshot,
+
+            pickupAt: input.pickupAt,
+
+            returnedAt:
+              input.returnedAt,
+
+            totalCents,
+
+            paidCents,
+          },
+
+          createdAt: nowTimestamp(),
+        },
+      );
+
+      transaction.set(
+        operationRef,
+        {
+          response: {
+            rentalId: rentalRef.id,
+
+            reservationId:
+              reservationRef.id,
+          },
+
+          actorUid,
+
+          createdAt: nowTimestamp(),
+        },
+      );
+    },
+  );
+
+  return {
+    rentalId: recordedRentalId,
+    reservationId:
+      recordedReservationId,
+  };
+}
+
+/* =========================================================
+   Rental records
+   ========================================================= */
+
+export type RentalRecord = {
+  rentalId: string;
+  reservationId: string | null;
+  customerId: string;
+  customerName: string;
+  vehicleId: string;
+  vehicleRegistration: string;
+  /** Who booked it, handed it over and took it back. */
+  bookedByName: string;
+  checkedOutByName: string;
+  returnedByName: string | null;
+  pickupAt: string | null;
+  expectedReturnAt: string | null;
+  actualReturnAt: string | null;
+  status:
+    | "active"
+    | "overdue"
+    | "returned"
+    | "historical";
+  isHistorical: boolean;
+};
+
+/*
+ * Every rental the office has, live or closed, with the
+ * employee who handled it attached.
+ *
+ * It reads `rentals` rather than `rentalFinancials` on
+ * purpose: this is the operational record, so it carries no
+ * money and an operations account can be shown all of it.
+ *
+ * Overdue is derived from the expected return time at read
+ * time, the same rule the dashboard applies, because nothing
+ * sweeps the collection on a schedule.
+ */
+async function listRentalRecords(
+  input: {
+    limit?: number;
+  },
+): Promise<RentalRecord[]> {
+  const { db } = getFirebaseClient();
+
+  const cap = Math.min(
+    Math.max(
+      Number(input?.limit ?? 200) || 200,
+      1,
+    ),
+    500,
+  );
+
+  const snapshot = await getDocs(
+    query(
+      collection(db, "rentals"),
+      orderBy("createdAt", "desc"),
+      limit(cap),
+    ),
+  );
+
+  const now = Date.now();
+
+  return snapshot.docs
+    .map((entry) => {
+      const pickupAt =
+        entry.get("pickupAt") == null
+          ? null
+          : toIso(entry.get("pickupAt"));
+
+      const expectedReturnAt =
+        entry.get("expectedReturnAt") == null
+          ? null
+          : toIso(
+              entry.get("expectedReturnAt"),
+            );
+
+      const actualReturnAt =
+        entry.get("actualReturnAt") == null
+          ? null
+          : toIso(
+              entry.get("actualReturnAt"),
+            );
+
+      const isHistorical =
+        entry.get("isHistorical") === true;
+
+      const stored = String(
+        entry.get("status") ?? "active",
+      );
+
+      const status: RentalRecord["status"] =
+        isHistorical
+          ? "historical"
+          : stored === "returned"
+            ? "returned"
+            : stored === "overdue" ||
+                (expectedReturnAt !== null &&
+                  Date.parse(
+                    expectedReturnAt,
+                  ) < now)
+              ? "overdue"
+              : "active";
+
+      const bookedByName = String(
+        entry.get("createdByNameSnapshot") ??
+          "Not recorded",
+      );
+
+      return {
+        rentalId: entry.id,
+
+        reservationId:
+          trimmedOrNull(
+            entry.get("reservationId"),
+          ),
+
+        customerId: String(
+          entry.get("customerId") ?? "",
+        ),
+
+        customerName: String(
+          entry.get("customerNameSnapshot") ??
+            "Unknown customer",
+        ),
+
+        vehicleId: String(
+          entry.get("vehicleId") ?? "",
+        ),
+
+        vehicleRegistration: String(
+          entry.get(
+            "vehicleRegistrationSnapshot",
+          ) ?? "Unknown vehicle",
+        ),
+
+        bookedByName,
+
+        checkedOutByName: String(
+          entry.get(
+            "checkedOutByNameSnapshot",
+          ) ?? bookedByName,
+        ),
+
+        returnedByName: trimmedOrNull(
+          entry.get(
+            "returnedByNameSnapshot",
+          ),
+        ),
+
+        pickupAt,
+
+        expectedReturnAt,
+
+        actualReturnAt,
+
+        status,
+
+        isHistorical,
+
+        /* Sort key only; dropped below. */
+        sortAt: Date.parse(
+          pickupAt ?? "",
+        ),
+      };
+    })
+    .sort(
+      (a, b) =>
+        (Number.isNaN(b.sortAt)
+          ? 0
+          : b.sortAt) -
+        (Number.isNaN(a.sortAt)
+          ? 0
+          : a.sortAt),
+    )
+    .map(
+      ({ sortAt: _sortAt, ...record }) =>
+        record,
+    );
+}
+
+/* =========================================================
+   Expense records
+   ========================================================= */
+
+export type ExpenseRecord = {
+  id: string;
+  vehicleId: string;
+  vehicleRegistration: string;
+  category: string;
+  amountCents: number;
+  occurredAt: string | null;
+  vendor: string | null;
+  note: string;
+  recordedBy: string;
+};
+
+/*
+ * The expenses this account is allowed to see.
+ *
+ * An administrator reads the whole book. Anyone else reads
+ * only what they recorded themselves, which is what the
+ * rules permit: `vehicleExpenses` is admin-read except for
+ * the recorder's own entries, so the `recordedBy` filter is
+ * not a convenience — without it the query is refused.
+ */
+async function listVehicleExpenses(
+  input: {
+    mine?: boolean;
+    limit?: number;
+  },
+): Promise<ExpenseRecord[]> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const cap = Math.min(
+    Math.max(
+      Number(input?.limit ?? 100) || 100,
+      1,
+    ),
+    500,
+  );
+
+  const snapshot = await getDocs(
+    input?.mine
+      ? query(
+          collection(
+            db,
+            "vehicleExpenses",
+          ),
+          where(
+            "recordedBy",
+            "==",
+            actorUid,
+          ),
+          limit(cap),
+        )
+      : query(
+          collection(
+            db,
+            "vehicleExpenses",
+          ),
+          limit(cap),
+        ),
+  );
+
+  return snapshot.docs
+    .map((entry) => {
+      const occurredAt =
+        entry.get("occurredAt") == null
+          ? null
+          : toIso(entry.get("occurredAt"));
+
+      return {
+        id: entry.id,
+
+        vehicleId: String(
+          entry.get("vehicleId") ?? "",
+        ),
+
+        vehicleRegistration: String(
+          entry.get("vehicleRegistration") ??
+            "Unknown vehicle",
+        ),
+
+        category: String(
+          entry.get("category") ?? "other",
+        ),
+
+        amountCents: Number(
+          entry.get("amountCents") ?? 0,
+        ),
+
+        occurredAt,
+
+        vendor: trimmedOrNull(
+          entry.get("vendor"),
+        ),
+
+        note: String(
+          entry.get("note") ?? "",
+        ),
+
+        recordedBy: String(
+          entry.get("recordedBy") ?? "",
+        ),
+
+        /* Sort key only; dropped below. */
+        sortAt: Date.parse(
+          occurredAt ?? "",
+        ),
+      };
+    })
+    .sort(
+      (a, b) =>
+        (Number.isNaN(b.sortAt)
+          ? 0
+          : b.sortAt) -
+        (Number.isNaN(a.sortAt)
+          ? 0
+          : a.sortAt),
+    )
+    .map(
+      ({ sortAt: _sortAt, ...entry }) =>
+        entry,
+    );
+}
+
+/* =========================================================
    Compatibility dispatcher
    ========================================================= */
 
@@ -7452,6 +8619,16 @@ export async function callFirestoreOperation<
             from: string;
             to: string;
             vehicleId: string | null;
+          },
+        )) as TResult
+      );
+
+    case "listVehicleExpenses":
+      return (
+        (await listVehicleExpenses(
+          data as {
+            mine?: boolean;
+            limit?: number;
           },
         )) as TResult
       );
@@ -7497,6 +8674,13 @@ export async function callFirestoreOperation<
       return (
         (await deleteCustomer(
           data as { customerId: string },
+        )) as TResult
+      );
+
+    case "listRentalRecords":
+      return (
+        (await listRentalRecords(
+          data as { limit?: number },
         )) as TResult
       );
 
@@ -7572,6 +8756,13 @@ export async function callFirestoreOperation<
               Record<string, unknown>
             >;
           },
+        )) as TResult
+      );
+
+    case "recordPastRental":
+      return (
+        (await recordPastRental(
+          data as PastRentalInput,
         )) as TResult
       );
 

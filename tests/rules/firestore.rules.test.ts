@@ -63,7 +63,15 @@ beforeAll(async () => {
     await setDoc(doc(db, "vehicles", "vehicle_001"), { registrationNumber: "RT-001" });
     await setDoc(doc(db, "customers", "customer_001"), { fullName: "Sample Customer" });
     await setDoc(doc(db, "rentalFinancials", "rental_001"), { totalCents: 10000 });
-    await setDoc(doc(db, "vehicleExpenses", "expense_001"), { amountCents: 5000 });
+    await setDoc(doc(db, "vehicleExpenses", "expense_001"), {
+      amountCents: 5000,
+      recordedBy: ADMIN,
+    });
+
+    await setDoc(doc(db, "vehicleExpenses", "expense_ops"), {
+      amountCents: 2500,
+      recordedBy: OPS,
+    });
     await setDoc(doc(db, "financialLedger", "entry_001"), { amountCents: 5000 });
     await setDoc(doc(db, "auditLogs", "audit_001"), { action: "vehicle.created" });
     await setDoc(doc(db, "idempotencyKeys", "payment_001"), { response: { outstandingCents: 0 } });
@@ -148,6 +156,151 @@ describe("Firestore access policy", () => {
     await assertFails(getDoc(doc(db, "vehicleExpenses", "expense_001")));
     await assertFails(getDoc(doc(db, "financialLedger", "entry_001")));
     await assertFails(getDoc(doc(db, "auditLogs", "audit_001")));
+    await assertFails(getDoc(doc(db, "refunds", "refund_001")));
+  });
+
+  /*
+   * Recording what the fleet costs to run is operational
+   * work, so an operations account may add an expense and
+   * read back its own. Everybody else's entries — and so the
+   * cost side of the business — stay with an administrator,
+   * which is why the unfiltered listing is refused and the
+   * filtered one is not.
+   */
+  it("lets operations record an expense and read back only its own", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(
+      setDoc(doc(db, "vehicleExpenses", "expense_ops_2"), {
+        amountCents: 1500,
+        recordedBy: OPS,
+      }),
+    );
+
+    await assertSucceeds(
+      getDoc(doc(db, "vehicleExpenses", "expense_ops")),
+    );
+
+    await assertFails(
+      getDoc(doc(db, "vehicleExpenses", "expense_001")),
+    );
+
+    await assertSucceeds(
+      getDocs(
+        query(
+          collection(db, "vehicleExpenses"),
+          where("recordedBy", "==", OPS),
+          limit(50),
+        ),
+      ),
+    );
+
+    await assertFails(
+      getDocs(
+        query(collection(db, "vehicleExpenses"), limit(50)),
+      ),
+    );
+  });
+
+  it("stops an expense being attributed to somebody else", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(
+      setDoc(doc(db, "vehicleExpenses", "expense_forged"), {
+        amountCents: 1500,
+        recordedBy: ADMIN,
+      }),
+    );
+  });
+
+  it("keeps an expense unrewritable once it is recorded", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(
+      updateDoc(doc(db, "vehicleExpenses", "expense_ops"), {
+        amountCents: 1,
+      }),
+    );
+
+    await assertFails(
+      deleteDoc(doc(db, "vehicleExpenses", "expense_ops")),
+    );
+  });
+
+  /*
+   * Correcting a staff member's name is an administrator's
+   * write to somebody else's profile, which no operations
+   * account may make. An account may still fix its own
+   * registration details, and neither may reach for a role.
+   */
+  it("lets only an administrator edit another staff profile", async () => {
+    await assertSucceeds(
+      updateDoc(doc(asUser(ADMIN), "users", OPS), {
+        fullName: "Corrected Name",
+        mobile: "1284000000",
+        age: 31,
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(asUser(OPS), "users", PENDING), {
+        fullName: "Not mine to change",
+      }),
+    );
+  });
+
+  it("stops an account granting itself a role while editing its own details", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(
+      updateDoc(doc(db, "users", OPS), {
+        fullName: "Own Name",
+        mobile: "1284111111",
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(db, "users", OPS), {
+        role: "admin",
+      }),
+    );
+  });
+
+  /*
+   * A past booking is written as a closed rental with its
+   * financial record and an append-only ledger entry, so
+   * every document it touches has to be writable by the
+   * account entering it.
+   */
+  it("lets staff enter a historical rental record", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(
+      setDoc(doc(db, "rentals", "rental_history_001"), {
+        status: "returned",
+        isHistorical: true,
+      }),
+    );
+
+    await assertSucceeds(
+      setDoc(doc(db, "rentalFinancials", "rental_history_001"), {
+        totalCents: 20000,
+        isHistorical: true,
+      }),
+    );
+
+    await assertSucceeds(
+      setDoc(doc(db, "payments", "payment_history_001"), {
+        amountCents: 20000,
+        isHistorical: true,
+      }),
+    );
+
+    await assertSucceeds(
+      setDoc(doc(db, "idempotencyKeys", "past_rental_001"), {
+        response: { rentalId: "rental_history_001" },
+      }),
+    );
   });
 
   it("keeps the ledger and audit trail append-only for operations staff", async () => {

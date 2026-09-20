@@ -113,6 +113,7 @@ export const CHARGE_ROWS = [
     label: "Windscreen waiver",
   },
   { key: "insurance", label: "Insurance" },
+  { key: "carSeat", label: "Car seat(s)" },
   { key: "other", label: "Other" },
 ] as const;
 
