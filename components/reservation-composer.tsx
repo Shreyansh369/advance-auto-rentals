@@ -175,11 +175,11 @@ const tabs: Array<{
 /*
  * What the renter settles at each end of the hire.
  *
- * At the counter they pay the deposit, the insurance and any
- * waivers, the car seats and the rental days themselves. The
- * fuel and the detailing cannot be known until the car comes
- * back, so those rows are not on the checkout form at all:
- * they are raised as adjustments at return.
+ * At the counter they pay the deposit, the insurance, the car
+ * seats and the rental days themselves. The hours run over,
+ * the waivers taken, the fuel and the detailing cannot be
+ * known until the car comes back, so none of them is on the
+ * checkout form: they are raised at return.
  *
  * Daily, weekly and monthly are not entered by hand anywhere
  * — they restate the booking's own quote.
@@ -4084,7 +4084,7 @@ export function ReservationComposer() {
 
                   <div>
                     <dt>
-                      Insurance, waivers and
+                      Insurance, car seats and
                       extras
                     </dt>
                     <dd>

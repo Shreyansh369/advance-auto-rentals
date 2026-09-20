@@ -10,6 +10,8 @@ import {
 
 import { useEffect, useRef, useState } from "react";
 
+import { useFirebaseAuth } from "./firebase-provider";
+
 import { getFirebaseClient } from "@/lib/firebase/client";
 
 import { firebaseErrorMessage } from "@/lib/presentation";
@@ -89,6 +91,8 @@ export function PastBookingForm({
   onRecorded: () => void;
   onCancel: () => void;
 }) {
+  const { user } = useFirebaseAuth();
+
   const [customers, setCustomers] = useState<
     Option[]
   >([]);
@@ -404,14 +408,24 @@ export function PastBookingForm({
           >
             <option value="">Me</option>
 
-            {staff.map((member) => (
-              <option
-                value={member.uid}
-                key={member.uid}
-              >
-                {member.fullName}
-              </option>
-            ))}
+            {/*
+              * The signed-in account is the default above, so
+              * listing it again would offer the same person
+              * twice under two names.
+              */}
+            {staff
+              .filter(
+                (member) =>
+                  member.uid !== user?.uid,
+              )
+              .map((member) => (
+                <option
+                  value={member.uid}
+                  key={member.uid}
+                >
+                  {member.fullName}
+                </option>
+              ))}
           </select>
         </div>
 

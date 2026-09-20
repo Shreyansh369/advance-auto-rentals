@@ -492,6 +492,19 @@ export function RentalAgreement({
       : []),
   ];
 
+  /*
+   * The tabs appear once the documents load, so a view can
+   * outlive the tab that offered it — a reload that fails,
+   * or a record whose photographs were removed. Falling back
+   * to the agreement keeps the dialog from showing a panel
+   * with no tab lit.
+   */
+  const activeView = tabs.some(
+    (tab) => tab.id === view,
+  )
+    ? view
+    : "agreement";
+
   if (!hydrated) {
     return null;
   }
@@ -530,10 +543,10 @@ export function RentalAgreement({
               }
               disabled={
                 !agreement ||
-                view !== "agreement"
+                activeView !== "agreement"
               }
               title={
-                view === "agreement"
+                activeView === "agreement"
                   ? "Print the agreement"
                   : "Printing applies to the agreement"
               }
@@ -562,12 +575,12 @@ export function RentalAgreement({
               type="button"
               key={tab.id}
               className={
-                view === tab.id
+                activeView === tab.id
                   ? "active"
                   : ""
               }
               aria-current={
-                view === tab.id
+                activeView === tab.id
                   ? "page"
                   : undefined
               }
@@ -602,9 +615,9 @@ export function RentalAgreement({
           </div>
         )}
 
-        {view !== "agreement" && (
+        {activeView !== "agreement" && (
           <section className="rental-media-panel">
-            {view === "licence" && (
+            {activeView === "licence" && (
               <LicenceImage
                 storagePath={
                   documents?.licenceStoragePath ??
@@ -613,7 +626,7 @@ export function RentalAgreement({
               />
             )}
 
-            {view === "booking" && (
+            {activeView === "booking" && (
               <MediaGrid
                 items={
                   documents?.bookingMedia ??
@@ -623,7 +636,7 @@ export function RentalAgreement({
               />
             )}
 
-            {view === "checkout" && (
+            {activeView === "checkout" && (
               <MediaGrid
                 items={
                   documents?.checkoutMedia ??
@@ -633,7 +646,7 @@ export function RentalAgreement({
               />
             )}
 
-            {view === "return" && (
+            {activeView === "return" && (
               <MediaGrid
                 items={
                   documents?.returnMedia ??
@@ -645,7 +658,7 @@ export function RentalAgreement({
           </section>
         )}
 
-        {view === "agreement" && (
+        {activeView === "agreement" && (
         <section className="agreement-review">
           <div className="agreement-review-head">
             <div>
@@ -921,7 +934,7 @@ export function RentalAgreement({
         </section>
         )}
 
-        {view === "agreement" &&
+        {activeView === "agreement" &&
           agreement && (
             <AgreementSheet
               agreement={agreement}
