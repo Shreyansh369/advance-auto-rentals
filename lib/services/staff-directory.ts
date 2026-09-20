@@ -640,3 +640,114 @@ export async function updateStaffProfile(options: {
 
   return { uid: options.uid };
 }
+
+/**
+ * Remove a staff profile.
+ *
+ * This deletes the `users/{uid}` document, which is where the
+ * rules read `role` and `status` from: the account loses every
+ * permission the moment it is gone. It does not delete the
+ * Firebase Authentication user, because a browser cannot —
+ * that account can still sign in, and will land on the "no
+ * staff profile exists" screen, able to register again as a
+ * pending request. Removing it for good is a console action.
+ *
+ * What the account did is untouched. Rentals, bookings and
+ * decisions carry a name snapshot taken when they happened,
+ * so history still says who handled what after the profile
+ * behind it is gone.
+ */
+export async function removeStaffMember(options: {
+  uid: string;
+}): Promise<{ uid: string }> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  if (options.uid === actorUid) {
+    throw new Error(
+      "You cannot remove your own account. Ask another administrator.",
+    );
+  }
+
+  await runTransaction(db, async (transaction) => {
+    const profileRef = doc(
+      db,
+      "users",
+      options.uid,
+    );
+
+    const [profile, actorProfile] =
+      await Promise.all([
+        transaction.get(profileRef),
+        transaction.get(
+          doc(db, "users", actorUid),
+        ),
+      ]);
+
+    if (!profile.exists()) {
+      throw new Error(
+        "That staff profile no longer exists.",
+      );
+    }
+
+    const actorName =
+      trimmedOrNull(
+        actorProfile.get("fullName"),
+      ) ??
+      trimmedOrNull(
+        actorProfile.get("email"),
+      ) ??
+      actorUid;
+
+    /*
+     * The audit entry is written in the same transaction and
+     * carries everything the profile held, because once the
+     * document is gone this record is the only account of who
+     * was removed and by whom.
+     */
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+
+        action: "user.removed",
+
+        resource: {
+          collection: "users",
+          id: options.uid,
+        },
+
+        details: {
+          actorName,
+
+          fullNameSnapshot: trimmedOrNull(
+            profile.get("fullName"),
+          ),
+
+          emailSnapshot: trimmedOrNull(
+            profile.get("email"),
+          ),
+
+          mobileSnapshot: trimmedOrNull(
+            profile.get("mobile"),
+          ),
+
+          previousRole: asRole(
+            profile.get("role"),
+          ),
+
+          previousStatus: asStatus(
+            profile.get("status"),
+          ),
+        },
+
+        createdAt: serverTimestamp(),
+      },
+    );
+
+    transaction.delete(profileRef);
+  });
+
+  return { uid: options.uid };
+}
