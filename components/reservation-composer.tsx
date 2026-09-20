@@ -17,6 +17,8 @@ import {
   ClipboardCheck,
   CreditCard,
   FileText,
+  History,
+  ListChecks,
   Plus,
   Search,
   UserRound,
@@ -36,6 +38,7 @@ import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
 import { CustomerSignaturePad } from "./customer-signature-pad";
 import { RentalAgreement } from "./rental-agreement";
+import { RentalRecords } from "./rental-records";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
@@ -56,15 +59,22 @@ import {
 
 import {
   callFirestoreOperation,
+  type AdditionalFeeType,
   type ContractQueueEntry,
 } from "@/lib/services/firestore-client";
+
+import {
+  listAssignableStaff,
+} from "@/lib/services/staff-directory";
 
 type Tab =
   | "booking"
   | "checkout"
   | "extend"
   | "return"
-  | "payment";
+  | "payment"
+  | "past"
+  | "records";
 
 type CustomerMode =
   | "existing"
@@ -76,6 +86,7 @@ type Customer = {
   telephone: string;
   email: string | null;
   address: string | null;
+  dateOfBirth: string | null;
   licenceNumber: string;
   licenceCountry: string;
   licenceExpiresAt: string | null;
@@ -89,6 +100,7 @@ type CustomerEdit = {
   telephone: string;
   email: string;
   address: string;
+  dateOfBirth: string;
   licenceNumber: string;
   licenceCountry: string;
   licenceExpiresAt: string;
@@ -123,6 +135,8 @@ type Rental = {
   expectedReturnAt: string | null;
   createdByNameSnapshot: string | null;
   checkedOutByNameSnapshot: string | null;
+  /** Taken at the counter and owed back at return. */
+  depositCents: number;
   status: string;
 };
 
@@ -164,16 +178,81 @@ const tabs: Array<{
     label: "Payment",
     icon: CreditCard,
   },
+  {
+    id: "past",
+    label: "Past booking",
+    icon: History,
+  },
+  {
+    id: "records",
+    label: "Rental records",
+    icon: ListChecks,
+  },
 ];
 
-/* The charge rows the employee fills in at checkout. Daily,
-   weekly and monthly come from the booking quote instead. */
+/*
+ * What the renter settles at each end of the hire.
+ *
+ * At the counter they pay the deposit, the insurance and any
+ * waivers, the car seats and the rental days themselves. The
+ * fuel and the detailing cannot be known until the car comes
+ * back, so those rows are not on the checkout form at all:
+ * they are raised as adjustments at return.
+ *
+ * Daily, weekly and monthly are not entered by hand anywhere
+ * — they restate the booking's own quote.
+ */
+const CHECKOUT_CHARGE_KEYS = [
+  "extraHours",
+  "insurance",
+  "liabilityWaiver",
+  "windscreenWaiver",
+  "carSeat",
+  "other",
+] as const;
+
 const agreementChargeRows = CHARGE_ROWS.filter(
   (row) =>
-    !["daily", "weekly", "monthly"].includes(
-      row.key,
-    ),
+    (
+      CHECKOUT_CHARGE_KEYS as readonly string[]
+    ).includes(row.key),
 );
+
+/*
+ * The charges raised when the vehicle comes back. Each is an
+ * adjustment on the rental, so the balance the renter settles
+ * at return is the rental plus whatever of these applied.
+ */
+const returnAdjustmentOptions = [
+  {
+    type: "extension",
+    label: "Extension",
+  },
+  {
+    type: "cleaning",
+    label: "Cleaning / detailing",
+  },
+  {
+    type: "fuel",
+    label: "Refuelling",
+  },
+  {
+    type: "damage",
+    label: "Damage",
+  },
+  {
+    type: "late_fee",
+    label: "Late fee",
+  },
+  {
+    type: "other",
+    label: "Other",
+  },
+  {
+    type: "discount",
+    label: "Discount",
+  },
+] as const;
 
 const fuelLevels = [
   "one_eighth",
@@ -186,36 +265,69 @@ const fuelLevels = [
   "full",
 ] as const;
 
+/*
+ * Fees that can be added to a payment, grouped by the end of
+ * the hire they normally belong to. Both groups stay usable
+ * whatever state the rental is in: a car seat charged at the
+ * counter but not paid for until the car comes back is still
+ * a car seat, and refusing to take it would leave the money
+ * off the record.
+ */
 const paymentFeeOptions = [
-  {
-    type: "car_seat",
-    label: "Car seat",
-    selectedName: "fee_car_seat_selected",
-    amountName: "fee_car_seat_amount",
-  },
   {
     type: "insurance",
     label: "Insurance",
+    stage: "checkout",
     selectedName: "fee_insurance_selected",
     amountName: "fee_insurance_amount",
   },
   {
+    type: "car_seat",
+    label: "Car seat",
+    stage: "checkout",
+    selectedName: "fee_car_seat_selected",
+    amountName: "fee_car_seat_amount",
+  },
+  {
+    type: "extension",
+    label: "Extension",
+    stage: "return",
+    selectedName: "fee_extension_selected",
+    amountName: "fee_extension_amount",
+  },
+  {
     type: "cleaning",
-    label: "Detailing / Cleaning",
+    label: "Cleaning / detailing",
+    stage: "return",
     selectedName: "fee_cleaning_selected",
     amountName: "fee_cleaning_amount",
   },
   {
+    type: "refueling",
+    label: "Refuelling",
+    stage: "return",
+    selectedName: "fee_refueling_selected",
+    amountName: "fee_refueling_amount",
+  },
+  {
     type: "smoke_fee",
     label: "Smoke fee",
+    stage: "return",
     selectedName: "fee_smoke_fee_selected",
     amountName: "fee_smoke_fee_amount",
   },
+] as const;
+
+const PAYMENT_FEE_STAGES = [
   {
-    type: "refueling",
-    label: "Refueling",
-    selectedName: "fee_refueling_selected",
-    amountName: "fee_refueling_amount",
+    id: "checkout",
+    heading: "Collected at checkout",
+    hint: "Insurance and car seats are settled when the renter takes the vehicle. The deposit is taken on the checkout screen: it is held, not earned, so it never joins the rental balance.",
+  },
+  {
+    id: "return",
+    heading: "Collected at return",
+    hint: "Extensions, cleaning, detailing and refuelling are settled when the vehicle comes back.",
   },
 ] as const;
 
@@ -318,6 +430,22 @@ function todayDateTime(): string {
   return value
     .toISOString()
     .slice(0, 16);
+}
+
+function todayDate(): string {
+  const value = new Date();
+
+  const year = value.getFullYear();
+
+  const month = String(
+    value.getMonth() + 1,
+  ).padStart(2, "0");
+
+  const day = String(
+    value.getDate(),
+  ).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
 }
 
 function tomorrowDate(): string {
@@ -488,14 +616,37 @@ export function ReservationComposer() {
    */
   const [agreementCharges, setAgreementCharges] =
     useState<Record<string, string>>({
-      fuel: "",
-      detailing: "",
       liabilityWaiver: "",
       windscreenWaiver: "",
       insurance: "",
+      carSeat: "",
       other: "",
       extraHours: "",
     });
+
+  /*
+   * The charges raised when the car comes back, by type.
+   * Empty means not charged.
+   */
+  const [returnRentalId, setReturnRentalId] =
+    useState("");
+
+  const [
+    returnAdjustments,
+    setReturnAdjustments,
+  ] = useState<Record<string, string>>({});
+
+  const [
+    returnAdjustmentNotes,
+    setReturnAdjustmentNotes,
+  ] = useState<Record<string, string>>({});
+
+  const [depositAmount, setDepositAmount] =
+    useState(
+      (
+        AGREEMENT_RATES.depositCents / 100
+      ).toFixed(2),
+    );
 
   const [waivers, setWaivers] = useState({
     liabilityWaiver: false,
@@ -550,6 +701,20 @@ export function ReservationComposer() {
    * from another, or an administrator can never reach the
    * agreement they are supposed to approve.
    */
+  /*
+   * Who a past booking can be attributed to. Only an
+   * administrator may list staff, so an operations account
+   * gets itself back and records the rental under its own
+   * name; see listAssignableStaff.
+   */
+  const [assignableStaff, setAssignableStaff] =
+    useState<
+      Array<{
+        uid: string;
+        fullName: string;
+      }>
+    >([]);
+
   const [contractQueue, setContractQueue] =
     useState<ContractQueueEntry[]>([]);
 
@@ -763,6 +928,10 @@ export function ReservationComposer() {
               snapshot.get(
                 "address",
               ) ?? null,
+            dateOfBirth:
+              snapshot.get(
+                "dateOfBirth",
+              ) ?? null,
             licenceNumber:
               snapshot.get(
                 "licenceNumber",
@@ -890,6 +1059,17 @@ export function ReservationComposer() {
                 "checkedOutByNameSnapshot",
               ) ??
               null,
+            depositCents:
+              Number(
+                (
+                  (snapshot.get(
+                    "agreement",
+                  ) ?? {}) as Record<
+                    string,
+                    unknown
+                  >
+                ).depositCents ?? 0,
+              ) || 0,
             status:
               snapshot.get(
                 "status",
@@ -1032,6 +1212,149 @@ export function ReservationComposer() {
     };
   }, [tab]);
 
+  useEffect(() => {
+    if (tab !== "past") {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadStaff() {
+      const staff =
+        await listAssignableStaff();
+
+      if (!cancelled) {
+        setAssignableStaff(staff);
+      }
+    }
+
+    void loadStaff();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tab]);
+
+  /*
+   * A rental the office already ran, typed in from the paper
+   * file. Nothing is reserved and no vehicle changes status:
+   * the record is written as a closed rental and flagged as
+   * historical so no screen counts it as a car that is out.
+   */
+  function recordPastBooking(
+    event: React.FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    const formElement =
+      event.currentTarget;
+
+    const form = new FormData(
+      formElement,
+    );
+
+    const paidCents = dollarsToCents(
+      form.get("paidAmount"),
+    );
+
+    void run(async () => {
+      /* Parsed inside the task so a malformed date is
+         reported through the screen's error banner rather
+         than thrown past it. */
+      const pickupAt = localToIso(
+        form.get("pickupAt"),
+      );
+
+      const returnedAt = localToIso(
+        form.get("returnedAt"),
+      );
+
+      await callFirestoreOperation<
+        {
+          customerId: string;
+          vehicleId: string;
+          pickupAt: string;
+          returnedAt: string;
+          handledByUid: string | null;
+          baseRentalCents: number;
+          additionalChargesCents: number;
+          paidCents: number;
+          paymentMethod: string | null;
+          pickupLocation: string | null;
+          dropoffLocation: string | null;
+          notes: string | null;
+          idempotencyKey: string;
+        },
+        {
+          rentalId: string;
+          reservationId: string;
+        }
+      >("recordPastRental", {
+        customerId: String(
+          form.get("customerId") ?? "",
+        ),
+
+        vehicleId: String(
+          form.get("vehicleId") ?? "",
+        ),
+
+        pickupAt,
+
+        returnedAt,
+
+        handledByUid:
+          String(
+            form.get("handledByUid") ?? "",
+          ).trim() || null,
+
+        baseRentalCents: dollarsToCents(
+          form.get("rentalAmount"),
+        ),
+
+        additionalChargesCents:
+          dollarsToCents(
+            form.get("additionalAmount"),
+          ),
+
+        paidCents,
+
+        paymentMethod:
+          paidCents > 0
+            ? String(
+                form.get("paymentMethod") ??
+                  "cash",
+              )
+            : null,
+
+        pickupLocation:
+          String(
+            form.get("pickupLocation") ?? "",
+          ).trim() || null,
+
+        dropoffLocation:
+          String(
+            form.get("dropoffLocation") ??
+              "",
+          ).trim() || null,
+
+        notes:
+          String(
+            form.get("notes") ?? "",
+          ).trim() || null,
+
+        idempotencyKey: operationKey(
+          "past-rental",
+        ),
+      });
+
+      releaseOperationKey("past-rental");
+
+      formElement.reset();
+
+      return "Past booking recorded. It is listed under Rental records as a past booking.";
+    });
+  }
+
   async function run(
     task: () => Promise<string>,
   ) {
@@ -1136,6 +1459,14 @@ export function ReservationComposer() {
       address:
         selectedCustomer.address ?? "",
 
+      dateOfBirth:
+        selectedCustomer.dateOfBirth
+          ? selectedCustomer.dateOfBirth.slice(
+              0,
+              10,
+            )
+          : "",
+
       licenceNumber:
         selectedCustomer.licenceNumber,
 
@@ -1227,6 +1558,7 @@ export function ReservationComposer() {
           telephone: string;
           email: string | null;
           address: string | null;
+          dateOfBirth: string | null;
           licenceNumber: string;
           licenceCountry: string;
           licenceExpiresAt: string;
@@ -1243,6 +1575,10 @@ export function ReservationComposer() {
 
         address:
           customerEdit.address.trim() || null,
+
+        dateOfBirth:
+          customerEdit.dateOfBirth.trim() ||
+          null,
 
         licenceNumber,
         licenceCountry,
@@ -1329,6 +1665,61 @@ export function ReservationComposer() {
     (sum, cents) => sum + Number(cents || 0),
     0,
   );
+
+  /*
+   * What the renter actually hands over at the counter: the
+   * charges on the agreement plus the refundable deposit.
+   * The deposit is shown separately because it is held, not
+   * earned, and never reaches the rental's balance.
+   */
+  const checkoutDepositCents = (() => {
+    const amount = Number(
+      depositAmount || 0,
+    );
+
+    return Number.isFinite(amount) &&
+      amount > 0
+      ? Math.round(amount * 100)
+      : 0;
+  })();
+
+  const dueAtCheckoutCents =
+    agreementTotalCents +
+    checkoutDepositCents;
+
+  /*
+   * A discount comes off the balance; everything else is
+   * added to it, which is exactly how the return applies
+   * them.
+   */
+  const returnRental = rentals.find(
+    (rental) => rental.id === returnRentalId,
+  );
+
+  const returnAdjustmentTotalCents =
+    returnAdjustmentOptions.reduce(
+      (sum, option) => {
+        const amount = Number(
+          returnAdjustments[option.type] || 0,
+        );
+
+        if (
+          !Number.isFinite(amount) ||
+          amount <= 0
+        ) {
+          return sum;
+        }
+
+        const cents = Math.round(
+          amount * 100,
+        );
+
+        return option.type === "discount"
+          ? sum - cents
+          : sum + cents;
+      },
+      0,
+    );
 
   const selectedPayableRental =
     payableRentals.find(
@@ -1718,12 +2109,17 @@ export function ReservationComposer() {
         setSignatureName("");
         setPaymentMethod("");
 
+        setDepositAmount(
+          (
+            AGREEMENT_RATES.depositCents / 100
+          ).toFixed(2),
+        );
+
         setAgreementCharges({
-          fuel: "",
-          detailing: "",
           liabilityWaiver: "",
           windscreenWaiver: "",
           insurance: "",
+          carSeat: "",
           other: "",
           extraHours: "",
         });
@@ -1847,56 +2243,54 @@ export function ReservationComposer() {
 
     void run(
       async () => {
-        const amount =
-          String(
-            form.get(
-              "adjustmentAmount",
-            ) ?? "",
-          ).trim();
-
-        let adjustments: Array<{
+        /*
+         * Every charge raised at return in one submission:
+         * an extension, the cleaning and a tank of fuel are
+         * routinely owed on the same car, and entering them
+         * one at a time meant three returns or two of them
+         * quietly lost.
+         */
+        const adjustments: Array<{
           type: string;
           amountCents: number;
           note: string;
         }> = [];
 
-        if (amount) {
-          const amountCents =
-            Math.round(
-              Number(amount) * 100,
-            );
+        for (const option of returnAdjustmentOptions) {
+          const raw = String(
+            returnAdjustments[option.type] ??
+              "",
+          ).trim();
+
+          if (!raw) {
+            continue;
+          }
+
+          const amountCents = Math.round(
+            Number(raw) * 100,
+          );
 
           if (
-            !Number.isFinite(
-              amountCents,
-            ) ||
+            !Number.isFinite(amountCents) ||
             amountCents <= 0
           ) {
             throw new Error(
-              "Adjustment amount must be greater than zero.",
+              `${option.label} must be an amount greater than zero.`,
             );
           }
 
-          adjustments = [
-            {
-              type:
-                String(
-                  form.get(
-                    "adjustmentType",
-                  ),
-                ),
+          adjustments.push({
+            type: option.type,
 
-              amountCents,
+            amountCents,
 
-              note:
-                String(
-                  form.get(
-                    "adjustmentNote",
-                  ) ?? "",
-                ).trim() ||
-                "Return adjustment",
-            },
-          ];
+            note:
+              String(
+                returnAdjustmentNotes[
+                  option.type
+                ] ?? "",
+              ).trim() || option.label,
+          });
         }
 
         const result =
@@ -1978,6 +2372,10 @@ export function ReservationComposer() {
         setReturnMedia(
           [],
         );
+
+        setReturnRentalId("");
+        setReturnAdjustments({});
+        setReturnAdjustmentNotes({});
 
         /*
          * A return that leaves a balance goes straight to the
@@ -2107,12 +2505,7 @@ export function ReservationComposer() {
                 | string
                 | null;
               additionalFees: Array<{
-                type:
-                  | "car_seat"
-                  | "insurance"
-                  | "cleaning"
-                  | "smoke_fee"
-                  | "refueling";
+                type: AdditionalFeeType;
                 amountCents: number;
               }>;
               idempotencyKey: string;
@@ -2464,7 +2857,321 @@ export function ReservationComposer() {
           </section>
         )}
 
+      {tab === "records" && (
+        <section className="surface ledger-surface">
+          <div className="section-heading">
+            <div>
+              <p className="section-kicker">
+                Rental records
+              </p>
+
+              <h2>
+                Who rented what, and to whom
+              </h2>
+
+              <p>
+                Every rental the office has
+                run, live or closed, with the
+                staff member who handled it.
+                Bookings typed in from the
+                paper file are marked as past
+                bookings.
+              </p>
+            </div>
+          </div>
+
+          <RentalRecords limit={300} />
+        </section>
+      )}
+
+      {/* The records tab renders its own surface above. */}
+      {tab !== "records" && (
       <section className="workflow-shell surface">
+        {tab === "past" && (
+          <form
+            className="form-grid"
+            onSubmit={recordPastBooking}
+          >
+            <div className="form-section">
+              <p className="section-kicker">
+                Past booking
+              </p>
+
+              <h2>
+                Record a rental that already
+                happened
+              </h2>
+
+              <p>
+                For a rental the office ran
+                before this system, or while
+                it was unavailable. Nothing is
+                reserved and no vehicle
+                changes status: the record is
+                written as a closed rental and
+                listed as a past booking.
+              </p>
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-customer">
+                Customer
+              </label>
+
+              <select
+                id="past-customer"
+                name="customerId"
+                required
+                defaultValue=""
+              >
+                <option value="" disabled>
+                  Select customer
+                </option>
+
+                {customers.map(
+                  (customer) => (
+                    <option
+                      value={customer.id}
+                      key={customer.id}
+                    >
+                      {customer.fullName}
+                      {" · "}
+                      {customer.telephone}
+                    </option>
+                  ),
+                )}
+              </select>
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-vehicle">
+                Vehicle
+              </label>
+
+              <select
+                id="past-vehicle"
+                name="vehicleId"
+                required
+                defaultValue=""
+              >
+                <option value="" disabled>
+                  Select vehicle
+                </option>
+
+                {vehicles.map((vehicle) => (
+                  <option
+                    value={vehicle.id}
+                    key={vehicle.id}
+                  >
+                    {
+                      vehicle.registrationNumber
+                    }
+                    {" · "}
+                    {vehicle.make}
+                    {" "}
+                    {vehicle.model}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-pickup">
+                Rental start
+              </label>
+
+              <input
+                id="past-pickup"
+                name="pickupAt"
+                type="datetime-local"
+                max={todayDateTime()}
+                required
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-return">
+                Return
+              </label>
+
+              <input
+                id="past-return"
+                name="returnedAt"
+                type="datetime-local"
+                max={todayDateTime()}
+                required
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-handled-by">
+                Handled by
+              </label>
+
+              <select
+                id="past-handled-by"
+                name="handledByUid"
+                defaultValue=""
+              >
+                <option value="">
+                  Me
+                </option>
+
+                {assignableStaff.map(
+                  (member) => (
+                    <option
+                      value={member.uid}
+                      key={member.uid}
+                    >
+                      {member.fullName}
+                    </option>
+                  ),
+                )}
+              </select>
+
+              <p className="form-help">
+                The staff member who rented the
+                vehicle out at the time. The
+                name is read from their own
+                profile, not from this form.
+              </p>
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-rental-amount">
+                Rental charged (USD)
+              </label>
+
+              <input
+                id="past-rental-amount"
+                name="rentalAmount"
+                type="number"
+                min="0.01"
+                max="100000"
+                step="0.01"
+                inputMode="decimal"
+                required
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-additional-amount">
+                Additional charges (USD)
+              </label>
+
+              <input
+                id="past-additional-amount"
+                name="additionalAmount"
+                type="number"
+                min="0"
+                max="100000"
+                step="0.01"
+                inputMode="decimal"
+                defaultValue="0"
+              />
+
+              <p className="form-help">
+                Fuel, cleaning, damage and the
+                rest, as one figure.
+              </p>
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-paid-amount">
+                Amount received (USD)
+              </label>
+
+              <input
+                id="past-paid-amount"
+                name="paidAmount"
+                type="number"
+                min="0"
+                max="100000"
+                step="0.01"
+                inputMode="decimal"
+                defaultValue="0"
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-payment-method">
+                Payment method
+              </label>
+
+              <select
+                id="past-payment-method"
+                name="paymentMethod"
+                defaultValue="cash"
+              >
+                <option value="cash">
+                  Cash
+                </option>
+
+                <option value="card">
+                  Card
+                </option>
+
+                <option value="bank_transfer">
+                  Bank transfer
+                </option>
+
+                <option value="other">
+                  Other
+                </option>
+              </select>
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-pickup-location">
+                Pickup location
+              </label>
+
+              <input
+                id="past-pickup-location"
+                name="pickupLocation"
+                maxLength={160}
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="past-dropoff-location">
+                Drop-off location
+              </label>
+
+              <input
+                id="past-dropoff-location"
+                name="dropoffLocation"
+                maxLength={160}
+              />
+            </div>
+
+            <div className="field full">
+              <label htmlFor="past-notes">
+                Notes
+              </label>
+
+              <textarea
+                id="past-notes"
+                name="notes"
+                maxLength={1000}
+              />
+            </div>
+
+            <div className="form-actions">
+              <button
+                className="button button-primary"
+                disabled={
+                  busy ||
+                  !customers.length ||
+                  !vehicles.length
+                }
+              >
+                Record past booking
+              </button>
+            </div>
+          </form>
+        )}
+
         {tab ===
           "booking" && (
           <form
@@ -2838,6 +3545,32 @@ export function ReservationComposer() {
                         </div>
 
                         <div className="field">
+                          <label htmlFor="edit-date-of-birth">
+                            Date of birth
+                          </label>
+
+                          <input
+                            id="edit-date-of-birth"
+                            type="date"
+                            max={todayDate()}
+                            value={
+                              customerEdit.dateOfBirth
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCustomerEdit({
+                                ...customerEdit,
+                                dateOfBirth:
+                                  event
+                                    .target
+                                    .value,
+                              })
+                            }
+                          />
+                        </div>
+
+                        <div className="field">
                           <label htmlFor="edit-licence-expiry">
                             Licence expiry
                           </label>
@@ -2958,6 +3691,20 @@ export function ReservationComposer() {
                       name="newCustomerEmail"
                       type="email"
                       autoComplete="email"
+                    />
+                  </div>
+
+                  <div className="field">
+                    <label htmlFor="date-of-birth">
+                      Date of birth
+                    </label>
+
+                    <input
+                      id="date-of-birth"
+                      name="newCustomerDateOfBirth"
+                      type="date"
+                      max={todayDate()}
+                      autoComplete="bday"
                     />
                   </div>
 
@@ -3140,6 +3887,15 @@ export function ReservationComposer() {
                                   ""
                                 ).trim() ||
                                 null,
+
+                              dateOfBirth:
+                                (
+                                  document.querySelector<HTMLInputElement>(
+                                    'input[name="newCustomerDateOfBirth"]',
+                                  )?.value ||
+                                  ""
+                                ).trim() ||
+                                null,
                             };
 
                           if (
@@ -3228,8 +3984,6 @@ export function ReservationComposer() {
                                   "createOrUpdateCustomer",
                                   {
                                     ...values,
-                                    dateOfBirth:
-                                      null,
                                     notes:
                                       null,
                                     licenceStoragePath:
@@ -3600,24 +4354,39 @@ export function ReservationComposer() {
                 type="number"
                 min={0}
                 step="0.01"
-                defaultValue={(
-                  AGREEMENT_RATES.depositCents /
-                  100
-                ).toFixed(2)}
+                value={depositAmount}
+                onChange={(event) =>
+                  setDepositAmount(
+                    event.target.value,
+                  )
+                }
               />
+
+              <p className="form-help">
+                Taken at the counter and held
+                against the rental. It is
+                refundable, so it is recorded
+                beside the balance rather than
+                added to it.
+              </p>
             </div>
 
             {/* ------------------ waivers and charges */}
             <fieldset className="field full checkout-block">
               <legend>
-                Waivers and charges
+                Due at checkout
               </legend>
 
               <p className="form-help">
-                These print on the agreement and
-                are added to the balance. The
-                daily, weekly and monthly rows
-                come from the booking quote.
+                What the renter settles at the
+                counter: the rental days from
+                the booking quote, the deposit
+                above, and the insurance,
+                waivers and car seats below.
+                Fuel, cleaning and detailing
+                are not entered here — they are
+                raised at return, when the
+                vehicle has been seen.
               </p>
 
               <div className="checkout-charges">
@@ -3701,6 +4470,64 @@ export function ReservationComposer() {
                 ))}
               </div>
             </fieldset>
+
+            {checkoutReservationQuote && (
+              <div className="field full payment-due">
+                <dl>
+                  <div>
+                    <dt>Rental days</dt>
+                    <dd>
+                      {formatMoney(
+                        (quotedCharges.daily ??
+                          0) +
+                          (quotedCharges.weekly ??
+                            0) +
+                          (quotedCharges.monthly ??
+                            0),
+                      )}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>
+                      Insurance, waivers and
+                      extras
+                    </dt>
+                    <dd>
+                      {formatMoney(
+                        agreementTotalCents -
+                          (quotedCharges.daily ??
+                            0) -
+                          (quotedCharges.weekly ??
+                            0) -
+                          (quotedCharges.monthly ??
+                            0),
+                      )}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>
+                      Deposit (refundable)
+                    </dt>
+                    <dd>
+                      {formatMoney(
+                        checkoutDepositCents,
+                      )}
+                    </dd>
+                  </div>
+
+                  <div className="payment-due-total">
+                    <dt>Due at checkout</dt>
+                    <dd>
+                      {formatMoney(
+                        dueAtCheckoutCents,
+                      )}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+            )}
 
             {/* ------------------- payment information */}
             <fieldset className="field full checkout-block">
@@ -4075,7 +4902,12 @@ export function ReservationComposer() {
                 id="active-rental-2"
                 name="rentalId"
                 required
-                defaultValue=""
+                value={returnRentalId}
+                onChange={(event) =>
+                  setReturnRentalId(
+                    event.target.value,
+                  )
+                }
               >
                 <option
                   value=""
@@ -4195,67 +5027,132 @@ export function ReservationComposer() {
               </select>
             </div>
 
-            <div className="field">
-              <label htmlFor="adjustment">
-                Adjustment
-              </label>
+            {/* ------------------ charges raised at return */}
+            <fieldset className="field full checkout-block">
+              <legend>
+                Due at return
+              </legend>
 
-              <select
-                id="adjustment"
-                name="adjustmentType"
-              >
-                <option value="fuel">
-                  Fuel charge
-                </option>
+              <p className="form-help">
+                What the renter owes now the
+                vehicle is back: an extension,
+                cleaning or detailing,
+                refuelling, damage and
+                anything else. Leave a row
+                empty and it is not charged. A
+                discount is taken off the
+                balance.
+              </p>
 
-                <option value="cleaning">
-                  Cleaning fee
-                </option>
+              <div className="checkout-charges">
+                {returnAdjustmentOptions.map(
+                  (option) => (
+                    <div
+                      className="field"
+                      key={option.type}
+                    >
+                      <label
+                        htmlFor={`return-${option.type}`}
+                      >
+                        {option.label}
+                        {" (USD)"}
+                      </label>
 
-                <option value="damage">
-                  Damage charge
-                </option>
+                      <input
+                        id={`return-${option.type}`}
+                        type="number"
+                        min="0.01"
+                        max="100000"
+                        step="0.01"
+                        inputMode="decimal"
+                        value={
+                          returnAdjustments[
+                            option.type
+                          ] ?? ""
+                        }
+                        onChange={(event) =>
+                          setReturnAdjustments(
+                            (current) => ({
+                              ...current,
 
-                <option value="late_fee">
-                  Late fee
-                </option>
+                              [option.type]:
+                                event.target
+                                  .value,
+                            }),
+                          )
+                        }
+                      />
 
-                <option value="discount">
-                  Discount
-                </option>
+                      <input
+                        aria-label={`${option.label} note`}
+                        placeholder="Note (optional)"
+                        maxLength={500}
+                        value={
+                          returnAdjustmentNotes[
+                            option.type
+                          ] ?? ""
+                        }
+                        onChange={(event) =>
+                          setReturnAdjustmentNotes(
+                            (current) => ({
+                              ...current,
 
-                <option value="other">
-                  Other
-                </option>
-              </select>
-            </div>
+                              [option.type]:
+                                event.target
+                                  .value,
+                            }),
+                          )
+                        }
+                      />
+                    </div>
+                  ),
+                )}
+              </div>
 
-            <div className="field">
-              <label htmlFor="amount-usd-optional">
-                Amount (USD, optional)
-              </label>
+              <div className="payment-due">
+                <dl>
+                  {returnRental &&
+                    returnRental.depositCents >
+                      0 && (
+                      <div>
+                        <dt>
+                          Deposit held at
+                          checkout
+                        </dt>
+                        <dd>
+                          {formatMoney(
+                            returnRental.depositCents,
+                          )}
+                        </dd>
+                      </div>
+                    )}
 
-              <input
-                id="amount-usd-optional"
-                name="adjustmentAmount"
-                type="number"
-                min="0.01"
-                step="0.01"
-                inputMode="decimal"
-              />
-            </div>
+                  <div className="payment-due-total">
+                    <dt>
+                      Charges raised at return
+                    </dt>
+                    <dd>
+                      {formatMoney(
+                        returnAdjustmentTotalCents,
+                      )}
+                    </dd>
+                  </div>
+                </dl>
 
-            <div className="field">
-              <label htmlFor="adjustment-note">
-                Adjustment note
-              </label>
-
-              <input
-                id="adjustment-note"
-                name="adjustmentNote"
-                maxLength={500}
-              />
-            </div>
+                {returnRental &&
+                  returnRental.depositCents >
+                    0 && (
+                    <p className="form-help">
+                      The deposit is refundable
+                      and is not part of the
+                      balance. Return it, or
+                      settle the charges above
+                      against it, at the
+                      counter.
+                    </p>
+                  )}
+              </div>
+            </fieldset>
 
             <div className="field full">
               <MediaCapture
@@ -4420,85 +5317,99 @@ export function ReservationComposer() {
               </select>
             </div>
 
-            <div className="field full">
-              <label>
-                Additional fees
-              </label>
-
-              <div
-                className="form-grid"
-                style={{
-                  marginTop: 8,
-                }}
+            {/*
+              * Grouped by the end of the hire each fee
+              * belongs to, so the desk can see at a glance
+              * what should already have been taken at the
+              * counter and what is only owed now the vehicle
+              * is back. Both groups stay usable: a fee that
+              * was missed at checkout is still collectable.
+              */}
+            {PAYMENT_FEE_STAGES.map((stage) => (
+              <fieldset
+                className="field full checkout-block"
+                key={stage.id}
               >
-                {paymentFeeOptions.map(
-                  (fee) => (
-                    <div
-                      className="field"
-                      key={
-                        fee.type
-                      }
-                    >
-                      <label>
+                <legend>
+                  {stage.heading}
+                </legend>
+
+                <p className="form-help">
+                  {stage.hint}
+                </p>
+
+                <div className="checkout-charges">
+                  {paymentFeeOptions
+                    .filter(
+                      (fee) =>
+                        fee.stage === stage.id,
+                    )
+                    .map((fee) => (
+                      <div
+                        className="field"
+                        key={fee.type}
+                      >
+                        <label>
+                          <input
+                            name={
+                              fee.selectedName
+                            }
+                            type="checkbox"
+                            checked={
+                              selectedFees[
+                                fee.type
+                              ] ?? false
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setSelectedFees(
+                                (current) => ({
+                                  ...current,
+
+                                  [fee.type]:
+                                    event
+                                      .target
+                                      .checked,
+                                }),
+                              )
+                            }
+                          />{" "}
+                          {fee.label}
+                        </label>
+
                         <input
                           name={
-                            fee.selectedName
+                            fee.amountName
                           }
-                          type="checkbox"
-                          checked={
-                            selectedFees[
+                          type="number"
+                          min="0.01"
+                          max="100000"
+                          step="0.01"
+                          inputMode="decimal"
+                          placeholder="Amount (USD)"
+                          value={
+                            feeAmounts[
                               fee.type
-                            ] ?? false
+                            ] ?? ""
                           }
-                          onChange={(
-                            event,
-                          ) =>
-                            setSelectedFees(
+                          onChange={(event) =>
+                            setFeeAmounts(
                               (current) => ({
                                 ...current,
+
                                 [fee.type]:
                                   event.target
-                                    .checked,
+                                    .value,
                               }),
                             )
                           }
-                        />{" "}
-                        {
-                          fee.label
-                        }
-                      </label>
-
-                      <input
-                        name={
-                          fee.amountName
-                        }
-                        type="number"
-                        min="0.01"
-                        max="100000"
-                        step="0.01"
-                        inputMode="decimal"
-                        placeholder="Amount (USD)"
-                        value={
-                          feeAmounts[
-                            fee.type
-                          ] ?? ""
-                        }
-                        onChange={(event) =>
-                          setFeeAmounts(
-                            (current) => ({
-                              ...current,
-                              [fee.type]:
-                                event.target
-                                  .value,
-                            }),
-                          )
-                        }
-                      />
-                    </div>
-                  ),
-                )}
-              </div>
-            </div>
+                        />
+                      </div>
+                    ))}
+                </div>
+              </fieldset>
+            ))}
 
             {/*
               * The running total, so the employee can read the
@@ -4578,6 +5489,7 @@ export function ReservationComposer() {
           </form>
         )}
       </section>
+      )}
     </AppShell>
   );
 }

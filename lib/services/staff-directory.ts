@@ -461,3 +461,182 @@ export async function changeStaffRole(options: {
     role: options.role,
   };
 }
+
+/**
+ * The staff an entry form can attribute work to.
+ *
+ * Only an administrator may list `users`, so an operations
+ * account is refused by the rules. That is not an error worth
+ * showing on a form: the account can still attribute the work
+ * to itself, which is the common case, so the refusal falls
+ * back to exactly that rather than blocking the entry.
+ */
+export async function listAssignableStaff(): Promise<
+  Array<{ uid: string; fullName: string }>
+> {
+  const { auth } = getFirebaseClient();
+
+  const self = auth.currentUser;
+
+  const fallback = self
+    ? [
+        {
+          uid: self.uid,
+
+          fullName:
+            trimmedOrNull(self.displayName) ??
+            trimmedOrNull(self.email) ??
+            "Me",
+        },
+      ]
+    : [];
+
+  try {
+    const staff = await listStaff();
+
+    const assignable = staff
+      .filter(
+        (member) =>
+          member.status === "approved",
+      )
+      .map((member) => ({
+        uid: member.uid,
+        fullName: member.fullName,
+      }));
+
+    return assignable.length > 0
+      ? assignable
+      : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Correct a staff member's own details.
+ *
+ * Role and status are deliberately not writable here: those
+ * are access decisions and go through `decideStaffAccess` and
+ * `changeStaffRole`, each of which records why it happened.
+ * The stored email is a display copy of the address the
+ * account registered with; changing the sign-in address is a
+ * Firebase Authentication operation and is not offered.
+ */
+export async function updateStaffProfile(options: {
+  uid: string;
+  fullName: string;
+  mobile: string | null;
+  age: number | null;
+}): Promise<{ uid: string }> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const fullName = trimmedOrNull(
+    options.fullName,
+  )?.slice(0, 120);
+
+  if (!fullName) {
+    throw new Error(
+      "A staff member needs a name.",
+    );
+  }
+
+  const mobile =
+    trimmedOrNull(options.mobile)?.slice(
+      0,
+      40,
+    ) ?? null;
+
+  const age =
+    options.age === null ||
+    options.age === undefined ||
+    Number.isNaN(Number(options.age))
+      ? null
+      : Math.trunc(Number(options.age));
+
+  if (
+    age !== null &&
+    (age < 16 || age > 100)
+  ) {
+    throw new Error(
+      "Enter an age between 16 and 100.",
+    );
+  }
+
+  await runTransaction(db, async (transaction) => {
+    const profileRef = doc(
+      db,
+      "users",
+      options.uid,
+    );
+
+    const [profile, actorProfile] =
+      await Promise.all([
+        transaction.get(profileRef),
+        transaction.get(
+          doc(db, "users", actorUid),
+        ),
+      ]);
+
+    if (!profile.exists()) {
+      throw new Error(
+        "That staff profile no longer exists.",
+      );
+    }
+
+    const actorName =
+      trimmedOrNull(
+        actorProfile.get("fullName"),
+      ) ??
+      trimmedOrNull(
+        actorProfile.get("email"),
+      ) ??
+      actorUid;
+
+    transaction.update(profileRef, {
+      fullName,
+      mobile,
+      age,
+      updatedAt: serverTimestamp(),
+      updatedBy: actorUid,
+    });
+
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+
+        action: "user.profile_updated",
+
+        resource: {
+          collection: "users",
+          id: options.uid,
+        },
+
+        details: {
+          actorName,
+          fullName,
+          mobile,
+          age,
+
+          previousFullName: trimmedOrNull(
+            profile.get("fullName"),
+          ),
+
+          previousMobile: trimmedOrNull(
+            profile.get("mobile"),
+          ),
+
+          emailSnapshot: trimmedOrNull(
+            profile.get("email"),
+          ),
+        },
+
+        createdAt: serverTimestamp(),
+      },
+    );
+  });
+
+  return { uid: options.uid };
+}

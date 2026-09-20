@@ -57,6 +57,7 @@ type Customer = {
   licenceCountry: string;
   licenceExpiresAt: string | null;
   licenceStoragePath: string | null;
+  dateOfBirth: string | null;
 };
 
 type CustomerForm = {
@@ -70,6 +71,7 @@ type CustomerForm = {
   licenceCountry: string;
   licenceExpiresAt: string;
   licenceStoragePath: string | null;
+  dateOfBirth: string;
 };
 
 type ActiveRental = {
@@ -110,6 +112,62 @@ function tomorrowDate(): string {
   return `${year}-${month}-${day}`;
 }
 
+function todayDate(): string {
+  const value = new Date();
+
+  const year =
+    value.getFullYear();
+
+  const month =
+    String(
+      value.getMonth() + 1,
+    ).padStart(2, "0");
+
+  const day =
+    String(
+      value.getDate(),
+    ).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+}
+
+/*
+ * Shown beside the date of birth: the under-25 insurance
+ * premium in the agreement's terms is judged on age, so the
+ * desk should not have to work it out from the date.
+ */
+function ageInYears(
+  value: string,
+): number {
+  const born =
+    new Date(`${value.slice(0, 10)}T00:00:00`);
+
+  if (
+    Number.isNaN(born.getTime())
+  ) {
+    return 0;
+  }
+
+  const today = new Date();
+
+  let years =
+    today.getFullYear() -
+    born.getFullYear();
+
+  const monthDelta =
+    today.getMonth() - born.getMonth();
+
+  if (
+    monthDelta < 0 ||
+    (monthDelta === 0 &&
+      today.getDate() < born.getDate())
+  ) {
+    years -= 1;
+  }
+
+  return Math.max(0, years);
+}
+
 function customerToForm(
   customer: Customer,
 ): CustomerForm {
@@ -139,6 +197,13 @@ function customerToForm(
         : "",
     licenceStoragePath:
       customer.licenceStoragePath,
+    dateOfBirth:
+      customer.dateOfBirth
+        ? customer.dateOfBirth.slice(
+            0,
+            10,
+          )
+        : "",
   };
 }
 
@@ -154,6 +219,7 @@ function emptyCustomerForm(): CustomerForm {
     licenceCountry: "",
     licenceExpiresAt: "",
     licenceStoragePath: null,
+    dateOfBirth: "",
   };
 }
 
@@ -373,6 +439,11 @@ export function CustomerDirectory({
               licenceStoragePath:
                 customerDoc.get(
                   "licenceStoragePath",
+                ) ?? null,
+
+              dateOfBirth:
+                customerDoc.get(
+                  "dateOfBirth",
                 ) ?? null,
             }),
           ),
@@ -781,6 +852,13 @@ export function CustomerDirectory({
         ) ?? "",
       ).trim();
 
+    const dateOfBirthValue =
+      String(
+        form.get(
+          "dateOfBirth",
+        ) ?? "",
+      ).trim();
+
     try {
       if (
         !fullName ||
@@ -878,6 +956,7 @@ export function CustomerDirectory({
             licenceCountry,
             licenceExpiresAt,
             dateOfBirth:
+              dateOfBirthValue ||
               null,
             notes:
               null,
@@ -911,6 +990,8 @@ export function CustomerDirectory({
         licenceExpiresAt,
         licenceStoragePath:
           null,
+        dateOfBirth:
+          dateOfBirthValue,
       });
 
       setNotice(
@@ -1047,6 +1128,7 @@ export function CustomerDirectory({
           licenceNumber: string;
           licenceCountry: string;
           licenceExpiresAt: string;
+          dateOfBirth: string | null;
           licenceStoragePath:
             string | null;
         },
@@ -1080,10 +1162,14 @@ export function CustomerDirectory({
           licenceCountry,
           licenceExpiresAt,
 
+          dateOfBirth:
+            editingCustomerForm.dateOfBirth.trim() ||
+            null,
+
           /*
-           * The date of birth and the internal note are not
-           * on this form, so they are left out of the patch
-           * rather than sent back as null and erased.
+           * The internal note is not on this form, so it is
+           * left out of the patch rather than sent back as
+           * null and erased.
            */
           licenceStoragePath:
             editingCustomerForm
@@ -1498,6 +1584,27 @@ export function CustomerDirectory({
                   </div>
 
                   <div className="field">
+                    <label htmlFor="date-of-birth">
+                      Date of birth
+                    </label>
+
+                    <input
+                      id="date-of-birth"
+                      name="dateOfBirth"
+                      type="date"
+                      max={todayDate()}
+                      autoComplete="bday"
+                    />
+
+                    <p className="form-help">
+                      Printed on the rental
+                      agreement and used to
+                      judge the under-25
+                      insurance premium.
+                    </p>
+                  </div>
+
+                  <div className="field">
                     <label htmlFor="licence-number">
                       Licence number
                     </label>
@@ -1758,6 +1865,32 @@ export function CustomerDirectory({
                   </div>
 
                   <div className="field">
+                    <label htmlFor="date-of-birth-2">
+                      Date of birth
+                    </label>
+
+                    <input
+                      id="date-of-birth-2"
+                      value={
+                        editingCustomerForm.dateOfBirth
+                      }
+                      onChange={(event) =>
+                        setEditingCustomerForm(
+                          (current) => ({
+                            ...current,
+                            dateOfBirth:
+                              event.target
+                                .value,
+                          }),
+                        )
+                      }
+                      type="date"
+                      max={todayDate()}
+                      autoComplete="bday"
+                    />
+                  </div>
+
+                  <div className="field">
                     <label htmlFor="licence-number-2">
                       Licence number
                     </label>
@@ -1929,6 +2062,10 @@ export function CustomerDirectory({
                       </th>
 
                       <th>
+                        Date of birth
+                      </th>
+
+                      <th>
                         Licence
                       </th>
 
@@ -1975,6 +2112,28 @@ export function CustomerDirectory({
                                 customer.telephone
                               }
                             </strong>
+                          </td>
+
+                          <td>
+                            {customer.dateOfBirth ? (
+                              <>
+                                <strong>
+                                  {formatDate(
+                                    customer.dateOfBirth,
+                                  )}
+                                </strong>
+
+                                <span>
+                                  {`${ageInYears(
+                                    customer.dateOfBirth,
+                                  )} years old`}
+                                </span>
+                              </>
+                            ) : (
+                              <span className="missing">
+                                Not recorded
+                              </span>
+                            )}
                           </td>
 
                           <td>

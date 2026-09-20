@@ -330,9 +330,22 @@ allow list: if isAdmin();
 
     match /vehicleExpenses/{expenseId} {
 
-      allow read: if isAdmin();
+      /* Recording an expense is operational work, so any
+         approved account may add one and read back what it
+         recorded itself — a query it can only run by
+         filtering on its own uid. Everybody else's entries,
+         and therefore the cost side of the business, stay
+         with an administrator. */
+      allow read: if isAdmin()
+        || (
+          isStaff()
+          && resource.data.recordedBy
+              == request.auth.uid
+        );
 
-      allow create: if isStaff();
+      allow create: if isStaff()
+        && request.resource.data.recordedBy
+            == request.auth.uid;
 
       allow update, delete: if isAdmin();
     }

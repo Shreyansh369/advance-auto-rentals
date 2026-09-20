@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 import {
   collection,
   getDocs,
@@ -21,7 +23,6 @@ import {
 import {
   useCallback,
   useEffect,
-  useRef,
   useState,
 } from "react";
 
@@ -96,24 +97,11 @@ export function FinanceOverview() {
   const [error, setError] =
     useState<string>();
 
-  const [notice, setNotice] =
-    useState<string>();
-
   const [loading, setLoading] =
     useState(true);
 
-  const [savingExpense, setSavingExpense] =
-    useState(false);
-
   const [reloadToken, setReloadToken] =
     useState(0);
-
-  /*
-   * Held across retries so a lost response cannot record the
-   * same expense twice; replaced only after it is stored.
-   */
-  const expenseKey =
-    useRef<string>(undefined);
 
   useEffect(() => {
     if (role !== "admin") {
@@ -221,124 +209,6 @@ export function FinanceOverview() {
       (token) => token + 1,
     );
   }, []);
-
-  async function addExpense(
-    event: React.FormEvent<HTMLFormElement>,
-  ) {
-    event.preventDefault();
-
-    /*
-     * Capture the form before awaiting anything.
-     * React's event.currentTarget is not safe to
-     * access after an awaited async operation.
-     */
-    const formElement =
-      event.currentTarget;
-
-    const form =
-      new FormData(formElement);
-
-    setSavingExpense(true);
-    setError(undefined);
-    setNotice(undefined);
-
-    try {
-      const amount =
-        Number(form.get("amount"));
-
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0
-      ) {
-        throw new Error(
-          "Expense amount must be greater than zero.",
-        );
-      }
-
-      const occurredAt =
-        String(
-          form.get("occurredAt") ?? "",
-        ).trim();
-
-      if (!occurredAt) {
-        throw new Error(
-          "Expense date is required.",
-        );
-      }
-
-      await callFirestoreOperation<
-        {
-          vehicleId: string;
-          category: string;
-          amountCents: number;
-          occurredAt: string;
-          vendor: string | null;
-          note: string;
-          idempotencyKey: string;
-        },
-        {
-          expenseId: string;
-        }
-      >(
-        "recordVehicleExpense",
-        {
-          vehicleId: String(
-            form.get("vehicleId"),
-          ),
-
-          category: String(
-            form.get("category"),
-          ),
-
-          amountCents:
-            Math.round(
-              amount * 100,
-            ),
-
-          occurredAt:
-            new Date(
-              `${occurredAt}T12:00:00`,
-            ).toISOString(),
-
-          vendor:
-            String(
-              form.get("vendor") ?? "",
-            ).trim() || null,
-
-          note:
-            String(
-              form.get("note") ?? "",
-            ).trim(),
-
-          idempotencyKey:
-            (expenseKey.current ??=
-              crypto.randomUUID()),
-        },
-      );
-
-      expenseKey.current = undefined;
-
-      setNotice(
-        "Expense recorded.",
-      );
-
-      /*
-       * Use the captured form element rather
-       * than event.currentTarget after await.
-       */
-      formElement.reset();
-
-      setReloadToken(
-        (token) => token + 1,
-      );
-    } catch (cause) {
-      setError(
-        firebaseErrorMessage(cause),
-      );
-    } finally {
-      setSavingExpense(false);
-    }
-  }
 
   if (role !== "admin") {
     return (
@@ -516,15 +386,6 @@ export function FinanceOverview() {
         </div>
       )}
 
-      {notice && (
-        <div
-          className="alert alert-success"
-          role="status"
-        >
-          {notice}
-        </div>
-      )}
-
       <section className="metric-grid finance-metrics">
         {metrics.map(
           ({
@@ -634,157 +495,36 @@ export function FinanceOverview() {
           <div className="section-heading">
             <div>
               <p className="section-kicker">
-                New entry
+                Running costs
               </p>
 
               <h2>
-                Record an expense
+                Expenses
               </h2>
             </div>
           </div>
 
-          <form
-            className="compact-form"
-            onSubmit={(event) =>
-              void addExpense(event)
-            }
+          {/*
+            * Recording an expense is operational work and has
+            * a screen of its own that operations can reach.
+            * Finance reports on the result rather than
+            * carrying a second copy of the form.
+            */}
+          <p>
+            Expenses are recorded on the
+            Expenses screen, which any
+            approved account can open. The
+            figures above already include
+            everything recorded there.
+          </p>
+
+          <Link
+            className="button button-secondary"
+            href="/expenses"
           >
-            <div className="field">
-              <label htmlFor="vehicle">
-                Vehicle
-              </label>
-
-              <select
-                id="vehicle"
-                name="vehicleId"
-                defaultValue=""
-                required
-              >
-                <option
-                  value=""
-                  disabled
-                >
-                  Select a vehicle
-                </option>
-
-                {vehicles.map(
-                  (vehicle) => (
-                    <option
-                      value={vehicle.id}
-                      key={vehicle.id}
-                    >
-                      {vehicle.label}
-                    </option>
-                  ),
-                )}
-              </select>
-            </div>
-
-            <div className="form-columns">
-              <div className="field">
-                <label htmlFor="category">
-                  Category
-                </label>
-
-                <select
-                  id="category"
-                  name="category"
-                  defaultValue="maintenance"
-                >
-                  <option value="repair">
-                    Repair
-                  </option>
-
-                  <option value="service">
-                    Service
-                  </option>
-
-                  <option value="maintenance">
-                    Maintenance
-                  </option>
-
-                  <option value="parts">
-                    Parts
-                  </option>
-
-                  <option value="other">
-                    Other
-                  </option>
-                </select>
-              </div>
-
-              <div className="field">
-                <label htmlFor="amount-usd">
-                  Amount (USD)
-                </label>
-
-                <input
-                  id="amount-usd"
-                  name="amount"
-                  type="number"
-                  min="0.01"
-                  max="100000"
-                  step="0.01"
-                  inputMode="decimal"
-                  required
-                />
-              </div>
-            </div>
-
-            <div className="form-columns">
-              <div className="field">
-                <label htmlFor="date">
-                  Date
-                </label>
-
-                <input
-                  id="date"
-                  name="occurredAt"
-                  type="date"
-                  defaultValue={toDateInput(
-                    new Date(),
-                  )}
-                  required
-                />
-              </div>
-
-              <div className="field">
-                <label htmlFor="vendor">
-                  Vendor
-                </label>
-
-                <input
-                  id="vendor"
-                  name="vendor"
-                  maxLength={160}
-                />
-              </div>
-            </div>
-
-            <div className="field">
-              <label htmlFor="note">
-                Note
-              </label>
-
-              <input
-                id="note"
-                name="note"
-                minLength={1}
-                maxLength={1000}
-                required
-              />
-            </div>
-
-            <button
-              type="submit"
-              className="button button-primary"
-              disabled={savingExpense}
-            >
-              {savingExpense
-                ? "Saving…"
-                : "Record expense"}
-            </button>
-          </form>
+            <ReceiptText size={15} />
+            Open Expenses
+          </Link>
         </article>
       </section>
 

@@ -172,6 +172,9 @@ export function RentalHistory({
           entry.customerName,
           entry.vehicleRegistration,
           entry.status,
+          entry.isHistorical
+            ? "past booking"
+            : "",
         ].some((value) =>
           String(value)
             .toLowerCase()
@@ -222,6 +225,28 @@ export function RentalHistory({
     />
   ) : null;
 
+  /*
+   * A booking typed in from the paper file reads as
+   * "Returned" like any other closed rental, so it is
+   * labelled for what it is rather than presented as
+   * something this system ran.
+   */
+  function entryStatusLabel(
+    entry: RentalHistoryEntry,
+  ): string {
+    return entry.isHistorical
+      ? "Past booking"
+      : statusLabel(entry.status);
+  }
+
+  function entryStatusTone(
+    entry: RentalHistoryEntry,
+  ): string {
+    return entry.isHistorical
+      ? "cleaning"
+      : statusTone(entry.status);
+  }
+
   if (compact) {
     return (
       <div className="list-table">
@@ -271,11 +296,11 @@ export function RentalHistory({
             </div>
 
             <span
-              className={`status-pill ${statusTone(
-                entry.status,
+              className={`status-pill ${entryStatusTone(
+                entry,
               )}`}
             >
-              {statusLabel(entry.status)}
+              {entryStatusLabel(entry)}
             </span>
           </button>
         ))}
@@ -365,11 +390,11 @@ export function RentalHistory({
 
               <td>
                 <span
-                  className={`status-pill ${statusTone(
-                    entry.status,
+                  className={`status-pill ${entryStatusTone(
+                    entry,
                   )}`}
                 >
-                  {statusLabel(entry.status)}
+                  {entryStatusLabel(entry)}
                 </span>
               </td>
             </tr>

@@ -2,11 +2,13 @@
 
 import {
   BadgeCheck,
+  Pencil,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
   UserRoundCheck,
   UserRoundX,
+  X,
 } from "lucide-react";
 
 import {
@@ -28,6 +30,7 @@ import {
   changeStaffRole,
   decideStaffAccess,
   listStaff,
+  updateStaffProfile,
   type StaffMember,
   type StaffRole,
   type StaffStatus,
@@ -104,6 +107,20 @@ export function StaffDirectory() {
 
   const [reloadToken, setReloadToken] =
     useState(0);
+
+  /*
+   * A name typed wrong at registration follows the account
+   * onto every rental it books, so an administrator has to be
+   * able to correct it. Role and status are not edited here:
+   * those are access decisions with their own controls and
+   * their own audit entries.
+   */
+  const [editing, setEditing] = useState<{
+    uid: string;
+    fullName: string;
+    mobile: string;
+    age: string;
+  } | null>(null);
 
   /*
    * A decision changes the queue, so the screen re-reads it
@@ -233,6 +250,61 @@ export function StaffDirectory() {
         outcome === "reject"
           ? `${member.fullName}'s request was declined.`
           : `${member.fullName} no longer has access.`,
+      );
+    } catch (cause) {
+      setError(firebaseErrorMessage(cause));
+    } finally {
+      setBusyUid(null);
+    }
+  }
+
+  function startEdit(member: StaffMember) {
+    setError(undefined);
+    setNotice(undefined);
+
+    setEditing({
+      uid: member.uid,
+      fullName: member.fullName,
+      mobile: member.mobile ?? "",
+      age:
+        member.age === null
+          ? ""
+          : String(member.age),
+    });
+  }
+
+  async function saveEdit() {
+    if (!editing || busyUid) {
+      return;
+    }
+
+    setBusyUid(editing.uid);
+    setError(undefined);
+    setNotice(undefined);
+
+    try {
+      await updateStaffProfile({
+        uid: editing.uid,
+
+        fullName: editing.fullName,
+
+        mobile:
+          editing.mobile.trim() || null,
+
+        age:
+          editing.age.trim() === ""
+            ? null
+            : Number(editing.age),
+      });
+
+      const saved = editing.fullName.trim();
+
+      setEditing(null);
+
+      reload();
+
+      setNotice(
+        `${saved}'s details were updated.`,
       );
     } catch (cause) {
       setError(firebaseErrorMessage(cause));
@@ -526,6 +598,174 @@ export function StaffDirectory() {
         </section>
       )}
 
+      {editing && (
+        <section className="surface staff-editor">
+          <div className="section-heading">
+            <div>
+              <p className="section-kicker">
+                Staff details
+              </p>
+
+              <h2>Edit staff member</h2>
+            </div>
+
+            <button
+              className="icon-button"
+              type="button"
+              aria-label="Close editor"
+              onClick={() => {
+                if (busyUid) {
+                  return;
+                }
+
+                setEditing(null);
+              }}
+            >
+              <X size={18} />
+            </button>
+          </div>
+
+          <form
+            className="form-grid"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveEdit();
+            }}
+          >
+            <div className="field">
+              <label htmlFor="staff-full-name">
+                Full name
+              </label>
+
+              <input
+                id="staff-full-name"
+                value={editing.fullName}
+                onChange={(event) =>
+                  setEditing((current) =>
+                    current
+                      ? {
+                          ...current,
+
+                          fullName:
+                            event.target
+                              .value,
+                        }
+                      : current,
+                  )
+                }
+                maxLength={120}
+                required
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="staff-mobile">
+                Mobile
+              </label>
+
+              <input
+                id="staff-mobile"
+                value={editing.mobile}
+                onChange={(event) =>
+                  setEditing((current) =>
+                    current
+                      ? {
+                          ...current,
+
+                          mobile:
+                            event.target
+                              .value,
+                        }
+                      : current,
+                  )
+                }
+                maxLength={40}
+                inputMode="tel"
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="staff-age">
+                Age
+              </label>
+
+              <input
+                id="staff-age"
+                value={editing.age}
+                onChange={(event) =>
+                  setEditing((current) =>
+                    current
+                      ? {
+                          ...current,
+
+                          age: event.target
+                            .value,
+                        }
+                      : current,
+                  )
+                }
+                type="number"
+                min={16}
+                max={100}
+                step={1}
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="staff-email">
+                Email
+              </label>
+
+              <input
+                id="staff-email"
+                value={
+                  members.find(
+                    (member) =>
+                      member.uid ===
+                      editing.uid,
+                  )?.email ?? ""
+                }
+                readOnly
+                disabled
+              />
+
+              <p className="form-help">
+                The sign-in address belongs to
+                Firebase Authentication and
+                cannot be changed from here.
+              </p>
+            </div>
+
+            <div className="form-actions">
+              <button
+                className="button button-secondary"
+                type="button"
+                disabled={
+                  busyUid === editing.uid
+                }
+                onClick={() =>
+                  setEditing(null)
+                }
+              >
+                Cancel
+              </button>
+
+              <button
+                className="button button-primary"
+                type="submit"
+                disabled={
+                  busyUid === editing.uid
+                }
+              >
+                {busyUid === editing.uid
+                  ? "Saving…"
+                  : "Save details"}
+              </button>
+            </div>
+          </form>
+        </section>
+      )}
+
       <section className="surface fleet-surface">
         <div className="surface-toolbar">
           <div className="filter-scroll">
@@ -672,6 +912,21 @@ export function StaffDirectory() {
 
                       <td>
                         <div className="row-actions">
+                          <button
+                            type="button"
+                            className="button button-secondary compact"
+                            onClick={() =>
+                              startEdit(member)
+                            }
+                            disabled={
+                              busyUid ===
+                              member.uid
+                            }
+                          >
+                            <Pencil size={15} />
+                            Edit
+                          </button>
+
                           {member.status ===
                             "approved" && (
                             <button

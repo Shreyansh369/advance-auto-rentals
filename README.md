@@ -8,6 +8,9 @@ Secure operations software for Advance Auto Rentals. It is a separate applicatio
 - Self-service staff registration with an administrator approval screen and role assignment
 - Firestore/Storage security rules and indexes
 - Transactional reservation, checkout, extension, return, pricing and payment workflows that run in the browser against Firestore, so no Blaze-plan Cloud Functions are required
+- Manual entry of a rental the office already ran, recorded as a closed rental and marked as a past booking so it is never mistaken for a live one
+- A rental record of every hire — customer, vehicle, the staff member who handled it, start, return and status — searchable from one box
+- Expense recording on a screen of its own that operations can reach, kept apart from the administrator-only revenue reporting
 - Cloudinary media capture for vehicle condition photos, fleet photos and driver's licence images
 - Printable rental agreement rebuilt from the stored booking, with an employee review workflow — submit, approve or reject, then email — and an immutable snapshot of what was approved
 - Approved agreements handed to the office's own mail account — Gmail compose, the device's mail app, or copy — so no mail provider, API key or extra deployment is involved

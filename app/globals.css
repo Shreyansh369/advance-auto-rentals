@@ -6640,3 +6640,42 @@ canvas {
     break-inside: avoid;
   }
 }
+
+/* ---------------------------------------------------------
+   Rental records, staff editing and expense recording
+   --------------------------------------------------------- */
+
+/*
+ * These sit inside a padded surface rather than a full-bleed
+ * one, so the toolbar and the filter row carry their own
+ * vertical rhythm instead of the edge padding a table screen
+ * would otherwise supply.
+ */
+.rental-records .surface-toolbar {
+  flex-wrap: wrap;
+  padding: 0 0 15px;
+}
+
+.rental-records .filter-scroll {
+  padding: 15px 0;
+}
+
+.rental-records .table-wrap {
+  border-top: 1px solid var(--line);
+}
+
+.staff-editor {
+  max-width: 1460px;
+  margin: 0 auto 15px;
+  padding: 22px;
+}
+
+@media (max-width: 720px) {
+  .staff-editor {
+    padding: 16px 14px;
+  }
+
+  .rental-records .surface-toolbar .search-box {
+    width: 100%;
+  }
+}
