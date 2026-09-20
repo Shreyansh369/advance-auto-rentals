@@ -6,6 +6,7 @@ import {
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
   UserRoundCheck,
   UserRoundX,
   X,
@@ -30,6 +31,7 @@ import {
   changeStaffRole,
   decideStaffAccess,
   listStaff,
+  removeStaffMember,
   updateStaffProfile,
   type StaffMember,
   type StaffRole,
@@ -121,6 +123,14 @@ export function StaffDirectory() {
     mobile: string;
     age: string;
   } | null>(null);
+
+  /*
+   * Removal is irreversible, so the row asks for a second
+   * click rather than deleting on the first one — the same
+   * pattern the customers screen uses.
+   */
+  const [pendingRemovalUid, setPendingRemovalUid] =
+    useState<string | null>(null);
 
   /*
    * A decision changes the queue, so the screen re-reads it
@@ -305,6 +315,40 @@ export function StaffDirectory() {
 
       setNotice(
         `${saved}'s details were updated.`,
+      );
+    } catch (cause) {
+      setError(firebaseErrorMessage(cause));
+    } finally {
+      setBusyUid(null);
+    }
+  }
+
+  async function remove(member: StaffMember) {
+    if (busyUid) {
+      return;
+    }
+
+    setBusyUid(member.uid);
+    setError(undefined);
+    setNotice(undefined);
+
+    try {
+      await removeStaffMember({
+        uid: member.uid,
+      });
+
+      setPendingRemovalUid(null);
+
+      if (
+        editing?.uid === member.uid
+      ) {
+        setEditing(null);
+      }
+
+      reload();
+
+      setNotice(
+        `${member.fullName} was removed. Their sign-in account still exists and can register again; delete it in the Firebase console to stop that.`,
       );
     } catch (cause) {
       setError(firebaseErrorMessage(cause));
@@ -911,6 +955,55 @@ export function StaffDirectory() {
                       </td>
 
                       <td>
+                        {pendingRemovalUid ===
+                        member.uid ? (
+                          <div className="row-actions">
+                            <span className="quiet">
+                              Remove{" "}
+                              {member.fullName}
+                              ?
+                            </span>
+
+                            <button
+                              type="button"
+                              className="button button-secondary compact"
+                              onClick={() =>
+                                setPendingRemovalUid(
+                                  null,
+                                )
+                              }
+                              disabled={
+                                busyUid ===
+                                member.uid
+                              }
+                            >
+                              Cancel
+                            </button>
+
+                            <button
+                              type="button"
+                              className="button button-danger compact"
+                              onClick={() =>
+                                void remove(
+                                  member,
+                                )
+                              }
+                              disabled={
+                                busyUid ===
+                                member.uid
+                              }
+                            >
+                              <Trash2
+                                size={15}
+                              />
+
+                              {busyUid ===
+                              member.uid
+                                ? "Removing…"
+                                : "Remove"}
+                            </button>
+                          </div>
+                        ) : (
                         <div className="row-actions">
                           <button
                             type="button"
@@ -995,7 +1088,42 @@ export function StaffDirectory() {
                               Approve
                             </button>
                           )}
+
+                          {/*
+                            * Removing the profile is what
+                            * removes the access: the rules
+                            * read role and status from it.
+                            */}
+                          <button
+                            type="button"
+                            className="icon-button"
+                            aria-label={`Remove ${member.fullName}`}
+                            title={`Remove ${member.fullName}`}
+                            onClick={() => {
+                              setError(
+                                undefined,
+                              );
+
+                              setNotice(
+                                undefined,
+                              );
+
+                              setPendingRemovalUid(
+                                member.uid,
+                              );
+                            }}
+                            disabled={
+                              self ||
+                              busyUid ===
+                                member.uid
+                            }
+                          >
+                            <Trash2
+                              size={16}
+                            />
+                          </button>
                         </div>
+                        )}
                       </td>
                     </tr>
                   );

@@ -13,6 +13,7 @@ import {
   CalendarCheck2,
   CalendarClock,
   CarFront,
+  ChevronDown,
   ChevronRight,
   ClipboardCheck,
   CreditCard,
@@ -715,6 +716,18 @@ export function ReservationComposer() {
       }>
     >([]);
 
+  /*
+   * The directory grows without limit, and a list of every
+   * matching name pushed the rest of the booking form off the
+   * screen. The picker is a dropdown instead: closed it is one
+   * row, open it is a search box over the same list.
+   */
+  const [customerPickerOpen, setCustomerPickerOpen] =
+    useState(false);
+
+  const customerPickerRef =
+    useRef<HTMLDivElement | null>(null);
+
   const [contractQueue, setContractQueue] =
     useState<ContractQueueEntry[]>([]);
 
@@ -777,6 +790,55 @@ export function ReservationComposer() {
         customer.id ===
         selectedCustomerId,
     );
+
+  useEffect(() => {
+    if (!customerPickerOpen) {
+      return;
+    }
+
+    function onPointerDown(
+      event: PointerEvent,
+    ) {
+      if (
+        customerPickerRef.current &&
+        !customerPickerRef.current.contains(
+          event.target as Node,
+        )
+      ) {
+        setCustomerPickerOpen(false);
+      }
+    }
+
+    function onKeyDown(
+      event: KeyboardEvent,
+    ) {
+      if (event.key === "Escape") {
+        setCustomerPickerOpen(false);
+      }
+    }
+
+    document.addEventListener(
+      "pointerdown",
+      onPointerDown,
+    );
+
+    document.addEventListener(
+      "keydown",
+      onKeyDown,
+    );
+
+    return () => {
+      document.removeEventListener(
+        "pointerdown",
+        onPointerDown,
+      );
+
+      document.removeEventListener(
+        "keydown",
+        onKeyDown,
+      );
+    };
+  }, [customerPickerOpen]);
 
   useEffect(() => {
     if (
@@ -3251,50 +3313,6 @@ export function ReservationComposer() {
               {customerMode ===
               "existing" ? (
                 <div className="customer-picker">
-                  <div className="customer-search-control">
-                    <Search
-                      size={18}
-                      className="customer-search-icon"
-                      aria-hidden="true"
-                    />
-
-                    <input
-                      id="customer"
-                      ref={
-                        customerSearchInputRef
-                      }
-                      type="text"
-                      defaultValue=""
-                      onChange={(
-                        event,
-                      ) =>
-                        setCustomerSearch(
-                          event
-                            .target
-                            .value,
-                        )
-                      }
-                      placeholder="Search name, telephone or licence"
-                      aria-label="Search customers"
-                    />
-
-                    {customerSearch.length >
-                      0 && (
-                      <button
-                        className="customer-search-clear"
-                        type="button"
-                        onClick={() =>
-                          setCustomerSearch(
-                            "",
-                          )
-                        }
-                        aria-label="Clear customer search"
-                      >
-                        <X size={15} />
-                      </button>
-                    )}
-                  </div>
-
                   {selectedCustomer ? (
                     <div className="selected-customer">
                       <div className="selected-customer-icon">
@@ -3344,6 +3362,14 @@ export function ReservationComposer() {
                             setSelectedCustomerId(
                               "",
                             );
+
+                            setCustomerSearch(
+                              "",
+                            );
+
+                            setCustomerPickerOpen(
+                              true,
+                            );
                           }}
                         >
                           Change
@@ -3351,69 +3377,183 @@ export function ReservationComposer() {
                       </div>
                     </div>
                   ) : (
-                    <div className="customer-choice-list">
-                      {filteredCustomers
-                        .slice(
-                          0,
-                          8,
-                        )
-                        .map(
-                          (
-                            customer,
-                          ) => (
-                            <button
-                              className="customer-choice"
-                              key={
-                                customer.id
+                    <div
+                      className="customer-combobox"
+                      ref={customerPickerRef}
+                    >
+                      <button
+                        id="customer"
+                        type="button"
+                        className="customer-combobox-trigger"
+                        aria-haspopup="listbox"
+                        aria-expanded={
+                          customerPickerOpen
+                        }
+                        onClick={() =>
+                          setCustomerPickerOpen(
+                            (open) => !open,
+                          )
+                        }
+                      >
+                        <span className="selected-customer-icon">
+                          <UserRound
+                            size={17}
+                          />
+                        </span>
+
+                        <span>
+                          <strong>
+                            Select a customer
+                          </strong>
+
+                          <small>
+                            {customers.length ===
+                            1
+                              ? "1 customer on file"
+                              : `${customers.length} customers on file`}
+                          </small>
+                        </span>
+
+                        <ChevronDown
+                          size={16}
+                        />
+                      </button>
+
+                      {customerPickerOpen && (
+                        <div className="customer-combobox-panel">
+                          <div className="customer-search-control">
+                            <Search
+                              size={18}
+                              className="customer-search-icon"
+                              aria-hidden="true"
+                            />
+
+                            <input
+                              ref={
+                                customerSearchInputRef
                               }
-                              type="button"
-                              onClick={() =>
-                                setSelectedCustomerId(
-                                  customer.id,
+                              type="text"
+                              autoFocus
+                              defaultValue={
+                                customerSearch
+                              }
+                              onChange={(
+                                event,
+                              ) =>
+                                setCustomerSearch(
+                                  event.target
+                                    .value,
                                 )
                               }
-                            >
-                              <span className="selected-customer-icon">
-                                <UserRound
-                                  size={
-                                    17
-                                  }
+                              placeholder="Search name, telephone or licence"
+                              aria-label="Search customers"
+                            />
+
+                            {customerSearch.length >
+                              0 && (
+                              <button
+                                className="customer-search-clear"
+                                type="button"
+                                onClick={() =>
+                                  setCustomerSearch(
+                                    "",
+                                  )
+                                }
+                                aria-label="Clear customer search"
+                              >
+                                <X
+                                  size={15}
                                 />
-                              </span>
+                              </button>
+                            )}
+                          </div>
 
-                              <span>
-                                <strong>
-                                  {
-                                    customer.fullName
-                                  }
-                                </strong>
+                          <div
+                            className="customer-choice-list"
+                            role="listbox"
+                            aria-label="Customers"
+                          >
+                            {filteredCustomers
+                              .slice(0, 50)
+                              .map(
+                                (customer) => (
+                                  <button
+                                    className="customer-choice"
+                                    key={
+                                      customer.id
+                                    }
+                                    type="button"
+                                    role="option"
+                                    aria-selected={
+                                      false
+                                    }
+                                    onClick={() => {
+                                      setSelectedCustomerId(
+                                        customer.id,
+                                      );
 
-                                <small>
-                                  {
-                                    customer.telephone
-                                  }
-                                  {" · "}
-                                  licence{" "}
-                                  {
-                                    customer.licenceNumber
-                                  }
-                                </small>
-                              </span>
+                                      setCustomerPickerOpen(
+                                        false,
+                                      );
+                                    }}
+                                  >
+                                    <span className="selected-customer-icon">
+                                      <UserRound
+                                        size={
+                                          17
+                                        }
+                                      />
+                                    </span>
 
-                              <ChevronRight
-                                size={16}
-                              />
-                            </button>
-                          ),
-                        )}
+                                    <span>
+                                      <strong>
+                                        {
+                                          customer.fullName
+                                        }
+                                      </strong>
 
-                      {filteredCustomers.length ===
-                        0 && (
-                        <div className="customer-picker-empty">
-                          No matching
-                          customer. Use “+ New
-                          customer” to create
-                          one.
+                                      <small>
+                                        {
+                                          customer.telephone
+                                        }
+                                        {" · "}
+                                        licence{" "}
+                                        {
+                                          customer.licenceNumber
+                                        }
+                                      </small>
+                                    </span>
+
+                                    <ChevronRight
+                                      size={16}
+                                    />
+                                  </button>
+                                ),
+                              )}
+
+                            {filteredCustomers.length >
+                              50 && (
+                              <p className="customer-picker-more">
+                                Showing the
+                                first 50 of{" "}
+                                {
+                                  filteredCustomers.length
+                                }
+                                . Keep typing to
+                                narrow the list.
+                              </p>
+                            )}
+
+                            {filteredCustomers.length ===
+                              0 && (
+                              <div className="customer-picker-empty">
+                                No matching
+                                customer. Use “+
+                                New customer” to
+                                create one.
+                              </div>
+                            )}
+                          </div>
                         </div>
                       )}
                     </div>

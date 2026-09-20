@@ -23,10 +23,16 @@ import { useFirebaseAuth } from "./firebase-provider";
 import { AgreementSheet } from "./agreement-sheet";
 
 import {
+  LicenceImage,
+  MediaGrid,
+} from "./rental-media";
+
+import {
   callFirestoreOperation,
   type ContractStatus,
   type ContractWorkflow,
   type RentalAgreementView,
+  type RentalDocuments,
 } from "@/lib/services/firestore-client";
 
 import {
@@ -108,6 +114,20 @@ function statusTone(
 }
 
 /*
+ * What the dialog is showing. The agreement is the reason the
+ * dialog is usually opened, so it is the tab it opens on; the
+ * photographs sit beside it rather than in a screen of their
+ * own, because the question "what condition was it in" is
+ * asked about a particular rental, not in the abstract.
+ */
+type DocumentView =
+  | "agreement"
+  | "licence"
+  | "booking"
+  | "checkout"
+  | "return";
+
+/*
  * The agreement is rebuilt from the stored booking every time
  * it is opened, so it always reflects the reservation that was
  * actually saved rather than whatever remains on the form.
@@ -123,6 +143,12 @@ export function RentalAgreement({
 
   const [agreement, setAgreement] =
     useState<RentalAgreementView>();
+
+  const [documents, setDocuments] =
+    useState<RentalDocuments>();
+
+  const [view, setView] =
+    useState<DocumentView>("agreement");
 
   const [workflow, setWorkflow] =
     useState<ContractWorkflow>();
@@ -197,6 +223,25 @@ export function RentalAgreement({
 
         if (!cancelled) {
           setWorkflow(review);
+        }
+
+        /*
+         * The photographs are a second read rather than part
+         * of the agreement view: the agreement is the frozen
+         * record of what was signed, and the licence image
+         * lives on the customer, who may have replaced it
+         * since.
+         */
+        const filed =
+          await callFirestoreOperation<
+            { rentalId: string },
+            RentalDocuments
+          >("getRentalDocuments", {
+            rentalId,
+          });
+
+        if (!cancelled) {
+          setDocuments(filed);
         }
       } catch (cause) {
         if (!cancelled) {
@@ -383,6 +428,70 @@ export function RentalAgreement({
     }
   }
 
+  /*
+   * Only the tabs that have something behind them, so the
+   * strip does not promise photographs that were never
+   * taken. The agreement is always there — it is rebuilt
+   * from the booking rather than stored as a file.
+   */
+  const tabs: Array<{
+    id: DocumentView;
+    label: string;
+    count: number | null;
+  }> = [
+    {
+      id: "agreement",
+      label: "Agreement",
+      count: null,
+    },
+
+    ...(documents?.licenceStoragePath
+      ? [
+          {
+            id: "licence" as const,
+            label: "Licence",
+            count: null,
+          },
+        ]
+      : []),
+
+    ...(documents &&
+    documents.bookingMedia.length > 0
+      ? [
+          {
+            id: "booking" as const,
+            label: "At booking",
+            count:
+              documents.bookingMedia.length,
+          },
+        ]
+      : []),
+
+    ...(documents &&
+    documents.checkoutMedia.length > 0
+      ? [
+          {
+            id: "checkout" as const,
+            label: "At checkout",
+            count:
+              documents.checkoutMedia.length,
+          },
+        ]
+      : []),
+
+    ...(documents &&
+    documents.returnMedia.length > 0
+      ? [
+          {
+            id: "return" as const,
+            label: "At return",
+            count:
+              documents.returnMedia.length,
+          },
+        ]
+      : []),
+  ];
+
   if (!hydrated) {
     return null;
   }
@@ -396,7 +505,7 @@ export function RentalAgreement({
         className="agreement-modal"
         role="dialog"
         aria-modal="true"
-        aria-label="Rental agreement"
+        aria-label="Rental file"
       >
         <header className="agreement-modal-header">
           <div>
@@ -419,7 +528,15 @@ export function RentalAgreement({
               onClick={() =>
                 window.print()
               }
-              disabled={!agreement}
+              disabled={
+                !agreement ||
+                view !== "agreement"
+              }
+              title={
+                view === "agreement"
+                  ? "Print the agreement"
+                  : "Printing applies to the agreement"
+              }
             >
               <Printer size={16} />
               Print
@@ -435,6 +552,37 @@ export function RentalAgreement({
             </button>
           </div>
         </header>
+
+        <nav
+          className="agreement-tabs"
+          aria-label="Rental documents"
+        >
+          {tabs.map((tab) => (
+            <button
+              type="button"
+              key={tab.id}
+              className={
+                view === tab.id
+                  ? "active"
+                  : ""
+              }
+              aria-current={
+                view === tab.id
+                  ? "page"
+                  : undefined
+              }
+              onClick={() =>
+                setView(tab.id)
+              }
+            >
+              {tab.label}
+
+              {tab.count !== null && (
+                <span>{tab.count}</span>
+              )}
+            </button>
+          ))}
+        </nav>
 
         {error && (
           <div
@@ -454,6 +602,50 @@ export function RentalAgreement({
           </div>
         )}
 
+        {view !== "agreement" && (
+          <section className="rental-media-panel">
+            {view === "licence" && (
+              <LicenceImage
+                storagePath={
+                  documents?.licenceStoragePath ??
+                  null
+                }
+              />
+            )}
+
+            {view === "booking" && (
+              <MediaGrid
+                items={
+                  documents?.bookingMedia ??
+                  []
+                }
+                emptyMessage="No photographs were taken when this vehicle was booked."
+              />
+            )}
+
+            {view === "checkout" && (
+              <MediaGrid
+                items={
+                  documents?.checkoutMedia ??
+                  []
+                }
+                emptyMessage="No condition photographs were taken at checkout."
+              />
+            )}
+
+            {view === "return" && (
+              <MediaGrid
+                items={
+                  documents?.returnMedia ??
+                  []
+                }
+                emptyMessage="No condition photographs were taken at return. They are captured when the rental is closed."
+              />
+            )}
+          </section>
+        )}
+
+        {view === "agreement" && (
         <section className="agreement-review">
           <div className="agreement-review-head">
             <div>
@@ -727,12 +919,14 @@ export function RentalAgreement({
               </div>
             )}
         </section>
-
-        {agreement && (
-          <AgreementSheet
-            agreement={agreement}
-          />
         )}
+
+        {view === "agreement" &&
+          agreement && (
+            <AgreementSheet
+              agreement={agreement}
+            />
+          )}
 
       </section>
     </div>,

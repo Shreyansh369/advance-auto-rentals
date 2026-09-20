@@ -8593,6 +8593,146 @@ async function listVehicleExpenses(
 }
 
 /* =========================================================
+   Rental documents
+   ========================================================= */
+
+export type RentalMediaItem = {
+  url: string;
+  publicId: string;
+  originalFilename: string;
+  format: string;
+};
+
+export type RentalDocuments = {
+  rentalId: string;
+  customerId: string;
+  customerName: string;
+  vehicleRegistration: string;
+  /*
+   * A Cloudinary URL, or a Firebase Storage path for a
+   * licence captured before the move to Cloudinary. The
+   * screen resolves whichever it is given.
+   */
+  licenceStoragePath: string | null;
+  bookingMedia: RentalMediaItem[];
+  checkoutMedia: RentalMediaItem[];
+  returnMedia: RentalMediaItem[];
+};
+
+/*
+ * Only what is needed to show a picture: the stored media
+ * objects also carry byte counts and dimensions that no
+ * viewer reads.
+ */
+function mediaItems(
+  value: unknown,
+): RentalMediaItem[] {
+  return sanitizeMediaList(value)
+    .filter(
+      (item) =>
+        typeof item.url === "string" &&
+        String(item.url).length > 0,
+    )
+    .map((item, index) => ({
+      url: String(item.url),
+
+      publicId: String(
+        item.publicId ?? `media-${index}`,
+      ),
+
+      originalFilename: String(
+        item.originalFilename ?? "Photo",
+      ),
+
+      format: String(item.format ?? ""),
+    }));
+}
+
+/*
+ * Everything filed against one rental that somebody at the
+ * desk might need to look at: the renter's licence, and the
+ * vehicle as it was photographed at booking, at handover and
+ * on its return.
+ *
+ * The agreement itself is not here — it is rebuilt from the
+ * booking by getRentalAgreement, which the same dialog
+ * already reads.
+ */
+async function getRentalDocuments(
+  input: { rentalId: string },
+): Promise<RentalDocuments> {
+  const { db } = getFirebaseClient();
+
+  const rentalRef = doc(
+    db,
+    "rentals",
+    String(input.rentalId),
+  );
+
+  const rental = await getDoc(rentalRef);
+
+  if (!rental.exists()) {
+    throw new Error(
+      "Rental was not found.",
+    );
+  }
+
+  const customerId = trimmedOrNull(
+    rental.get("customerId"),
+  );
+
+  /*
+   * A rental whose customer has since been removed still has
+   * its photographs and its name snapshot, so a missing
+   * customer costs the licence image and nothing else.
+   */
+  const customer = customerId
+    ? await getDoc(
+        doc(db, "customers", customerId),
+      )
+    : null;
+
+  return {
+    rentalId: rental.id,
+
+    customerId: customerId ?? "",
+
+    customerName: String(
+      rental.get("customerNameSnapshot") ??
+        customer?.get("fullName") ??
+        "Unknown customer",
+    ),
+
+    vehicleRegistration: String(
+      rental.get(
+        "vehicleRegistrationSnapshot",
+      ) ?? "Unknown vehicle",
+    ),
+
+    licenceStoragePath:
+      customer && customer.exists()
+        ? trimmedOrNull(
+            customer.get(
+              "licenceStoragePath",
+            ),
+          )
+        : null,
+
+    bookingMedia: mediaItems(
+      rental.get("bookingMedia"),
+    ),
+
+    checkoutMedia: mediaItems(
+      rental.get("checkoutMedia"),
+    ),
+
+    returnMedia: mediaItems(
+      rental.get("returnMedia"),
+    ),
+  };
+}
+
+/* =========================================================
    Compatibility dispatcher
    ========================================================= */
 
@@ -8731,6 +8871,13 @@ export async function callFirestoreOperation<
       return (
         (await getReservationContract(
           data as { reservationId: string },
+        )) as TResult
+      );
+
+    case "getRentalDocuments":
+      return (
+        (await getRentalDocuments(
+          data as { rentalId: string },
         )) as TResult
       );
 

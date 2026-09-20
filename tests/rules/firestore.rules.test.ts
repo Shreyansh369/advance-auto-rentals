@@ -60,6 +60,17 @@ beforeAll(async () => {
       requestedRole: "operations",
     });
 
+    /* A disposable profile for the deletion test, so removing
+       it cannot pull the ground from under the accounts the
+       rest of these tests sign in as. */
+    await setDoc(doc(db, "users", "removable-user"), {
+      email: "removable@example.test",
+      fullName: "Removable Account",
+      role: "operations",
+      status: "approved",
+      requestedRole: "operations",
+    });
+
     await setDoc(doc(db, "vehicles", "vehicle_001"), { registrationNumber: "RT-001" });
     await setDoc(doc(db, "customers", "customer_001"), { fullName: "Sample Customer" });
     await setDoc(doc(db, "rentalFinancials", "rental_001"), { totalCents: 10000 });
@@ -246,6 +257,25 @@ describe("Firestore access policy", () => {
       updateDoc(doc(asUser(OPS), "users", PENDING), {
         fullName: "Not mine to change",
       }),
+    );
+  });
+
+  /*
+   * Removing the profile is what removes the access: the
+   * rules read role and status from it. It is therefore an
+   * administrator's decision and nobody else's.
+   */
+  it("lets only an administrator remove a staff profile", async () => {
+    await assertFails(
+      deleteDoc(
+        doc(asUser(OPS), "users", "removable-user"),
+      ),
+    );
+
+    await assertSucceeds(
+      deleteDoc(
+        doc(asUser(ADMIN), "users", "removable-user"),
+      ),
     );
   });
 

@@ -21,6 +21,8 @@ import {
   type RentalRecord,
 } from "@/lib/services/firestore-client";
 
+import { RentalAgreement } from "./rental-agreement";
+
 /*
  * Every rental the office has run, with the employee who
  * handled it beside the customer and the vehicle.
@@ -120,6 +122,14 @@ export function RentalRecords({
 
   const [reloadToken, setReloadToken] =
     useState(0);
+
+  /*
+   * Opening a row is how the desk pulls up the paperwork:
+   * the agreement, the renter's licence and the condition
+   * photographs from each end of the hire.
+   */
+  const [openRentalId, setOpenRentalId] =
+    useState<string>();
 
   useEffect(() => {
     let cancelled = false;
@@ -341,9 +351,18 @@ export function RentalRecords({
               {visible.map((record) => (
                 <tr key={record.rentalId}>
                   <td>
-                    <strong>
+                    <button
+                      type="button"
+                      className="text-button history-open"
+                      title={`Open the rental file for ${record.customerName}`}
+                      onClick={() =>
+                        setOpenRentalId(
+                          record.rentalId,
+                        )
+                      }
+                    >
                       {record.customerName}
-                    </strong>
+                    </button>
                   </td>
 
                   <td>
@@ -414,6 +433,15 @@ export function RentalRecords({
             </tbody>
           </table>
         </div>
+      )}
+
+      {openRentalId && (
+        <RentalAgreement
+          rentalId={openRentalId}
+          onClose={() =>
+            setOpenRentalId(undefined)
+          }
+        />
       )}
     </div>
   );
