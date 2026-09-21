@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { calculateBalance, chargedRentalDays, quoteRental } from "../../packages/domain/src/pricing";
 import { isValidVehicleTransition } from "../../packages/domain/src/lifecycle";
+import { pickupWindowError } from "../../packages/domain/src/booking";
 
 const rates = { currency: "USD" as const, dailyCents: 7_500, weeklyCents: 45_000, monthlyCents: 150_000 };
 describe("rental pricing", () => {
@@ -12,4 +13,15 @@ describe("rental pricing", () => {
 });
 describe("vehicle lifecycle", () => {
   it("allows only defined transitions", () => { expect(isValidVehicleTransition("reserved", "rented")).toBe(true); expect(isValidVehicleTransition("out_of_service", "rented")).toBe(false); });
+});
+
+describe("booking pickup window", () => {
+  const now = Date.parse("2026-09-21T12:00:00.000Z");
+  const hours = (count: number) => now + count * 3_600_000;
+  it("takes an ordinary booking for a pickup ahead of now", () => expect(pickupWindowError({ pickupAtMs: hours(2), nowMs: now, backdated: false })).toBeNull());
+  it("refuses an ordinary booking dated in the past", () => expect(pickupWindowError({ pickupAtMs: hours(-2), nowMs: now, backdated: false })).toContain("cannot be in the past"));
+  it("takes a backdated booking for a hire that is already out", () => expect(pickupWindowError({ pickupAtMs: hours(-24 * 30), nowMs: now, backdated: true })).toBeNull());
+  it("refuses a backdated booking dated in the future", () => expect(pickupWindowError({ pickupAtMs: hours(2), nowMs: now, backdated: true })).toContain("cannot be picked up in the future"));
+  it("refuses a backdate beyond two years, which is a mistyped year", () => expect(pickupWindowError({ pickupAtMs: Date.parse("2016-09-21T12:00:00.000Z"), nowMs: now, backdated: true })).toContain("two years"));
+  it("refuses an unparseable pickup", () => expect(pickupWindowError({ pickupAtMs: Number.NaN, nowMs: now, backdated: true })).toContain("valid pickup"));
 });

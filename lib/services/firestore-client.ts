@@ -26,6 +26,7 @@ import type {
   VehicleStatus,
 } from "@/packages/domain/src/types";
 import { isValidVehicleTransition } from "@/packages/domain/src/lifecycle";
+import { pickupWindowError } from "@/packages/domain/src/booking";
 
 /* =========================================================
    Shared types
@@ -2212,6 +2213,12 @@ async function createReservation(
     dropoffLocation: string | null;
     notes: string | null;
     bookingMedia: Array<Record<string, unknown>>;
+    /*
+     * The rental is already running and is being written down
+     * after the fact, so its pickup is behind us rather than
+     * ahead. Everything else about it is an ordinary booking.
+     */
+    backdated?: boolean;
   },
 ): Promise<{
   reservationId: string;
@@ -2340,15 +2347,31 @@ async function createReservation(
       const pickupMillis =
         pickupAt.toMillis();
 
-      if (
-        pickupMillis <
-        Timestamp.now().toMillis()
-      ) {
-        throw new Error(
-          "Pickup time cannot be in the past.",
-        );
+      const backdated =
+        input.backdated === true;
+
+      const windowError =
+        pickupWindowError({
+          pickupAtMs: pickupMillis,
+
+          nowMs:
+            Timestamp.now().toMillis(),
+
+          backdated,
+        });
+
+      if (windowError) {
+        throw new Error(windowError);
       }
 
+      /*
+       * Papers are checked against the pickup instant, so a
+       * backdated booking is judged on what was valid when the
+       * vehicle actually went out rather than on what is valid
+       * today. That is the same latitude a past booking is
+       * given: the hire already happened, and refusing to
+       * write it down does not un-hire the car.
+       */
       if (
         complianceDateMs(
           vehicle.insuranceExpiresAt,
@@ -2457,6 +2480,18 @@ async function createReservation(
           status:
             "confirmed",
 
+          /*
+           * Says the record was written after its pickup had
+           * passed, so a booking dated last month is read as
+           * one the office caught up on rather than as a
+           * mistyped date.
+           *
+           * It is deliberately not `isHistorical`: that flag
+           * marks a rental that is over and takes it out of
+           * the live listings, and this one is still out.
+           */
+          backdated,
+
           rateSnapshot: {
             ...vehicle.rates,
 
@@ -2532,6 +2567,8 @@ async function createReservation(
 
             pickupAt:
               input.pickupAt,
+
+            backdated,
           },
 
           createdAt:
