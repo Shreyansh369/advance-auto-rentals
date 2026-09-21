@@ -112,6 +112,8 @@ type Reservation = {
   vehicleRegistration: string;
   pickupAt: string | null;
   expectedReturnAt: string | null;
+  /* Written down after the pickup it records had passed. */
+  backdated: boolean;
   /* Extended prices for the agreement's charges table:
      units booked multiplied by the rate quoted at booking. */
   dailyCents: number;
@@ -531,6 +533,16 @@ export function ReservationComposer() {
 
   const [reservations, setReservations] =
     useState<Reservation[]>([]);
+
+  /*
+   * The booking being written down is one the office already
+   * started: the car went out before this system had the
+   * record, and it has not come back. Held in state rather
+   * than read off the form because the pickup and return
+   * inputs change the range they accept with it.
+   */
+  const [backdated, setBackdated] =
+    useState(false);
 
   const [rentals, setRentals] =
     useState<Rental[]>([]);
@@ -1044,6 +1056,10 @@ export function ReservationComposer() {
                   "expectedReturnAt",
                 ),
               ),
+            backdated:
+              snapshot.get(
+                "backdated",
+              ) === true,
             dailyCents:
               extendedPrice(
                 snapshot,
@@ -1743,6 +1759,7 @@ export function ReservationComposer() {
                 | string
                 | null;
               bookingMedia: CloudinaryMedia[];
+              backdated: boolean;
             },
             {
               reservationId: string;
@@ -1808,6 +1825,8 @@ export function ReservationComposer() {
                * a booking carries none.
                */
               bookingMedia: [],
+
+              backdated,
             },
           );
 
@@ -1841,7 +1860,18 @@ export function ReservationComposer() {
           null,
         );
 
-        return `Booking confirmed · ${result.quote.chargedDays} day(s) · ${formatMoney(
+        /* reset() cannot clear a controlled checkbox, and the
+           next booking is an ordinary one until it says
+           otherwise. */
+        const wasBackdated = backdated;
+
+        setBackdated(false);
+
+        return `${
+          wasBackdated
+            ? "Backdated booking recorded"
+            : "Booking confirmed"
+        } · ${result.quote.chargedDays} day(s) · ${formatMoney(
           result.quote.baseRentalCents,
         )}. Check the vehicle out to sign and issue the rental agreement.`;
       },
@@ -2562,6 +2592,15 @@ export function ReservationComposer() {
                   <li
                     key={reservation.id}
                   >
+                    {/* Otherwise a pickup dated last month
+                        reads as a typo rather than as the
+                        hire the office caught up on. */}
+                    {reservation.backdated && (
+                      <span className="status-pill reserved">
+                        Backdated
+                      </span>
+                    )}
+
                     <span className="booking-list-detail">
                       <strong>
                         {
@@ -3755,6 +3794,37 @@ export function ReservationComposer() {
                 )}
             </div>
 
+            {/*
+              * A hire that started before the office had this
+              * system is still running, so it cannot be filed
+              * as a past booking — that closes a rental — and
+              * it cannot be booked ahead either. Ticking this
+              * lets the pickup sit in the past; the booking is
+              * otherwise ordinary, and still has to be checked
+              * out, extended and returned here.
+              */}
+            <div className="field full">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  name="backdated"
+                  checked={backdated}
+                  onChange={(event) =>
+                    setBackdated(
+                      event.target.checked,
+                    )
+                  }
+                />
+                This rental already started
+              </label>
+
+              <p className="form-help">
+                {backdated
+                  ? "The pickup is in the past and the return can be either side of today. The vehicle is still held and checked out here as usual. To record a hire that has already come back, use Past booking on the customer's record instead."
+                  : "Tick this to write down a hire that went out before it was booked here and has not come back yet."}
+              </p>
+            </div>
+
             <div className="field">
               <label htmlFor="pickup">
                 Pickup
@@ -3764,7 +3834,16 @@ export function ReservationComposer() {
                 id="pickup"
                 name="pickupAt"
                 type="datetime-local"
-                min={todayDateTime()}
+                min={
+                  backdated
+                    ? undefined
+                    : todayDateTime()
+                }
+                max={
+                  backdated
+                    ? todayDateTime()
+                    : undefined
+                }
                 required
               />
             </div>
@@ -3774,11 +3853,21 @@ export function ReservationComposer() {
                 Expected return
               </label>
 
+              {/*
+                * A rental that started in the past may be due
+                * back at any point — next week, or last week
+                * if it is running late — so only an ordinary
+                * booking is held to a future return.
+                */}
               <input
                 id="expected-return"
                 name="expectedReturnAt"
                 type="datetime-local"
-                min={todayDateTime()}
+                min={
+                  backdated
+                    ? undefined
+                    : todayDateTime()
+                }
                 required
               />
             </div>
