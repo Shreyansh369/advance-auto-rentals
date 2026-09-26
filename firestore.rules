@@ -299,6 +299,50 @@ allow list: if isAdmin();
 
 
     /* =========================================================
+       DISCOUNTS
+       ========================================================= */
+
+    match /rentalDiscounts/{discountId} {
+
+      allow read: if isStaff();
+
+      /* Anyone on staff may offer a discount, in their own
+         name, and it waits for an administrator. Only an
+         administrator's own discount may be approved as it
+         is written. */
+      allow create: if isStaff()
+        && request.resource.data.requestedBy
+            == request.auth.uid
+        && request.resource.data.amountCents is int
+        && request.resource.data.amountCents > 0
+        && (
+          request.resource.data.status == "pending"
+          || (
+            isAdmin()
+            && request.resource.data.status == "approved"
+          )
+        );
+
+      /* Only an administrator decides, only once, and never
+         by changing what was asked for. */
+      allow update: if isAdmin()
+        && resource.data.status == "pending"
+        && request.resource.data.status in [
+          "approved",
+          "rejected"
+        ]
+        && request.resource.data.rentalId
+            == resource.data.rentalId
+        && request.resource.data.amountCents
+            == resource.data.amountCents
+        && request.resource.data.requestedBy
+            == resource.data.requestedBy;
+
+      allow delete: if false;
+    }
+
+
+    /* =========================================================
        REFUNDS
        ========================================================= */
 

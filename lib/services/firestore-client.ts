@@ -62,6 +62,24 @@ export type PayableRental = {
   vehicleRegistration: string;
   status: string;
   outstandingCents: number;
+  /*
+   * Only set while the vehicle is still out. The expected
+   * return is the date the rent has been charged up to, so a
+   * long hire that has run past it owes rent from there, and
+   * the rate and base rental let the payment screen price
+   * that rent the same way an extension does.
+   */
+  pickupAt: string | null;
+  paidThroughAt: string | null;
+  /* Still out past the date its rent was charged to. */
+  rentOverdue: boolean;
+  baseRentalCents: number;
+  rates: {
+    currency: "USD";
+    dailyCents: number | null;
+    weeklyCents: number | null;
+    monthlyCents: number | null;
+  } | null;
 };
 export type FinancialOverview = {
   from: string;
@@ -1044,41 +1062,162 @@ async function getOperationalDashboard(): Promise<DashboardSummary> {
     activeRentals,
   };
 }
+/*
+ * Everything the payment screen can take money against: any
+ * rental with a balance, and every rental still out whether
+ * it owes anything yet or not. A long hire that was paid up
+ * front has no balance until more rent is charged, and it
+ * used to drop off this list entirely, so the next week's
+ * rent could not be taken at all.
+ */
 async function getPayableRentals(): Promise<PayableRental[]> {
   const { db } = getFirebaseClient();
 
-  const snapshot = await getDocs(
-    query(
-      collection(db, "rentalFinancials"),
-      where("outstandingCents", ">", 0),
-      limit(500),
+  const [owing, out] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "rentalFinancials"),
+        where("outstandingCents", ">", 0),
+        limit(500),
+      ),
+    ),
+    getDocs(
+      query(
+        collection(db, "rentals"),
+        where("status", "in", [
+          "active",
+          "overdue",
+        ]),
+        limit(500),
+      ),
+    ),
+  ]);
+
+  const financials = new Map<
+    string,
+    Record<string, any>
+  >();
+
+  for (const snapshot of owing.docs) {
+    const data = snapshot.data();
+
+    financials.set(
+      String(data.rentalId ?? snapshot.id),
+      data,
+    );
+  }
+
+  /*
+   * A rental that is out but settled is not in the balance
+   * query, so its financial record is read on its own.
+   */
+  const settled = out.docs.filter(
+    (snapshot) =>
+      !financials.has(snapshot.id),
+  );
+
+  const settledFinancials = await Promise.all(
+    settled.map((snapshot) =>
+      getDoc(
+        doc(
+          db,
+          "rentalFinancials",
+          snapshot.id,
+        ),
+      ),
     ),
   );
 
-  return snapshot.docs
-    .map((snapshot) => {
-      const data = snapshot.data();
+  for (const snapshot of settledFinancials) {
+    if (snapshot.exists()) {
+      financials.set(
+        snapshot.id,
+        snapshot.data(),
+      );
+    }
+  }
+
+  const outRentals = new Map(
+    out.docs.map((snapshot) => [
+      snapshot.id,
+      snapshot.data(),
+    ]),
+  );
+
+  function centsOrNull(
+    value: unknown,
+  ): number | null {
+    const cents = Number(value);
+
+    return value === null ||
+      value === undefined ||
+      !Number.isSafeInteger(cents) ||
+      cents < 0
+      ? null
+      : cents;
+  }
+
+  return [...financials.entries()]
+    .map(([id, data]) => {
+      const rental = outRentals.get(id);
+
+      const rates = rental?.rateSnapshot as
+        | Record<string, unknown>
+        | undefined;
 
       return {
-        id: String(
-          data.rentalId ?? snapshot.id,
-        ),
+        id,
         customerName: String(
           data.customerNameSnapshot ??
             data.customerName ??
+            rental?.customerNameSnapshot ??
             "Unknown customer",
         ),
         vehicleRegistration: String(
           data.vehicleRegistration ??
             data.vehicleRegistrationSnapshot ??
+            rental?.vehicleRegistrationSnapshot ??
             "Unknown vehicle",
         ),
         status: String(
-          data.rentalStatus ?? "active",
+          rental?.status ??
+            data.rentalStatus ??
+            "active",
         ),
         outstandingCents: Number(
           data.outstandingCents ?? 0,
         ),
+        pickupAt:
+          rental?.pickupAt
+            ? toIso(rental.pickupAt)
+            : null,
+        paidThroughAt:
+          rental?.expectedReturnAt
+            ? toIso(rental.expectedReturnAt)
+            : null,
+        rentOverdue: Boolean(
+          rental?.expectedReturnAt &&
+            Date.parse(
+              toIso(rental.expectedReturnAt),
+            ) < Date.now(),
+        ),
+        baseRentalCents: Number(
+          data.baseRentalCents ?? 0,
+        ),
+        rates: rates
+          ? {
+              currency: "USD" as const,
+              dailyCents: centsOrNull(
+                rates.dailyCents,
+              ),
+              weeklyCents: centsOrNull(
+                rates.weeklyCents,
+              ),
+              monthlyCents: centsOrNull(
+                rates.monthlyCents,
+              ),
+            }
+          : null,
         updatedAt:
           data.updatedAt instanceof Timestamp
             ? data.updatedAt.toMillis()
@@ -1090,7 +1229,8 @@ async function getPayableRentals(): Promise<PayableRental[]> {
         Number.isFinite(
           rental.outstandingCents,
         ) &&
-        rental.outstandingCents > 0,
+        (rental.outstandingCents > 0 ||
+          outRentals.has(rental.id)),
     )
     .sort(
       (a, b) =>
@@ -4201,11 +4341,32 @@ async function returnRental(
        * refuses a read once it has started writing, and the
        * rental update below is the first one.
        */
-      const returnedByNameSnapshot =
-        await actorNameSnapshot(
+      const returnedBy =
+        await actorProfileSnapshot(
           transaction,
           actorUid,
         );
+
+      const returnedByNameSnapshot =
+        returnedBy.name;
+
+      /*
+       * A discount needs an administrator's say-so. Anyone
+       * else offers one from the payment screen, where it
+       * waits for approval instead of coming straight off.
+       */
+      if (
+        returnedBy.role !== "admin" &&
+        adjustments.some(
+          (adjustment) =>
+            adjustment.type === "discount" &&
+            adjustment.amountCents > 0,
+        )
+      ) {
+        throw new Error(
+          "A discount needs an administrator's approval. Complete the return, then request it on the Payment tab.",
+        );
+      }
 
       const actualReturnAt =
         asTimestamp(
@@ -4936,6 +5097,591 @@ async function recordRentalPayment(
   return {
     outstandingCents,
   };
+}
+
+/* =========================================================
+   Discounts
+   ========================================================= */
+
+/*
+ * A discount is offered at the end of the hire, when the
+ * balance is being settled. An administrator's discount
+ * comes off the balance at once; anyone else's is a request
+ * that waits, untouched, until an administrator approves it.
+ * Either way the request is kept, so every discount on the
+ * books names who offered it and who allowed it.
+ */
+export type DiscountStatus =
+  | "pending"
+  | "approved"
+  | "rejected";
+
+export type RentalDiscount = {
+  id: string;
+  rentalId: string;
+  customerName: string;
+  vehicleRegistration: string;
+  amountCents: number;
+  reason: string;
+  status: DiscountStatus;
+  requestedByName: string;
+  requestedAt: string | null;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+function discountStatusOf(
+  value: unknown,
+): DiscountStatus {
+  return value === "approved" ||
+    value === "rejected"
+    ? value
+    : "pending";
+}
+
+function rentalDiscountFrom(
+  id: string,
+  data: Record<string, unknown>,
+): RentalDiscount {
+  return {
+    id,
+    rentalId: String(data.rentalId ?? ""),
+    customerName: String(
+      data.customerNameSnapshot ?? "",
+    ),
+    vehicleRegistration: String(
+      data.vehicleRegistrationSnapshot ?? "",
+    ),
+    amountCents: Number(data.amountCents ?? 0),
+    reason: String(data.reason ?? ""),
+    status: discountStatusOf(data.status),
+    requestedByName: String(
+      data.requestedByNameSnapshot ?? "",
+    ),
+    requestedAt: data.requestedAt
+      ? toIso(data.requestedAt)
+      : null,
+    reviewedByName: trimmedOrNull(
+      data.reviewedByNameSnapshot,
+    ),
+    reviewedAt: data.reviewedAt
+      ? toIso(data.reviewedAt)
+      : null,
+    reviewNote: trimmedOrNull(data.reviewNote),
+  };
+}
+
+/*
+ * Takes an approved discount off the rental's balance. It
+ * lowers adjustmentCents as well as the total, because the
+ * return recomputes the total from baseRentalCents plus
+ * adjustmentCents, and a discount recorded in only one of
+ * them would come back when the vehicle does.
+ *
+ * A discount can only forgive what is still owed: money
+ * already taken is a refund, which is a separate decision.
+ */
+function applyDiscount(
+  transaction: {
+    update: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    rentalId: string;
+    discountId: string;
+    financial: Record<string, any>;
+    amountCents: number;
+    reason: string;
+    actorUid: string;
+  },
+): number {
+  const { db } = getFirebaseClient();
+
+  const currentOutstanding = calculateBalance(
+    Math.round(
+      Number(input.financial.totalCents ?? 0),
+    ),
+    assertMoneyCents(
+      input.financial.paidCents ?? 0,
+      "Amount received",
+    ),
+    assertMoneyCents(
+      input.financial.refundedCents ?? 0,
+      "Amount refunded",
+    ),
+  );
+
+  if (input.amountCents > currentOutstanding) {
+    throw new Error(
+      `The discount is more than the ${formatCents(
+        Math.max(currentOutstanding, 0),
+      )} still owed on this rental.`,
+    );
+  }
+
+  const adjustmentCents =
+    Number(
+      input.financial.adjustmentCents ?? 0,
+    ) - input.amountCents;
+
+  const totalCents =
+    Number(input.financial.totalCents ?? 0) -
+    input.amountCents;
+
+  const outstandingCents =
+    currentOutstanding - input.amountCents;
+
+  transaction.update(
+    doc(db, "rentalFinancials", input.rentalId),
+    {
+      adjustmentCents,
+      totalCents,
+      outstandingCents,
+      updatedAt: nowTimestamp(),
+    },
+  );
+
+  transaction.set(
+    doc(collection(db, "financialLedger")),
+    {
+      rentalId: input.rentalId,
+      vehicleId: String(
+        input.financial.vehicleId ?? "",
+      ),
+      vehicleRegistration: String(
+        input.financial.vehicleRegistration ?? "",
+      ),
+      customerId: String(
+        input.financial.customerId ?? "",
+      ),
+      entryType: "rental_discount",
+      adjustmentType: "discount",
+      amountCents: -input.amountCents,
+      discountId: input.discountId,
+      note: input.reason,
+      occurredAt: nowTimestamp(),
+      recordedBy: input.actorUid,
+    },
+  );
+
+  return outstandingCents;
+}
+
+function formatCents(cents: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(cents / 100);
+}
+
+async function requestRentalDiscount(
+  input: {
+    rentalId: string;
+    amountCents: number;
+    reason: string;
+    idempotencyKey: string;
+  },
+): Promise<{
+  discountId: string;
+  status: DiscountStatus;
+  outstandingCents: number;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const rentalId = trimmedOrNull(input.rentalId);
+
+  if (!rentalId) {
+    throw new Error("Select the rental to discount.");
+  }
+
+  const amountCents = assertMoneyCents(
+    input.amountCents,
+    "Discount amount",
+  );
+
+  if (amountCents <= 0) {
+    throw new Error(
+      "Discount amount must be greater than zero.",
+    );
+  }
+
+  const reason = trimmedOrNull(input.reason);
+
+  if (!reason) {
+    throw new Error(
+      "Say why the discount is being offered.",
+    );
+  }
+
+  if (reason.length > 500) {
+    throw new Error(
+      "Keep the discount reason under 500 characters.",
+    );
+  }
+
+  /*
+   * One request at a time per rental, so an administrator
+   * never approves two versions of the same discount. The
+   * query cannot run inside a browser transaction; the
+   * idempotency key below is what stops a double submit.
+   */
+  const waiting = await getDocs(
+    query(
+      collection(db, "rentalDiscounts"),
+      where("rentalId", "==", rentalId),
+      where("status", "==", "pending"),
+      limit(1),
+    ),
+  );
+
+  if (!waiting.empty) {
+    throw new Error(
+      "A discount on this rental is already waiting for an administrator.",
+    );
+  }
+
+  const operationRef = doc(
+    db,
+    "idempotencyKeys",
+    `discount_${input.idempotencyKey}`,
+  );
+
+  const discountRef = doc(
+    collection(db, "rentalDiscounts"),
+  );
+
+  const financialRef = doc(
+    db,
+    "rentalFinancials",
+    rentalId,
+  );
+
+  const rentalRef = doc(db, "rentals", rentalId);
+
+  let response:
+    | {
+        discountId: string;
+        status: DiscountStatus;
+        outstandingCents: number;
+      }
+    | undefined;
+
+  await runTransaction(db, async (transaction) => {
+    const previous = await transaction.get(
+      operationRef,
+    );
+
+    if (previous.exists()) {
+      response = previous.get("response");
+
+      return;
+    }
+
+    const [financialSnapshot, rentalSnapshot] =
+      await Promise.all([
+        transaction.get(financialRef),
+        transaction.get(rentalRef),
+      ]);
+
+    if (
+      !financialSnapshot.exists() ||
+      !rentalSnapshot.exists()
+    ) {
+      throw new Error(
+        "Rental financial record was not found.",
+      );
+    }
+
+    const actor = await actorProfileSnapshot(
+      transaction,
+      actorUid,
+    );
+
+    const financial = financialSnapshot.data();
+
+    const rental = rentalSnapshot.data();
+
+    const status: DiscountStatus =
+      actor.role === "admin"
+        ? "approved"
+        : "pending";
+
+    let outstandingCents = Number(
+      financial.outstandingCents ?? 0,
+    );
+
+    if (status === "approved") {
+      outstandingCents = applyDiscount(
+        transaction,
+        {
+          rentalId,
+          discountId: discountRef.id,
+          financial,
+          amountCents,
+          reason,
+          actorUid,
+        },
+      );
+    } else if (amountCents > outstandingCents) {
+      throw new Error(
+        `The discount is more than the ${formatCents(
+          Math.max(outstandingCents, 0),
+        )} still owed on this rental.`,
+      );
+    }
+
+    transaction.set(discountRef, {
+      rentalId,
+      customerNameSnapshot: String(
+        financial.customerNameSnapshot ??
+          rental.customerNameSnapshot ??
+          "",
+      ),
+      vehicleRegistrationSnapshot: String(
+        financial.vehicleRegistration ??
+          rental.vehicleRegistrationSnapshot ??
+          "",
+      ),
+      amountCents,
+      reason,
+      status,
+      requestedBy: actorUid,
+      requestedByNameSnapshot: actor.name,
+      requestedAt: nowTimestamp(),
+
+      /* An administrator's own discount is its own approval. */
+      reviewedBy:
+        status === "approved" ? actorUid : null,
+      reviewedByNameSnapshot:
+        status === "approved" ? actor.name : null,
+      reviewedAt:
+        status === "approved"
+          ? nowTimestamp()
+          : null,
+      reviewNote: null,
+      updatedAt: nowTimestamp(),
+    });
+
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+        action:
+          status === "approved"
+            ? "discount.applied"
+            : "discount.requested",
+        resource: {
+          collection: "rentalDiscounts",
+          id: discountRef.id,
+        },
+        details: { rentalId, amountCents },
+        createdAt: nowTimestamp(),
+      },
+    );
+
+    response = {
+      discountId: discountRef.id,
+      status,
+      outstandingCents,
+    };
+
+    transaction.set(operationRef, {
+      response,
+      actorUid,
+      createdAt: nowTimestamp(),
+    });
+  });
+
+  return response!;
+}
+
+async function reviewRentalDiscount(
+  input: {
+    discountId: string;
+    decision: "approve" | "reject";
+    note: string | null;
+  },
+): Promise<{
+  status: DiscountStatus;
+  outstandingCents: number | null;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const discountId = trimmedOrNull(
+    input.discountId,
+  );
+
+  if (!discountId) {
+    throw new Error("Select the discount to review.");
+  }
+
+  if (
+    input.decision !== "approve" &&
+    input.decision !== "reject"
+  ) {
+    throw new Error(
+      "Choose whether to approve or reject the discount.",
+    );
+  }
+
+  const note = trimmedOrNull(input.note);
+
+  if (note && note.length > 1000) {
+    throw new Error(
+      "Keep the review note under 1000 characters.",
+    );
+  }
+
+  const discountRef = doc(
+    db,
+    "rentalDiscounts",
+    discountId,
+  );
+
+  let result: {
+    status: DiscountStatus;
+    outstandingCents: number | null;
+  } = { status: "pending", outstandingCents: null };
+
+  await runTransaction(db, async (transaction) => {
+    const discountSnapshot = await transaction.get(
+      discountRef,
+    );
+
+    if (!discountSnapshot.exists()) {
+      throw new Error("Discount was not found.");
+    }
+
+    const discount = discountSnapshot.data();
+
+    if (
+      discountStatusOf(discount.status) !==
+      "pending"
+    ) {
+      throw new Error(
+        "This discount has already been decided.",
+      );
+    }
+
+    const rentalId = String(discount.rentalId);
+
+    const financialRef = doc(
+      db,
+      "rentalFinancials",
+      rentalId,
+    );
+
+    const financialSnapshot = await transaction.get(
+      financialRef,
+    );
+
+    const actor = await actorProfileSnapshot(
+      transaction,
+      actorUid,
+    );
+
+    if (actor.role !== "admin") {
+      throw new Error(
+        "Only an administrator can approve a discount.",
+      );
+    }
+
+    const status: DiscountStatus =
+      input.decision === "approve"
+        ? "approved"
+        : "rejected";
+
+    let outstandingCents: number | null = null;
+
+    if (status === "approved") {
+      if (!financialSnapshot.exists()) {
+        throw new Error(
+          "Rental financial record was not found.",
+        );
+      }
+
+      outstandingCents = applyDiscount(
+        transaction,
+        {
+          rentalId,
+          discountId,
+          financial: financialSnapshot.data(),
+          amountCents: assertMoneyCents(
+            discount.amountCents,
+            "Discount amount",
+          ),
+          reason: String(discount.reason ?? ""),
+          actorUid,
+        },
+      );
+    }
+
+    transaction.update(discountRef, {
+      status,
+      reviewedBy: actorUid,
+      reviewedByNameSnapshot: actor.name,
+      reviewedAt: nowTimestamp(),
+      reviewNote: note,
+      updatedAt: nowTimestamp(),
+    });
+
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+        action:
+          status === "approved"
+            ? "discount.approved"
+            : "discount.rejected",
+        resource: {
+          collection: "rentalDiscounts",
+          id: discountId,
+        },
+        details: { rentalId, note },
+        createdAt: nowTimestamp(),
+      },
+    );
+
+    result = { status, outstandingCents };
+  });
+
+  return result;
+}
+
+/* Discounts still waiting for an administrator. */
+async function listPendingDiscounts(): Promise<
+  RentalDiscount[]
+> {
+  const { db } = getFirebaseClient();
+
+  const snapshot = await getDocs(
+    query(
+      collection(db, "rentalDiscounts"),
+      where("status", "==", "pending"),
+      limit(200),
+    ),
+  );
+
+  return snapshot.docs
+    .map((entry) =>
+      rentalDiscountFrom(entry.id, entry.data()),
+    )
+    .sort((a, b) =>
+      String(a.requestedAt).localeCompare(
+        String(b.requestedAt),
+      ),
+    );
 }
 
 /* =========================================================
@@ -9022,6 +9768,34 @@ export async function callFirestoreOperation<
             idempotencyKey: string;
           },
         )) as TResult
+      );
+
+    case "requestRentalDiscount":
+      return (
+        (await requestRentalDiscount(
+          data as {
+            rentalId: string;
+            amountCents: number;
+            reason: string;
+            idempotencyKey: string;
+          },
+        )) as TResult
+      );
+
+    case "reviewRentalDiscount":
+      return (
+        (await reviewRentalDiscount(
+          data as {
+            discountId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+        )) as TResult
+      );
+
+    case "listPendingDiscounts":
+      return (
+        (await listPendingDiscounts()) as TResult
       );
 
     case "createVehicle":

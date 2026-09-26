@@ -124,6 +124,20 @@ beforeAll(async () => {
       status: "in_review",
       version: 1,
     });
+
+    await setDoc(doc(db, "rentalDiscounts", "discount_pending"), {
+      rentalId: "rental_001",
+      amountCents: 2500,
+      status: "pending",
+      requestedBy: OPS,
+    });
+
+    await setDoc(doc(db, "rentalDiscounts", "discount_decided"), {
+      rentalId: "rental_001",
+      amountCents: 1000,
+      status: "rejected",
+      requestedBy: OPS,
+    });
   });
 });
 
@@ -442,6 +456,88 @@ describe("Firestore access policy", () => {
     );
   });
 
+  it("lets staff offer a discount only as a request waiting for approval", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(
+      setDoc(doc(db, "rentalDiscounts", "discount_ops_request"), {
+        rentalId: "rental_001",
+        amountCents: 1500,
+        status: "pending",
+        requestedBy: OPS,
+      }),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "rentalDiscounts", "discount_ops_self_approved"), {
+        rentalId: "rental_001",
+        amountCents: 1500,
+        status: "approved",
+        requestedBy: OPS,
+      }),
+    );
+
+    await assertFails(
+      setDoc(doc(db, "rentalDiscounts", "discount_in_another_name"), {
+        rentalId: "rental_001",
+        amountCents: 1500,
+        status: "pending",
+        requestedBy: ADMIN,
+      }),
+    );
+
+    await assertSucceeds(
+      getDocs(
+        query(
+          collection(db, "rentalDiscounts"),
+          where("rentalId", "==", "rental_001"),
+          where("status", "==", "pending"),
+          limit(1),
+        ),
+      ),
+    );
+  });
+
+  it("keeps the discount decision with an administrator, once, as asked", async () => {
+    await assertFails(
+      updateDoc(doc(asUser(OPS), "rentalDiscounts", "discount_pending"), {
+        status: "approved",
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_pending"), {
+        status: "approved",
+        amountCents: 9000,
+      }),
+    );
+
+    await assertSucceeds(
+      updateDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_pending"), {
+        status: "approved",
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_decided"), {
+        status: "approved",
+      }),
+    );
+
+    await assertSucceeds(
+      setDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_admin_own"), {
+        rentalId: "rental_001",
+        amountCents: 500,
+        status: "approved",
+        requestedBy: ADMIN,
+      }),
+    );
+
+    await assertFails(
+      deleteDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_decided")),
+    );
+  });
+
   it("treats an approved contract as final, even for an administrator", async () => {
     await assertFails(
       updateDoc(
@@ -568,6 +664,7 @@ describe("Firestore access policy", () => {
     ["vehicleExpenses", "expense_001"],
     ["auditLogs", "audit_001"],
     ["idempotencyKeys", "payment_001"],
+    ["rentalDiscounts", "discount_decided"],
   ];
 
   it("matches every collection the application reads with a rule", async () => {

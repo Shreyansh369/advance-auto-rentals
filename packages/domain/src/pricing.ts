@@ -72,3 +72,20 @@ export function calculateBalance(totalCents: number, paidCents: number, refunded
   }
   return totalCents - paidCents + refundedCents;
 }
+
+/**
+ * Rent owed for keeping a vehicle out until `throughAt`, on top of what has
+ * already been charged. It is the same difference an extension charges: the
+ * whole hire re-priced from pickup, less the base rental already on the books,
+ * so a long hire moves onto a weekly or monthly bundle as soon as that is
+ * cheaper. Returns 0 when `throughAt` is not past what is already charged.
+ */
+export function rentOwedThrough(
+  input: { pickupAt: string; chargedThroughAt: string; throughAt: string; baseRentalCents: number },
+  rates: VehicleRates,
+): number {
+  assertSafeCurrency(input.baseRentalCents, "Base rental");
+  if (Date.parse(input.throughAt) <= Date.parse(input.chargedThroughAt)) return 0;
+  const quote = quoteRental({ pickupAt: input.pickupAt, expectedReturnAt: input.throughAt }, rates);
+  return Math.max(0, quote.baseRentalCents - input.baseRentalCents);
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateBalance, chargedRentalDays, quoteRental } from "../../packages/domain/src/pricing";
+import { calculateBalance, chargedRentalDays, quoteRental, rentOwedThrough } from "../../packages/domain/src/pricing";
 import { isValidVehicleTransition } from "../../packages/domain/src/lifecycle";
 import { pickupWindowError } from "../../packages/domain/src/booking";
 
@@ -24,4 +24,16 @@ describe("booking pickup window", () => {
   it("refuses a backdated booking dated in the future", () => expect(pickupWindowError({ pickupAtMs: hours(2), nowMs: now, backdated: true })).toContain("cannot be picked up in the future"));
   it("refuses a backdate beyond two years, which is a mistyped year", () => expect(pickupWindowError({ pickupAtMs: Date.parse("2016-09-21T12:00:00.000Z"), nowMs: now, backdated: true })).toContain("two years"));
   it("refuses an unparseable pickup", () => expect(pickupWindowError({ pickupAtMs: Number.NaN, nowMs: now, backdated: true })).toContain("valid pickup"));
+});
+
+describe("rent owed on a long hire", () => {
+  const pickupAt = "2026-08-01T08:00:00.000Z";
+  it("charges the next week of a hire paid a week up front", () =>
+    expect(rentOwedThrough({ pickupAt, chargedThroughAt: "2026-08-08T08:00:00.000Z", throughAt: "2026-08-15T08:00:00.000Z", baseRentalCents: 45_000 }, rates)).toBe(45_000));
+  it("moves a hire onto the monthly rate once that is cheaper", () =>
+    expect(rentOwedThrough({ pickupAt, chargedThroughAt: "2026-08-22T08:00:00.000Z", throughAt: "2026-08-31T08:00:00.000Z", baseRentalCents: 135_000 }, rates)).toBe(15_000));
+  it("charges a part day past the paid date as a full day", () =>
+    expect(rentOwedThrough({ pickupAt, chargedThroughAt: "2026-08-08T08:00:00.000Z", throughAt: "2026-08-08T12:00:00.000Z", baseRentalCents: 45_000 }, rates)).toBe(7_500));
+  it("owes nothing for a date already paid for", () =>
+    expect(rentOwedThrough({ pickupAt, chargedThroughAt: "2026-08-08T08:00:00.000Z", throughAt: "2026-08-05T08:00:00.000Z", baseRentalCents: 45_000 }, rates)).toBe(0));
 });
