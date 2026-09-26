@@ -10,6 +10,8 @@ Secure operations software for Advance Auto Rentals. It is a separate applicatio
 - Transactional reservation, checkout, extension, return, pricing and payment workflows that run in the browser against Firestore, so no Blaze-plan Cloud Functions are required
 - Manual entry of a rental the office already ran, recorded as a closed rental and marked as a past booking so it is never mistaken for a live one
 - Backdated bookings on the booking screen for a hire that started before it was booked here and is still out: tick **This rental already started**, date the pickup in the past, and it is checked out, extended and returned like any other booking
+- Rent on a long hire: every rental still out appears on the Payment tab, rent that has built up past the date it was charged to is priced from the rental's own rates, and taking it moves that date forward
+- Discounts at payment: an administrator's comes straight off the balance; an employee's waits for an administrator's approval, counted beside **Bookings** until it is decided
 - A rental record of every hire — customer, vehicle, the staff member who handled it, start, return and status — searchable from one box
 - Expense recording on a screen of its own that operations can reach, kept apart from the administrator-only revenue reporting
 - Cloudinary media capture for vehicle condition photos, fleet photos and driver's licence images

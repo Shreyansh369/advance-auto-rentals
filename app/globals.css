@@ -188,6 +188,27 @@ a {
   text-transform: uppercase;
 }
 
+/* A discount waiting for an administrator's decision. */
+.discount-request {
+  display: grid;
+  gap: 6px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.discount-request:last-child {
+  border-bottom: 0;
+}
+
+.discount-request p {
+  margin: 0;
+}
+
+.checkout-block > .field + .field,
+.checkout-block > .form-help + .field {
+  margin-top: 8px;
+}
+
 .checkout-charges {
   display: grid;
   gap: 10px;

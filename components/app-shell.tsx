@@ -48,6 +48,7 @@ const navigation = [
     href: "/rentals",
     label: "Bookings",
     icon: CalendarDays,
+    countsPendingDiscounts: true,
   },
   {
     href: "/customers",
@@ -195,6 +196,45 @@ export function AppShell({
   }, [role]);
 
   /*
+   * Discounts offered by staff wait for an administrator, and
+   * nothing else tells one that a customer is waiting on the
+   * answer, so they are counted beside Bookings the same way.
+   */
+  const [pendingDiscounts, setPendingDiscounts] =
+    useState(0);
+
+  useEffect(() => {
+    if (role !== "admin") {
+      return;
+    }
+
+    let unsubscribe:
+      | (() => void)
+      | undefined;
+
+    try {
+      const { db } = getFirebaseClient();
+
+      unsubscribe = onSnapshot(
+        query(
+          collection(db, "rentalDiscounts"),
+          where("status", "==", "pending"),
+          limit(PENDING_BADGE_CEILING + 1),
+        ),
+
+        (snapshot) =>
+          setPendingDiscounts(snapshot.size),
+
+        () => setPendingDiscounts(0),
+      );
+    } catch {
+      // Firebase is unconfigured; the shell reports that itself.
+    }
+
+    return () => unsubscribe?.();
+  }, [role]);
+
+  /*
    * Prevent the mobile menu from scrolling
    * the page underneath it.
    */
@@ -290,11 +330,14 @@ export function AppShell({
               label,
               icon: Icon,
               countsPendingStaff,
+              countsPendingDiscounts,
             }) => {
               const waiting =
                 countsPendingStaff
                   ? pendingStaff
-                  : 0;
+                  : countsPendingDiscounts
+                    ? pendingDiscounts
+                    : 0;
 
               return (
                 <Link

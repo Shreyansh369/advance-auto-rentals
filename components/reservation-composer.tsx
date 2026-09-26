@@ -32,6 +32,7 @@ import {
 } from "react";
 
 import { AppShell } from "./app-shell";
+import { useFirebaseAuth } from "./firebase-provider";
 import { CountrySelect } from "./country-select";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
@@ -42,6 +43,7 @@ import { getFirebaseClient } from "@/lib/firebase/client";
 
 import {
   firebaseErrorMessage,
+  formatDate,
   formatFuel,
   formatMoney,
 } from "@/lib/presentation";
@@ -59,7 +61,11 @@ import {
   callFirestoreOperation,
   type AdditionalFeeType,
   type ContractQueueEntry,
+  type PayableRental,
+  type RentalDiscount,
 } from "@/lib/services/firestore-client";
+
+import { rentOwedThrough } from "@/packages/domain/src/pricing";
 
 type Tab =
   | "booking"
@@ -132,14 +138,6 @@ type Rental = {
   /** Taken at the counter and owed back at return. */
   depositCents: number;
   status: string;
-};
-
-type PayableRental = {
-  id: string;
-  customerName: string;
-  vehicleRegistration: string;
-  status: string;
-  outstandingCents: number;
 };
 
 const tabs: Array<{
@@ -547,6 +545,11 @@ export function ReservationComposer() {
   const [rentals, setRentals] =
     useState<Rental[]>([]);
 
+  /* Who may discount outright and who has to ask. */
+  const { role } = useFirebaseAuth();
+
+  const isAdmin = role === "admin";
+
   const [payableRentals, setPayableRentals] =
     useState<PayableRental[]>([]);
 
@@ -576,6 +579,28 @@ export function ReservationComposer() {
 
   const [paymentAmount, setPaymentAmount] =
     useState("");
+
+  /*
+   * How far the rent is charged with this payment. A long
+   * hire runs past the date its rent was charged to, so the
+   * rental is re-priced to this date, the way an extension
+   * is, before the payment is taken.
+   */
+  const [chargeThrough, setChargeThrough] =
+    useState("");
+
+  const [discountAmount, setDiscountAmount] =
+    useState("");
+
+  const [discountReason, setDiscountReason] =
+    useState("");
+
+  const [pendingDiscounts, setPendingDiscounts] =
+    useState<RentalDiscount[]>([]);
+
+  const [reviewNotes, setReviewNotes] = useState<
+    Record<string, string>
+  >({});
 
   /* Cancelling frees the vehicle, so it asks twice. */
   const [cancellingId, setCancellingId] =
@@ -1201,12 +1226,25 @@ export function ReservationComposer() {
           {},
         );
 
+      const discounts =
+        await callFirestoreOperation<
+          Record<string, never>,
+          RentalDiscount[]
+        >(
+          "listPendingDiscounts",
+          {},
+        );
+
       if (isCancelled()) {
         return;
       }
 
       setPayableRentals(
         records,
+      );
+
+      setPendingDiscounts(
+        discounts,
       );
     } catch (cause) {
       console.error(
@@ -1657,9 +1695,53 @@ export function ReservationComposer() {
         : sum;
     }, 0);
 
+  /*
+   * Rent for the time the vehicle has been out past the date
+   * it was charged to. Priced from the rental's own rates, so
+   * the figure on screen is what the extension will charge.
+   */
+  const rentChargeCents = (() => {
+    if (
+      !selectedPayableRental?.pickupAt ||
+      !selectedPayableRental.paidThroughAt ||
+      !selectedPayableRental.rates ||
+      !chargeThrough
+    ) {
+      return 0;
+    }
+
+    try {
+      return rentOwedThrough(
+        {
+          pickupAt:
+            selectedPayableRental.pickupAt,
+          chargedThroughAt:
+            selectedPayableRental.paidThroughAt,
+          throughAt: localToIso(chargeThrough),
+          baseRentalCents:
+            selectedPayableRental.baseRentalCents,
+        },
+        selectedPayableRental.rates,
+      );
+    } catch {
+      return 0;
+    }
+  })();
+
+  const rentIsOverdue =
+    selectedPayableRental?.rentOverdue ?? false;
+
+  const pendingDiscountForRental =
+    pendingDiscounts.find(
+      (discount) =>
+        discount.rentalId === paymentRentalId,
+    );
+
   const totalDueCents =
     (selectedPayableRental?.outstandingCents ??
-      0) + additionalFeesCents;
+      0) +
+    rentChargeCents +
+    additionalFeesCents;
 
   const paidNowCents = (() => {
     const amount = Number(paymentAmount || 0);
@@ -2430,6 +2512,40 @@ export function ReservationComposer() {
           );
         }
 
+        const paymentRental = String(
+          form.get("rentalId"),
+        );
+
+        /*
+         * Rent past the charged date goes on the rental first,
+         * as an extension, so the payment is taken against the
+         * balance it creates. The extension keeps its own
+         * idempotency key: if the payment then fails, a retry
+         * does not charge the rent a second time.
+         */
+        if (chargeThrough && rentChargeCents > 0) {
+          await callFirestoreOperation<
+            {
+              rentalId: string;
+              expectedReturnAt: string;
+              note: string;
+              idempotencyKey: string;
+            },
+            {
+              extensionCents: number;
+              outstandingCents: number;
+            }
+          >("extendRental", {
+            rentalId: paymentRental,
+            expectedReturnAt:
+              localToIso(chargeThrough),
+            note: "Rent charged with payment",
+            idempotencyKey: operationKey(
+              `rent-${paymentRental}-${chargeThrough}`,
+            ),
+          });
+        }
+
         const result =
           await callFirestoreOperation<
             {
@@ -2485,11 +2601,16 @@ export function ReservationComposer() {
 
         releaseOperationKey("payment");
 
+        releaseOperationKey(
+          `rent-${paymentRental}-${chargeThrough}`,
+        );
+
         formElement.reset();
 
         /* reset() cannot clear controlled inputs. */
         setPaymentRentalId("");
         setPaymentAmount("");
+        setChargeThrough("");
         setSelectedFees({});
         setFeeAmounts({});
 
@@ -2498,6 +2619,175 @@ export function ReservationComposer() {
         )}.`;
       },
     );
+  }
+
+  /*
+   * When a rental is chosen, a hire that has run past the date
+   * its rent was charged to is priced up to now, so the rent
+   * that has built up is on screen without anyone asking.
+   */
+  function selectPaymentRental(
+    rentalId: string,
+  ) {
+    setPaymentRentalId(rentalId);
+
+    const rental = payableRentals.find(
+      (entry) => entry.id === rentalId,
+    );
+
+    /*
+     * A started day is charged as a whole one, so the rent is
+     * charged to the end of the day the renter is in: that is
+     * what they are paying for, and charging only to this
+     * minute would show the hire overdue again straight away.
+     */
+    if (!rental?.rentOverdue || !rental.pickupAt) {
+      setChargeThrough("");
+
+      return;
+    }
+
+    const dayMs = 86_400_000;
+
+    const pickupMs = Date.parse(rental.pickupAt);
+
+    const through = new Date(
+      pickupMs +
+        Math.ceil((Date.now() - pickupMs) / dayMs) *
+          dayMs,
+    );
+
+    through.setMinutes(
+      through.getMinutes() -
+        through.getTimezoneOffset(),
+    );
+
+    setChargeThrough(
+      through.toISOString().slice(0, 16),
+    );
+  }
+
+  function offerDiscount() {
+    void run(async () => {
+      const amountCents = Math.round(
+        Number(discountAmount) * 100,
+      );
+
+      if (
+        !paymentRentalId ||
+        !Number.isFinite(amountCents) ||
+        amountCents <= 0
+      ) {
+        throw new Error(
+          "Select the rental and enter the discount amount.",
+        );
+      }
+
+      /*
+       * A long hire that was paid up owes nothing until the
+       * rent since then is charged, so there would be nothing
+       * for the discount to come off. The rent on screen is
+       * charged first, under the same key the payment uses,
+       * so taking the payment afterwards does not charge it
+       * again.
+       */
+      const rentKey = `rent-${paymentRentalId}-${chargeThrough}`;
+
+      if (chargeThrough && rentChargeCents > 0) {
+        await callFirestoreOperation<
+          {
+            rentalId: string;
+            expectedReturnAt: string;
+            note: string;
+            idempotencyKey: string;
+          },
+          {
+            extensionCents: number;
+            outstandingCents: number;
+          }
+        >("extendRental", {
+          rentalId: paymentRentalId,
+          expectedReturnAt:
+            localToIso(chargeThrough),
+          note: "Rent charged with payment",
+          idempotencyKey: operationKey(rentKey),
+        });
+
+        releaseOperationKey(rentKey);
+
+        setChargeThrough("");
+      }
+
+      const result =
+        await callFirestoreOperation<
+          {
+            rentalId: string;
+            amountCents: number;
+            reason: string;
+            idempotencyKey: string;
+          },
+          {
+            status: string;
+            outstandingCents: number;
+          }
+        >("requestRentalDiscount", {
+          rentalId: paymentRentalId,
+          amountCents,
+          reason: discountReason.trim(),
+          idempotencyKey: operationKey("discount"),
+        });
+
+      releaseOperationKey("discount");
+
+      setDiscountAmount("");
+      setDiscountReason("");
+
+      return result.status === "approved"
+        ? `Discount applied · ${formatMoney(
+            result.outstandingCents,
+          )} now outstanding.`
+        : "Discount sent to an administrator for approval.";
+    });
+  }
+
+  function decideDiscount(
+    discount: RentalDiscount,
+    decision: "approve" | "reject",
+  ) {
+    void run(async () => {
+      const result =
+        await callFirestoreOperation<
+          {
+            discountId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+          {
+            status: string;
+            outstandingCents: number | null;
+          }
+        >("reviewRentalDiscount", {
+          discountId: discount.id,
+          decision,
+          note:
+            reviewNotes[discount.id]?.trim() ||
+            null,
+        });
+
+      setReviewNotes((current) => {
+        const next = { ...current };
+
+        delete next[discount.id];
+
+        return next;
+      });
+
+      return result.status === "approved"
+        ? `Discount approved for ${discount.vehicleRegistration} · ${formatMoney(
+            result.outstandingCents ?? 0,
+          )} now outstanding.`
+        : `Discount for ${discount.vehicleRegistration} rejected.`;
+    });
   }
 
   return (
@@ -4785,8 +5075,27 @@ export function ReservationComposer() {
               </legend>
 
 
+              {/*
+                * A discount needs an administrator. Anyone
+                * else asks for one on the Payment tab once
+                * the return is done.
+                */}
+              {!isAdmin && (
+                <p className="form-help">
+                  To offer a discount, complete the
+                  return and request it on the Payment
+                  tab. An administrator approves it.
+                </p>
+              )}
+
               <div className="checkout-charges">
-                {returnAdjustmentOptions.map(
+                {returnAdjustmentOptions
+                  .filter(
+                    (option) =>
+                      isAdmin ||
+                      option.type !== "discount",
+                  )
+                  .map(
                   (option) => (
                     <div
                       className="field"
@@ -4943,9 +5252,108 @@ export function ReservationComposer() {
                 Select the rental.
                 Customer and vehicle
                 details are already
-                attached.
+                attached. Every rental
+                still out is listed, so
+                rent on a long hire can be
+                taken whether or not a
+                balance is showing.
               </p>
             </div>
+
+            {/*
+              * An administrator decides waiting discounts here,
+              * where the balances they come off are settled.
+              */}
+            {isAdmin &&
+              pendingDiscounts.length > 0 && (
+                <fieldset className="field full checkout-block">
+                  <legend>
+                    Discounts waiting for your
+                    approval
+                  </legend>
+
+                  {pendingDiscounts.map(
+                    (discount) => (
+                      <div
+                        className="discount-request"
+                        key={discount.id}
+                      >
+                        <p>
+                          <strong>
+                            {formatMoney(
+                              discount.amountCents,
+                            )}
+                          </strong>
+                          {" off "}
+                          {
+                            discount.vehicleRegistration
+                          }
+                          {" · "}
+                          {discount.customerName}
+                        </p>
+
+                        <p className="form-help">
+                          {discount.reason}
+                          {" — asked by "}
+                          {discount.requestedByName ||
+                            "staff"}
+                        </p>
+
+                        <input
+                          aria-label="Review note"
+                          placeholder="Note (optional)"
+                          maxLength={1000}
+                          value={
+                            reviewNotes[
+                              discount.id
+                            ] ?? ""
+                          }
+                          onChange={(event) =>
+                            setReviewNotes(
+                              (current) => ({
+                                ...current,
+                                [discount.id]:
+                                  event.target
+                                    .value,
+                              }),
+                            )
+                          }
+                        />
+
+                        <div className="form-actions">
+                          <button
+                            type="button"
+                            className="button button-primary"
+                            disabled={busy}
+                            onClick={() =>
+                              decideDiscount(
+                                discount,
+                                "approve",
+                              )
+                            }
+                          >
+                            Approve
+                          </button>
+
+                          <button
+                            type="button"
+                            className="button"
+                            disabled={busy}
+                            onClick={() =>
+                              decideDiscount(
+                                discount,
+                                "reject",
+                              )
+                            }
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    ),
+                  )}
+                </fieldset>
+              )}
 
             <div className="field full">
               <label htmlFor="rental">
@@ -4958,7 +5366,7 @@ export function ReservationComposer() {
                 required
                 value={paymentRentalId}
                 onChange={(event) =>
-                  setPaymentRentalId(
+                  selectPaymentRental(
                     event.target.value,
                   )
                 }
@@ -4967,7 +5375,7 @@ export function ReservationComposer() {
                   value=""
                   disabled
                 >
-                  Select rental with balance
+                  Select rental
                 </option>
 
                 {payableRentals.map(
@@ -4988,15 +5396,80 @@ export function ReservationComposer() {
                         rental.customerName
                       }
                       {" · "}
-                      {formatMoney(
-                        rental.outstandingCents,
-                      )}{" "}
-                      due
+                      {rental.outstandingCents > 0
+                        ? `${formatMoney(
+                            rental.outstandingCents,
+                          )} due`
+                        : rental.paidThroughAt
+                          ? `rent to ${formatDate(
+                              rental.paidThroughAt,
+                            )}`
+                          : "settled"}
+                      {rental.rentOverdue
+                        ? " · RENT OVERDUE"
+                        : ""}
                     </option>
                   ),
                 )}
               </select>
             </div>
+
+            {/*
+              * Rent on a hire that is still out. The date the
+              * rent has been charged to is the expected return;
+              * charging further moves it, the way an extension
+              * does, so the vehicle stops showing as overdue.
+              */}
+            {selectedPayableRental?.paidThroughAt && (
+              <fieldset className="field full checkout-block">
+                <legend>Rent</legend>
+
+                <p className="form-help">
+                  Rent charged to{" "}
+                  <strong>
+                    {formatDate(
+                      selectedPayableRental.paidThroughAt,
+                      {
+                        hour: "numeric",
+                        minute: "2-digit",
+                      },
+                    )}
+                  </strong>
+                  {rentIsOverdue
+                    ? ". The vehicle is still out past that date, so rent up to now is added below."
+                    : ". To take rent in advance, choose how far it is paid to."}
+                </p>
+
+                <div className="field">
+                  <label htmlFor="charge-through">
+                    Charge rent to
+                  </label>
+
+                  <input
+                    id="charge-through"
+                    type="datetime-local"
+                    value={chargeThrough}
+                    onChange={(event) =>
+                      setChargeThrough(
+                        event.target.value,
+                      )
+                    }
+                  />
+                </div>
+
+                <div className="field">
+                  <span className="form-help">
+                    Rent for this period
+                  </span>
+
+                  <strong>
+                    {formatMoney(
+                      rentChargeCents,
+                    )}
+                  </strong>
+                </div>
+              </fieldset>
+            )}
 
             <div className="field">
               <label htmlFor="amount-usd">
@@ -5143,6 +5616,100 @@ export function ReservationComposer() {
               * the fees are still being typed rather than
               * after the payment has been taken.
               */}
+            {/*
+              * A discount comes off at the end, when the
+              * balance is settled. An administrator's applies
+              * at once; anyone else's waits for approval and
+              * the balance does not change until then.
+              */}
+            {selectedPayableRental && (
+              <fieldset className="field full checkout-block">
+                <legend>Discount</legend>
+
+                {pendingDiscountForRental ? (
+                  <p className="form-help">
+                    <strong>
+                      {formatMoney(
+                        pendingDiscountForRental.amountCents,
+                      )}
+                    </strong>{" "}
+                    discount waiting for an
+                    administrator&apos;s approval
+                    {" — "}
+                    {pendingDiscountForRental.reason}.
+                    The balance changes once it is
+                    approved.
+                  </p>
+                ) : (
+                  <>
+                    <p className="form-help">
+                      {isAdmin
+                        ? "Comes off the balance straight away."
+                        : "Sent to an administrator. It comes off the balance once approved."}
+                      {rentChargeCents > 0
+                        ? " The rent above is charged first, so the discount has something to come off."
+                        : ""}
+                    </p>
+
+                    <div className="field">
+                      <label htmlFor="discount-amount">
+                        Discount (USD)
+                      </label>
+
+                      <input
+                        id="discount-amount"
+                        type="number"
+                        min="0.01"
+                        max="100000"
+                        step="0.01"
+                        inputMode="decimal"
+                        value={discountAmount}
+                        onChange={(event) =>
+                          setDiscountAmount(
+                            event.target.value,
+                          )
+                        }
+                      />
+                    </div>
+
+                    <div className="field">
+                      <label htmlFor="discount-reason">
+                        Reason
+                      </label>
+
+                      <input
+                        id="discount-reason"
+                        maxLength={500}
+                        value={discountReason}
+                        onChange={(event) =>
+                          setDiscountReason(
+                            event.target.value,
+                          )
+                        }
+                      />
+                    </div>
+
+                    <div className="form-actions">
+                      <button
+                        type="button"
+                        className="button"
+                        disabled={
+                          busy ||
+                          !discountAmount ||
+                          !discountReason.trim()
+                        }
+                        onClick={offerDiscount}
+                      >
+                        {isAdmin
+                          ? "Apply discount"
+                          : "Request approval"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </fieldset>
+            )}
+
             {selectedPayableRental && (
               <div className="field full payment-due">
                 <dl>
@@ -5156,6 +5723,17 @@ export function ReservationComposer() {
                       )}
                     </dd>
                   </div>
+
+                  {rentChargeCents > 0 && (
+                    <div>
+                      <dt>Rent for this period</dt>
+                      <dd>
+                        {formatMoney(
+                          rentChargeCents,
+                        )}
+                      </dd>
+                    </div>
+                  )}
 
                   <div>
                     <dt>Additional fees</dt>
