@@ -7039,3 +7039,218 @@ canvas {
     padding: 10px 11px;
   }
 }
+
+/* =========================================================
+   Finance entry receipt
+   ========================================================= */
+
+.ledger-hint {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.ledger-row {
+  cursor: pointer;
+}
+
+.ledger-row:hover td {
+  background: #f7f9fc;
+}
+
+.ledger-open {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ledger-open:focus-visible {
+  border-radius: 6px;
+  outline: 2px solid var(--navy, #1f3b73);
+  outline-offset: 3px;
+}
+
+.ledger-who {
+  color: #7b879a;
+  font-size: 12px;
+}
+
+.receipt-modal {
+  width: min(620px, 100%);
+}
+
+.receipt {
+  display: grid;
+  gap: 14px;
+}
+
+.receipt-print-title {
+  display: none;
+  margin: 0;
+  font-size: 18px;
+}
+
+.receipt-block {
+  display: grid;
+  gap: 2px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.receipt-block .section-kicker {
+  margin: 0 0 6px;
+}
+
+.receipt-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 6px 0;
+  font-size: 14px;
+}
+
+.receipt-row + .receipt-row {
+  border-top: 1px dashed var(--line);
+}
+
+.receipt-row span {
+  flex-shrink: 0;
+  color: #7b879a;
+}
+
+.receipt-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.receipt-totals .receipt-row:last-child {
+  padding-top: 10px;
+  border-top: 1px solid var(--ink, #10203a);
+  font-size: 16px;
+}
+
+.receipt-lines {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.receipt-lines li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 6px;
+  border-radius: 6px;
+}
+
+.receipt-lines li + li {
+  border-top: 1px dashed var(--line);
+}
+
+.receipt-lines li.is-current {
+  background: #eef4ff;
+}
+
+.receipt-lines li > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.receipt-lines small {
+  color: #7b879a;
+  overflow-wrap: anywhere;
+}
+
+.receipt-lines b {
+  flex-shrink: 0;
+}
+
+@media print {
+  .receipt-print-title {
+    display: block;
+  }
+
+  .receipt-block {
+    break-inside: avoid;
+  }
+}
+
+/* =========================================================
+   Cancelled bookings
+   ========================================================= */
+
+.sidebar-nav .nav-count + .nav-count {
+  margin-left: 4px;
+}
+
+.nav-count-cancel {
+  background: #d97706 !important;
+}
+
+.mobile-nav a {
+  position: relative;
+}
+
+.mobile-nav .nav-count {
+  position: absolute;
+  top: 2px;
+  left: calc(50% + 6px);
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 17px;
+  text-align: center;
+}
+
+.cancelled-list ul {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cancelled-list li {
+  display: grid;
+  gap: 3px;
+  padding: 11px 0;
+}
+
+.cancelled-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.cancelled-list li strong {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.cancelled-list small {
+  color: #7b879a;
+  overflow-wrap: anywhere;
+}
+
+.cancelled-new {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #fff1dc;
+  color: #b45309;
+  font-size: 11px;
+  font-weight: 800;
+}

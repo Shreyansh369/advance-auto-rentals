@@ -38,6 +38,12 @@ import { useFirebaseAuth } from "./firebase-provider";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
+import {
+  CANCELLATIONS_SEEN_EVENT,
+  cancellationsSeenAt,
+  recentCancellationsQuery,
+} from "@/lib/cancellations";
+
 const navigation = [
   {
     href: "/",
@@ -49,6 +55,7 @@ const navigation = [
     label: "Bookings",
     icon: CalendarDays,
     countsPendingDiscounts: true,
+    countsCancellations: true,
   },
   {
     href: "/customers",
@@ -235,6 +242,95 @@ export function AppShell({
   }, [role]);
 
   /*
+   * A booking called off leaves the list without a trace, so
+   * everyone — not only administrators — is told how many were
+   * cancelled since they last looked at Bookings.
+   */
+  const [cancelledTimes, setCancelledTimes] =
+    useState<number[]>([]);
+
+  const [seenAt, setSeenAt] = useState(0);
+
+  const uid = user?.uid;
+
+  useEffect(() => {
+    if (!uid) {
+      return;
+    }
+
+    const refresh = () =>
+      setSeenAt(cancellationsSeenAt(uid));
+
+    refresh();
+
+    window.addEventListener(
+      CANCELLATIONS_SEEN_EVENT,
+      refresh,
+    );
+
+    return () =>
+      window.removeEventListener(
+        CANCELLATIONS_SEEN_EVENT,
+        refresh,
+      );
+  }, [uid]);
+
+  useEffect(() => {
+    if (!uid || !role) {
+      return;
+    }
+
+    let unsubscribe:
+      | (() => void)
+      | undefined;
+
+    try {
+      unsubscribe = onSnapshot(
+        recentCancellationsQuery(),
+
+        (snapshot) =>
+          setCancelledTimes(
+            snapshot.docs.map((entry) => {
+              const value = entry.get(
+                "cancelledAt",
+              );
+
+              return typeof value?.toMillis ===
+                "function"
+                ? value.toMillis()
+                : 0;
+            }),
+          ),
+
+        () => setCancelledTimes([]),
+      );
+    } catch {
+      // Firebase is unconfigured; the shell reports that itself.
+    }
+
+    return () => unsubscribe?.();
+  }, [uid, role]);
+
+  const unseenCancellations =
+    cancelledTimes.filter(
+      (time) => time > seenAt,
+    ).length;
+
+  function cancellationBadge() {
+    return unseenCancellations > 0 ? (
+      <b
+        className="nav-count nav-count-cancel"
+        aria-label={`${unseenCancellations} booking${
+          unseenCancellations === 1 ? "" : "s"
+        } cancelled since you last looked`}
+        title="Bookings cancelled since you last looked"
+      >
+        {unseenCancellations}
+      </b>
+    ) : null;
+  }
+
+  /*
    * Prevent the mobile menu from scrolling
    * the page underneath it.
    */
@@ -331,6 +427,7 @@ export function AppShell({
               icon: Icon,
               countsPendingStaff,
               countsPendingDiscounts,
+              countsCancellations,
             }) => {
               const waiting =
                 countsPendingStaff
@@ -377,6 +474,9 @@ export function AppShell({
                         : waiting}
                     </b>
                   )}
+
+                  {countsCancellations &&
+                    cancellationBadge()}
                 </Link>
               );
             },
@@ -498,6 +598,7 @@ export function AppShell({
               href,
               label,
               icon: Icon,
+              countsCancellations,
             }) => (
               <Link
                 href={href}
@@ -518,6 +619,9 @@ export function AppShell({
                 <span>
                   {label}
                 </span>
+
+                {countsCancellations &&
+                  cancellationBadge()}
               </Link>
             ),
           )}

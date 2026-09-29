@@ -105,6 +105,7 @@ export type FinancialOverview = {
     id: string;
     entryType: string;
     vehicleRegistration: string;
+    customerName: string | null;
     amountCents: number;
     occurredAt: string;
   }>;
@@ -7194,6 +7195,22 @@ operatingMarginCents:
       }),
     );
 
+  const customerNameByRental =
+    new Map<string, string>();
+
+  for (const record of financialRecords) {
+    const name = trimmedOrNull(
+      record.customerNameSnapshot,
+    );
+
+    if (name) {
+      customerNameByRental.set(
+        record.id,
+        name,
+      );
+    }
+  }
+
   const recentEntries =
     filteredLedger
       .sort(
@@ -7225,6 +7242,18 @@ operatingMarginCents:
               entry.vehicleRegistration ??
                 "",
             ),
+
+          /*
+           * The ledger carries only the customer's id, so the
+           * name is read from the rental's financial record,
+           * which is kept under the rental's own id.
+           */
+          customerName:
+            customerNameByRental.get(
+              String(
+                entry.rentalId ?? "",
+              ),
+            ) ?? null,
 
           amountCents:
             Number(
@@ -7277,6 +7306,407 @@ operatingMarginCents:
   };
 }
 
+
+/* =========================================================
+   Ledger entry detail
+   ========================================================= */
+
+/*
+ * One line on the finance screen says only what kind of
+ * money moved and how much. Opening it answers the rest —
+ * whose rental it was, which car, who took the money or
+ * gave the discount, and when — and sets it beside every
+ * other line on the same rental, so it reads as a bill.
+ */
+export type LedgerLine = {
+  id: string;
+  entryType: string;
+  amountCents: number;
+  occurredAt: string;
+  note: string | null;
+  detailType: string | null;
+  recordedByName: string | null;
+};
+
+export type LedgerEntryDetail = {
+  entry: LedgerLine & {
+    vehicleRegistration: string;
+  };
+
+  payment: {
+    method: string;
+    externalReference: string | null;
+    amountCents: number;
+  } | null;
+
+  expense: {
+    category: string;
+    vendor: string | null;
+    note: string | null;
+  } | null;
+
+  /* The discount this entry records, when it records one. */
+  discount: RentalDiscount | null;
+
+  rental: {
+    id: string;
+    status: string;
+    customerName: string;
+    customerTelephone: string | null;
+    vehicleRegistration: string;
+    vehicleDescription: string | null;
+    pickupAt: string | null;
+    expectedReturnAt: string | null;
+    actualReturnAt: string | null;
+    handledByName: string | null;
+    checkedOutByName: string | null;
+    returnedByName: string | null;
+  } | null;
+
+  bill: {
+    baseRentalCents: number;
+    adjustmentCents: number;
+    totalCents: number;
+    paidCents: number;
+    refundedCents: number;
+    outstandingCents: number;
+    depositHeldCents: number;
+  } | null;
+
+  /* Every ledger line on the rental, oldest first. */
+  lines: LedgerLine[];
+
+  /* Every discount asked for on the rental, whatever became of it. */
+  discounts: RentalDiscount[];
+};
+
+function isoOrNull(value: unknown): string | null {
+  return value ? toIso(value) : null;
+}
+
+async function getLedgerEntryDetail(
+  input: { entryId: string },
+): Promise<LedgerEntryDetail> {
+  await assertAdmin("Financial reporting");
+
+  const entryId = trimmedOrNull(input.entryId);
+
+  if (!entryId) {
+    throw new Error("Select an entry to open.");
+  }
+
+  const { db } = getFirebaseClient();
+
+  const entrySnapshot = await getDoc(
+    doc(db, "financialLedger", entryId),
+  );
+
+  if (!entrySnapshot.exists()) {
+    throw new Error("That entry was not found.");
+  }
+
+  const entry = entrySnapshot.data();
+
+  const rentalId = trimmedOrNull(entry.rentalId);
+
+  const paymentId = trimmedOrNull(entry.paymentId);
+
+  const expenseId = trimmedOrNull(entry.expenseId);
+
+  const [
+    rentalSnapshot,
+    financialSnapshot,
+    paymentSnapshot,
+    expenseSnapshot,
+    lineSnapshot,
+    discountSnapshot,
+  ] = await Promise.all([
+    rentalId
+      ? getDoc(doc(db, "rentals", rentalId))
+      : null,
+
+    rentalId
+      ? getDoc(
+          doc(db, "rentalFinancials", rentalId),
+        )
+      : null,
+
+    paymentId
+      ? getDoc(doc(db, "payments", paymentId))
+      : null,
+
+    expenseId
+      ? getDoc(
+          doc(db, "vehicleExpenses", expenseId),
+        )
+      : null,
+
+    rentalId
+      ? getDocs(
+          query(
+            collection(db, "financialLedger"),
+            where("rentalId", "==", rentalId),
+            limit(200),
+          ),
+        )
+      : null,
+
+    rentalId
+      ? getDocs(
+          query(
+            collection(db, "rentalDiscounts"),
+            where("rentalId", "==", rentalId),
+            limit(50),
+          ),
+        )
+      : null,
+  ]);
+
+  const rental = rentalSnapshot?.exists()
+    ? rentalSnapshot.data()
+    : null;
+
+  const financial = financialSnapshot?.exists()
+    ? financialSnapshot.data()
+    : null;
+
+  const lineDocs: FirestoreDoc[] = lineSnapshot
+    ? lineSnapshot.docs.map((snapshot) => ({
+        id: snapshot.id,
+        ...snapshot.data(),
+      }))
+    : [{ id: entryId, ...entry }];
+
+  const vehicleId = trimmedOrNull(
+    entry.vehicleId ?? rental?.vehicleId,
+  );
+
+  /*
+   * The ledger stores who recorded a line by account id only.
+   * Names are looked up once per person; an account that has
+   * since been removed simply shows no name.
+   */
+  const recorderIds = [
+    ...new Set(
+      lineDocs
+        .map((line) =>
+          trimmedOrNull(line.recordedBy),
+        )
+        .filter(
+          (uid): uid is string => uid !== null,
+        ),
+    ),
+  ];
+
+  const customerId = trimmedOrNull(
+    entry.customerId ?? rental?.customerId,
+  );
+
+  const [
+    vehicleSnapshot,
+    customerSnapshot,
+    ...recorderSnapshots
+  ] = await Promise.all([
+      vehicleId
+        ? getDoc(
+            doc(db, "vehicles", vehicleId),
+          ).catch(() => null)
+        : null,
+
+      /* A customer removed since keeps the name on the rental. */
+      customerId
+        ? getDoc(
+            doc(db, "customers", customerId),
+          ).catch(() => null)
+        : null,
+
+      ...recorderIds.map((uid) =>
+        getDoc(doc(db, "users", uid)).catch(
+          () => null,
+        ),
+      ),
+    ]);
+
+  const nameByUid = new Map<string, string>();
+
+  recorderIds.forEach((uid, index) => {
+    const profile =
+      recorderSnapshots[index]?.data() ?? {};
+
+    const name =
+      trimmedOrNull(profile.fullName) ??
+      trimmedOrNull(profile.email);
+
+    if (name) {
+      nameByUid.set(uid, name);
+    }
+  });
+
+  const lineFrom = (
+    line: FirestoreDoc,
+  ): LedgerLine => ({
+    id: line.id,
+    entryType: String(line.entryType ?? "entry"),
+    amountCents: Number(line.amountCents ?? 0),
+    occurredAt: toIso(line.occurredAt),
+    note: trimmedOrNull(line.note),
+    detailType: trimmedOrNull(
+      line.feeType ?? line.adjustmentType,
+    ),
+    recordedByName:
+      nameByUid.get(String(line.recordedBy ?? "")) ??
+      null,
+  });
+
+  const lines = lineDocs
+    .map(lineFrom)
+    .sort((a, b) =>
+      a.occurredAt.localeCompare(b.occurredAt),
+    );
+
+  const discounts = discountSnapshot
+    ? discountSnapshot.docs
+        .map((snapshot) =>
+          rentalDiscountFrom(
+            snapshot.id,
+            snapshot.data(),
+          ),
+        )
+        .sort((a, b) =>
+          String(a.requestedAt).localeCompare(
+            String(b.requestedAt),
+          ),
+        )
+    : [];
+
+  const discountId = trimmedOrNull(entry.discountId);
+
+  const vehicle = vehicleSnapshot?.exists()
+    ? vehicleSnapshot.data()
+    : null;
+
+  const vehicleDescription = vehicle
+    ? [vehicle.year, vehicle.make, vehicle.model]
+        .map((part) => trimmedOrNull(part))
+        .filter(Boolean)
+        .join(" ") || null
+    : null;
+
+  const vehicleRegistration = String(
+    entry.vehicleRegistration ??
+      rental?.vehicleRegistrationSnapshot ??
+      vehicle?.registrationNumber ??
+      "",
+  );
+
+  const payment = paymentSnapshot?.exists()
+    ? paymentSnapshot.data()
+    : null;
+
+  const expense = expenseSnapshot?.exists()
+    ? expenseSnapshot.data()
+    : null;
+
+  return {
+    entry: {
+      ...lineFrom({ id: entryId, ...entry }),
+      vehicleRegistration,
+    },
+
+    payment: payment
+      ? {
+          method: String(payment.method ?? "other"),
+          externalReference: trimmedOrNull(
+            payment.externalReference,
+          ),
+          amountCents: Number(
+            payment.amountCents ?? 0,
+          ),
+        }
+      : null,
+
+    expense: expense
+      ? {
+          category: String(
+            expense.category ?? "other",
+          ),
+          vendor: trimmedOrNull(expense.vendor),
+          note: trimmedOrNull(expense.note),
+        }
+      : null,
+
+    discount: discountId
+      ? (discounts.find(
+          (discount) => discount.id === discountId,
+        ) ?? null)
+      : null,
+
+    rental:
+      rental && rentalId
+        ? {
+            id: rentalId,
+            status: String(rental.status ?? ""),
+            customerName: String(
+              rental.customerNameSnapshot ??
+                financial?.customerNameSnapshot ??
+                "",
+            ),
+            customerTelephone: trimmedOrNull(
+              customerSnapshot?.get("telephone"),
+            ),
+            vehicleRegistration,
+            vehicleDescription,
+            pickupAt: isoOrNull(rental.pickupAt),
+            expectedReturnAt: isoOrNull(
+              rental.expectedReturnAt,
+            ),
+            actualReturnAt: isoOrNull(
+              rental.actualReturnAt,
+            ),
+            handledByName: trimmedOrNull(
+              rental.handledByNameSnapshot ??
+                rental.createdByNameSnapshot,
+            ),
+            checkedOutByName: trimmedOrNull(
+              rental.checkedOutByNameSnapshot,
+            ),
+            returnedByName: trimmedOrNull(
+              rental.returnedByNameSnapshot,
+            ),
+          }
+        : null,
+
+    bill: financial
+      ? {
+          baseRentalCents: Number(
+            financial.baseRentalCents ?? 0,
+          ),
+          adjustmentCents: Number(
+            financial.adjustmentCents ?? 0,
+          ),
+          totalCents: Number(
+            financial.totalCents ?? 0,
+          ),
+          paidCents: Number(
+            financial.paidCents ?? 0,
+          ),
+          refundedCents: Number(
+            financial.refundedCents ?? 0,
+          ),
+          outstandingCents: Number(
+            financial.outstandingCents ?? 0,
+          ),
+          depositHeldCents: Number(
+            financial.depositHeldCents ?? 0,
+          ),
+        }
+      : null,
+
+    lines,
+
+    discounts,
+  };
+}
 
 /* =========================================================
    Customer removal
@@ -9539,6 +9969,13 @@ export async function callFirestoreOperation<
             to: string;
             vehicleId: string | null;
           },
+        )) as TResult
+      );
+
+    case "getLedgerEntryDetail":
+      return (
+        (await getLedgerEntryDetail(
+          data as { entryId: string },
         )) as TResult
       );
 
