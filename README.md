@@ -12,6 +12,8 @@ Secure operations software for Advance Auto Rentals. It is a separate applicatio
 - Backdated bookings on the booking screen for a hire that started before it was booked here and is still out: tick **This rental already started**, date the pickup in the past, and it is checked out, extended and returned like any other booking
 - Rent on a long hire: every rental still out appears on the Payment tab, rent that has built up past the date it was charged to is priced from the rental's own rates, and taking it moves that date forward
 - Discounts at payment: an administrator's comes straight off the balance; an employee's waits for an administrator's approval, counted beside **Bookings** until it is decided
+- Every line under **Recent entries** on Finance opens as a bill: customer, vehicle, who recorded it, how it was paid, who offered and who approved a discount, and every other charge and payment on the same rental, printable
+- Cancelled bookings are listed on **Bookings** with who cancelled them, when and why; bookings cancelled since you last looked are counted beside **Bookings** in the menu and the phone's bottom bar
 - A rental record of every hire — customer, vehicle, the staff member who handled it, start, return and status — searchable from one box
 - Expense recording on a screen of its own that operations can reach, kept apart from the administrator-only revenue reporting
 - Cloudinary media capture for vehicle condition photos, fleet photos and driver's licence images

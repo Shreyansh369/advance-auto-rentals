@@ -28,6 +28,11 @@ import {
 
 import { AppShell } from "./app-shell";
 
+import {
+  entryTypeLabel,
+  LedgerEntryReceipt,
+} from "./ledger-entry-receipt";
+
 import { useFirebaseAuth } from "./firebase-provider";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
@@ -102,6 +107,14 @@ export function FinanceOverview() {
 
   const [reloadToken, setReloadToken] =
     useState(0);
+
+  const [openEntryId, setOpenEntryId] =
+    useState<string | null>(null);
+
+  const closeEntry = useCallback(
+    () => setOpenEntryId(null),
+    [],
+  );
 
   useEffect(() => {
     if (role !== "admin") {
@@ -553,6 +566,13 @@ export function FinanceOverview() {
         </div>
 
         {data?.recentEntries.length ? (
+          <>
+          <p className="quiet ledger-hint">
+            Tap an entry to see the customer,
+            the vehicle, who recorded it and the
+            rental&rsquo;s full bill.
+          </p>
+
           <div className="table-wrap">
             <table>
               <thead>
@@ -569,7 +589,15 @@ export function FinanceOverview() {
               <tbody>
                 {data.recentEntries.map(
                   (entry) => (
-                    <tr key={entry.id}>
+                    <tr
+                      key={entry.id}
+                      className="ledger-row"
+                      onClick={() =>
+                        setOpenEntryId(
+                          entry.id,
+                        )
+                      }
+                    >
                       <td>
                         {formatDate(
                           entry.occurredAt,
@@ -577,12 +605,45 @@ export function FinanceOverview() {
                       </td>
 
                       <td>
-                        <span className="entry-type">
-                          {entry.entryType.replaceAll(
-                            "_",
-                            " ",
+                        {/* A real button, so the row opens
+                            from the keyboard as well. */}
+                        <button
+                          type="button"
+                          className="ledger-open"
+                          aria-label={`Open ${entryTypeLabel(
+                            entry.entryType,
+                          )} of ${formatMoney(
+                            entry.amountCents,
+                          )}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+
+                            setOpenEntryId(
+                              entry.id,
+                            );
+                          }}
+                        >
+                          <span className="entry-type">
+                            {entryTypeLabel(
+                              entry.entryType,
+                            )}
+                          </span>
+
+                          {/* The vehicle column is hidden on
+                              a phone, so the car and the
+                              customer ride under the type. */}
+                          {(entry.vehicleRegistration ||
+                            entry.customerName) && (
+                            <small className="ledger-who">
+                              {[
+                                entry.vehicleRegistration,
+                                entry.customerName,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </small>
                           )}
-                        </span>
+                        </button>
                       </td>
 
                       <td>
@@ -609,12 +670,20 @@ export function FinanceOverview() {
               </tbody>
             </table>
           </div>
+          </>
         ) : (
           <div className="inline-empty">
             No entries for this period.
           </div>
         )}
       </section>
+
+      {openEntryId && (
+        <LedgerEntryReceipt
+          entryId={openEntryId}
+          onClose={closeEntry}
+        />
+      )}
     </AppShell>
   );
 }

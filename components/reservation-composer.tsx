@@ -33,6 +33,8 @@ import {
 
 import { AppShell } from "./app-shell";
 import { useFirebaseAuth } from "./firebase-provider";
+
+import { CancelledBookings } from "./cancelled-bookings";
 import { CountrySelect } from "./country-select";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
@@ -2995,6 +2997,10 @@ export function ReservationComposer() {
             </ul>
           </section>
         )}
+
+      {tab === "booking" && (
+        <CancelledBookings />
+      )}
 
       {tab === "booking" &&
         (contractQueue.length > 0 ||
