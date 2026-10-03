@@ -231,6 +231,236 @@ a {
   font-size: 13px;
 }
 
+/* ---------------------------------------------------------
+   Damage marked on the vehicle outline drawings
+   --------------------------------------------------------- */
+
+.damage-diagram {
+  display: grid;
+  gap: 10px;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.damage-diagram-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.damage-diagram-head > div {
+  display: grid;
+  gap: 2px;
+}
+
+.damage-diagram-head small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.damage-diagram-head .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.damage-diagram .form-help {
+  margin: 0;
+}
+
+.damage-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.damage-kind {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.damage-kind.is-selected {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 2px rgb(49 94 251 / 18%);
+}
+
+.damage-views {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.damage-view {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  margin: 0;
+}
+
+.damage-view-left,
+.damage-view-right {
+  grid-column: 1 / -1;
+}
+
+.damage-canvas {
+  position: relative;
+  width: 100%;
+  max-width: 240px;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+.damage-view-left .damage-canvas,
+.damage-view-right .damage-canvas {
+  max-width: 520px;
+}
+
+.damage-canvas.is-editable {
+  cursor: crosshair;
+}
+
+.damage-canvas img {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+
+.damage-view figcaption {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0.06em;
+}
+
+.damage-pin {
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  background: #fff;
+  color: var(--navy);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+
+.damage-pin-scratch {
+  color: #1f4fd6;
+}
+
+.damage-pin-dent {
+  color: #8a3ffc;
+}
+
+.damage-pin-chip {
+  color: #b55d00;
+}
+
+.damage-pin-other {
+  color: #3d4757;
+}
+
+/* Marked since the form opened: new damage at a return. */
+.damage-pin.is-new {
+  border-color: var(--red);
+  background: #fde8ea;
+  color: var(--red);
+}
+
+.damage-pin.is-placed {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 3px rgb(20 30 55 / 25%);
+}
+
+button.damage-pin.is-placed:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.damage-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.damage-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.damage-list .damage-pin {
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+}
+
+.damage-list em {
+  color: var(--red);
+  font-style: normal;
+  font-weight: 700;
+}
+
+.damage-list .text-button {
+  display: inline-flex;
+  color: var(--muted);
+}
+
+/* Marks printed on the agreement's own drawings. */
+.sheet-diagram-canvas {
+  position: relative;
+  width: 100%;
+  max-width: 190px;
+}
+
+.sheet-diagram-left .sheet-diagram-canvas,
+.sheet-diagram-right .sheet-diagram-canvas {
+  max-width: 420px;
+}
+
+.sheet-diagram-canvas img {
+  display: block;
+  max-width: 100%;
+}
+
+.sheet-diagram-canvas .damage-pin {
+  width: 15px;
+  height: 15px;
+  border-width: 1.5px;
+  font-size: 8px;
+  box-shadow: none;
+}
+
+.sheet-damage-key {
+  margin: 4px 0 0;
+  color: #4a5568;
+  font-size: 8.5px;
+}
+
 /* Confirmed bookings that have not gone out yet, with the
    control that releases the vehicle they are holding. */
 .booking-list {

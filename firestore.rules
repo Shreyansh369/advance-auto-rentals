@@ -166,7 +166,24 @@ allow list: if isAdmin();
 
       allow read: if isStaff();
 
-      allow create, update: if isStaff();
+      allow create: if isStaff();
+
+      /* A booking is only cancelled with a reason: the
+         cancelled list on Bookings says why each one went. */
+      allow update: if isStaff()
+        && (
+          request.resource.data.get("status", null)
+              != "cancelled"
+          || resource.data.get("status", null)
+              == "cancelled"
+          || (
+            request.resource.data.get(
+              "cancellationReason", null
+            ) is string
+            && request.resource.data.cancellationReason
+                .trim().size() > 0
+          )
+        );
 
       allow delete: if isAdmin();
     }

@@ -108,7 +108,7 @@ describe("the agreement handed to the office's own mail account", () => {
       "Daily: $160.00",
       "Detailing / cleaning: $120.00",
       "TOTAL: $280.00",
-      "Method: Credit",
+      "Method: Credit card",
       "Accepted by: Riley Customer",
     ]) {
       expect(body).toContain(fragment);

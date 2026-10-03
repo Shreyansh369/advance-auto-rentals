@@ -43,7 +43,13 @@ import {
 } from "@/lib/services/firestore-client";
 
 import { AppShell } from "./app-shell";
+import { DamageDiagram } from "./damage-diagram";
 import { MediaCapture } from "./media-capture";
+
+import {
+  sanitizeDamageMarks,
+  type DamageMark,
+} from "@/lib/damage";
 
 import type { CloudinaryMedia } from "@/lib/cloudinary";
 
@@ -344,6 +350,10 @@ export function VehicleDirectory({
   const [photos, setPhotos] =
     useState<CloudinaryMedia[]>([]);
 
+  /* Null until changed, so an untouched form saves nothing. */
+  const [damage, setDamage] =
+    useState<DamageMark[] | null>(null);
+
   const [saving, setSaving] =
     useState(false);
 
@@ -464,6 +474,7 @@ export function VehicleDirectory({
     setError(undefined);
     setNotice(undefined);
     setEditingVehicle(vehicle);
+    setDamage(null);
     setForm(vehicleToForm(vehicle));
     setPhotos(
       (vehicle.photos ??
@@ -480,6 +491,7 @@ export function VehicleDirectory({
     setCreatingVehicle(false);
     setForm(null);
     setPhotos([]);
+    setDamage(null);
   }
 
   function updateForm(
@@ -691,6 +703,19 @@ export function VehicleDirectory({
           },
         );
 
+        if (damage) {
+          await callFirestoreOperation<
+            {
+              vehicleId: string;
+              damageMarks: DamageMark[];
+            },
+            unknown
+          >("updateVehicleDamage", {
+            vehicleId: editingVehicle!.id,
+            damageMarks: damage,
+          });
+        }
+
         setNotice(
           `${payload.registrationNumber} updated successfully.`,
         );
@@ -700,6 +725,7 @@ export function VehicleDirectory({
       setCreatingVehicle(false);
       setForm(null);
       setPhotos([]);
+      setDamage(null);
     } catch (cause) {
       setError(
         firebaseErrorMessage(cause),
@@ -1692,6 +1718,22 @@ export function VehicleDirectory({
                     maxFiles={10}
                   />
                 </div>
+
+                {editingVehicle && (
+                  <div className="field full">
+                    <DamageDiagram
+                      label="Damage on this vehicle"
+                      hint="Carried from one hire to the next and shown at every checkout. Tap a mark to clear a repair; choose a kind and tap the drawing to add damage found in the yard."
+                      marks={
+                        damage ??
+                        sanitizeDamageMarks(
+                          editingVehicle.damageMarks,
+                        )
+                      }
+                      onChange={setDamage}
+                    />
+                  </div>
+                )}
               </div>
 
               <footer className="vehicle-modal-footer">

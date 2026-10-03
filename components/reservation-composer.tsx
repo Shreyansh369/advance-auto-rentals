@@ -39,6 +39,7 @@ import { CountrySelect } from "./country-select";
 import { CustomerLicenseCapture } from "./customer-license-capture";
 import { MediaCapture } from "./media-capture";
 import { CustomerSignaturePad } from "./customer-signature-pad";
+import { DamageDiagram } from "./damage-diagram";
 import { RentalAgreement } from "./rental-agreement";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
@@ -51,6 +52,12 @@ import {
 } from "@/lib/presentation";
 
 import type { CloudinaryMedia } from "@/lib/cloudinary";
+
+import {
+  sanitizeDamageMarks,
+  summariseDamage,
+  type DamageMark,
+} from "@/lib/damage";
 
 import {
   AGREEMENT_RATES,
@@ -112,10 +119,13 @@ type Vehicle = {
   make: string;
   model: string;
   status: string;
+  /* The damage it carries from its last hire. */
+  damageMarks: DamageMark[];
 };
 
 type Reservation = {
   id: string;
+  vehicleId: string;
   customerName: string;
   vehicleRegistration: string;
   pickupAt: string | null;
@@ -132,6 +142,8 @@ type Reservation = {
 type Rental = {
   id: string;
   customerName: string;
+  /* Marked on the drawings when it went out. */
+  checkoutDamageMarks: DamageMark[];
   vehicleRegistration: string;
   pickupOdometerKm: number;
   expectedReturnAt: string | null;
@@ -638,6 +650,34 @@ export function ReservationComposer() {
     useState<CloudinaryMedia[]>([]);
 
   /*
+   * The damage marked on the drawings. Null until the form is
+   * touched, so it follows whichever booking or rental is
+   * selected: checkout starts from the damage the vehicle
+   * already carries, return from what it went out with.
+   */
+  const [checkoutDamage, setCheckoutDamage] =
+    useState<DamageMark[] | null>(null);
+
+  const [returnDamage, setReturnDamage] =
+    useState<DamageMark[] | null>(null);
+
+  /*
+   * A discount offered at the counter, and the money taken
+   * there. Whatever is not paid now is left as the rental's
+   * balance due.
+   */
+  const [checkoutDiscount, setCheckoutDiscount] =
+    useState("");
+
+  const [
+    checkoutDiscountReason,
+    setCheckoutDiscountReason,
+  ] = useState("");
+
+  const [checkoutPaidNow, setCheckoutPaidNow] =
+    useState("");
+
+  /*
    * The charge rows the employee fills in. The daily, weekly
    * and monthly rows restate the booking's quote and are not
    * entered here, so they are left out of this list.
@@ -1049,6 +1089,12 @@ export function ReservationComposer() {
                 snapshot.get(
                   "status",
                 ),
+              damageMarks:
+                sanitizeDamageMarks(
+                  snapshot.get(
+                    "damageMarks",
+                  ),
+                ),
             }),
           )
           .sort(
@@ -1063,6 +1109,11 @@ export function ReservationComposer() {
         reservationDocs.docs.map(
           (snapshot) => ({
             id: snapshot.id,
+            vehicleId: String(
+              snapshot.get(
+                "vehicleId",
+              ) ?? "",
+            ),
             customerName:
               snapshot.get(
                 "customerNameSnapshot",
@@ -1116,6 +1167,12 @@ export function ReservationComposer() {
             customerName:
               snapshot.get(
                 "customerNameSnapshot",
+              ),
+            checkoutDamageMarks:
+              sanitizeDamageMarks(
+                snapshot.get(
+                  "checkoutDamageMarks",
+                ),
               ),
             vehicleRegistration:
               snapshot.get(
@@ -1637,9 +1694,68 @@ export function ReservationComposer() {
       : 0;
   })();
 
+  function centsFromDollars(value: string): number {
+    const amount = Number(value || 0);
+
+    return Number.isFinite(amount) && amount > 0
+      ? Math.round(amount * 100)
+      : 0;
+  }
+
+  const checkoutDiscountCents =
+    centsFromDollars(checkoutDiscount);
+
+  /*
+   * An administrator's discount comes straight off; anyone
+   * else's waits for an administrator, so it is shown but not
+   * taken off what is collected now.
+   */
+  const checkoutDiscountAppliedCents = isAdmin
+    ? checkoutDiscountCents
+    : 0;
+
   const dueAtCheckoutCents =
-    agreementTotalCents +
+    agreementTotalCents -
+    checkoutDiscountAppliedCents +
     checkoutDepositCents;
+
+  /* The rental's share of what is due, deposit aside. */
+  const checkoutRentalDueCents = Math.max(
+    agreementTotalCents - checkoutDiscountCents,
+    0,
+  );
+
+  const checkoutPaidNowCents =
+    centsFromDollars(checkoutPaidNow);
+
+  const balanceAfterCheckoutCents = Math.max(
+    agreementTotalCents -
+      checkoutDiscountAppliedCents -
+      checkoutPaidNowCents,
+    0,
+  );
+
+  /*
+   * Checkout starts from the damage the vehicle already
+   * carries; return from the damage it went out with.
+   */
+  const checkoutDamageBaseline =
+    vehicles.find(
+      (vehicle) =>
+        vehicle.id ===
+        checkoutReservationQuote?.vehicleId,
+    )?.damageMarks ?? [];
+
+  const checkoutDamageMarks =
+    checkoutDamage ?? checkoutDamageBaseline;
+
+  const returnDamageBaseline =
+    rentals.find(
+      (rental) => rental.id === returnRentalId,
+    )?.checkoutDamageMarks ?? [];
+
+  const returnDamageMarks =
+    returnDamage ?? returnDamageBaseline;
 
   /*
    * A discount comes off the balance; everything else is
@@ -1761,16 +1877,29 @@ export function ReservationComposer() {
   async function cancelBooking(
     reservation: Reservation,
   ) {
-    setCancelBusy(true);
     setError(undefined);
     setNotice(undefined);
+
+    /*
+     * Every cancellation is listed with its reason, so a
+     * booking cannot be released without one.
+     */
+    if (!cancelReason.trim()) {
+      setError(
+        "Give a reason for cancelling this booking.",
+      );
+
+      return;
+    }
+
+    setCancelBusy(true);
 
     try {
       const result =
         await callFirestoreOperation<
           {
             reservationId: string;
-            reason: string | null;
+            reason: string;
           },
           {
             reservationId: string;
@@ -1778,8 +1907,7 @@ export function ReservationComposer() {
           }
         >("cancelReservation", {
           reservationId: reservation.id,
-          reason:
-            cancelReason.trim() || null,
+          reason: cancelReason.trim(),
         });
 
       setCancellingId(null);
@@ -1977,6 +2105,24 @@ export function ReservationComposer() {
 
     void run(
       async () => {
+        if (
+          checkoutDiscountCents > 0 &&
+          !checkoutDiscountReason.trim()
+        ) {
+          throw new Error(
+            "Say why the discount is being offered.",
+          );
+        }
+
+        if (
+          checkoutPaidNowCents > 0 &&
+          !paymentMethod
+        ) {
+          throw new Error(
+            "Choose how the renter is paying — cash, check or credit card — before recording the amount paid now.",
+          );
+        }
+
         const result =
           await callFirestoreOperation<
             {
@@ -2015,9 +2161,21 @@ export function ReservationComposer() {
                 | string
                 | null;
               extraHours: number;
+              damageMarks: DamageMark[];
+              discount: {
+                amountCents: number;
+                reason: string;
+              } | null;
+              paidNowCents: number;
             },
             {
               rentalId: string;
+              outstandingCents: number;
+              discountStatus:
+                | "approved"
+                | "pending"
+                | null;
+              paidNowCents: number;
             }
           >(
             "checkoutReservation",
@@ -2108,6 +2266,22 @@ export function ReservationComposer() {
                 ).trim() || null,
 
               extraHours: 0,
+
+              damageMarks:
+                checkoutDamageMarks,
+
+              discount:
+                checkoutDiscountCents > 0
+                  ? {
+                      amountCents:
+                        checkoutDiscountCents,
+                      reason:
+                        checkoutDiscountReason.trim(),
+                    }
+                  : null,
+
+              paidNowCents:
+                checkoutPaidNowCents,
             },
           );
 
@@ -2115,6 +2289,10 @@ export function ReservationComposer() {
 
         setCheckoutReservationId("");
         setCheckoutMedia([]);
+        setCheckoutDamage(null);
+        setCheckoutDiscount("");
+        setCheckoutDiscountReason("");
+        setCheckoutPaidNow("");
         setCustomerSignature(null);
         setSignatureName("");
         setPaymentMethod("");
@@ -2151,7 +2329,28 @@ export function ReservationComposer() {
 
         setShowContract(true);
 
-        return `Vehicle checked out · rental agreement ready to print.`;
+        const paidNote =
+          result.paidNowCents > 0
+            ? ` · ${formatMoney(
+                result.paidNowCents,
+              )} paid`
+            : "";
+
+        const balanceNote =
+          result.outstandingCents > 0
+            ? ` · ${formatMoney(
+                result.outstandingCents,
+              )} balance due on the Payment tab`
+            : " · nothing left to pay";
+
+        const discountNote =
+          result.discountStatus === "pending"
+            ? " · discount waiting for an administrator"
+            : result.discountStatus === "approved"
+              ? " · discount applied"
+              : "";
+
+        return `Vehicle checked out${paidNote}${balanceNote}${discountNote} · rental agreement ready to print.`;
       },
     );
   }
@@ -2320,6 +2519,7 @@ export function ReservationComposer() {
                 | string
                 | null;
               returnMedia: CloudinaryMedia[];
+              damageMarks: DamageMark[];
             },
             {
               outstandingCents: number;
@@ -2376,7 +2576,19 @@ export function ReservationComposer() {
                 null,
 
               returnMedia,
+
+              damageMarks:
+                returnDamageMarks,
             },
+          );
+
+        const newDamage =
+          returnDamageMarks.filter(
+            (mark) =>
+              !returnDamageBaseline.some(
+                (existing) =>
+                  existing.id === mark.id,
+              ),
           );
 
         formElement.reset();
@@ -2384,6 +2596,8 @@ export function ReservationComposer() {
         setReturnMedia(
           [],
         );
+
+        setReturnDamage(null);
 
         setReturnRentalId("");
         setReturnAdjustments({});
@@ -2402,6 +2616,13 @@ export function ReservationComposer() {
          * desk can settle it while the customer is still at
          * the counter.
          */
+        const damageNote =
+          newDamage.length > 0
+            ? ` New damage marked: ${summariseDamage(
+                newDamage,
+              )}.`
+            : "";
+
         if (result.outstandingCents > 0) {
           setPaymentRentalId(returnedRentalId);
 
@@ -2409,10 +2630,10 @@ export function ReservationComposer() {
 
           return `Return completed · ${formatMoney(
             result.outstandingCents,
-          )} outstanding. Take the payment below.`;
+          )} outstanding. Take the payment below.${damageNote}`;
         }
 
-        return `Return completed · nothing left to pay.`;
+        return `Return completed · nothing left to pay.${damageNote}`;
       },
     );
   }
@@ -2919,7 +3140,8 @@ export function ReservationComposer() {
                       <span className="booking-list-confirm">
                         <input
                           aria-label="Reason for cancelling"
-                          placeholder="Reason (optional)"
+                          placeholder="Reason (required)"
+                          required
                           maxLength={500}
                           value={cancelReason}
                           disabled={cancelBusy}
@@ -2936,7 +3158,10 @@ export function ReservationComposer() {
                         <button
                           className="button button-danger compact"
                           type="button"
-                          disabled={cancelBusy}
+                          disabled={
+                            cancelBusy ||
+                            !cancelReason.trim()
+                          }
                           onClick={() =>
                             void cancelBooking(
                               reservation,
@@ -4261,11 +4486,13 @@ export function ReservationComposer() {
                 name="reservationId"
                 required
                 value={checkoutReservationId}
-                onChange={(event) =>
+                onChange={(event) => {
                   setCheckoutReservationId(
                     event.target.value,
-                  )
-                }
+                  );
+
+                  setCheckoutDamage(null);
+                }}
               >
                 <option
                   value=""
@@ -4450,6 +4677,64 @@ export function ReservationComposer() {
 
             </fieldset>
 
+            {/* ------------------------------ discount */}
+            <fieldset className="field full checkout-block">
+              <legend>
+                Discount (optional)
+              </legend>
+
+              <p className="form-help">
+                {isAdmin
+                  ? "Comes straight off what the renter owes."
+                  : "Sent to an administrator to approve. It comes off the balance once approved; until then the renter is charged the full amount."}
+              </p>
+
+              <div className="checkout-charges">
+                <div className="field">
+                  <label htmlFor="checkout-discount">
+                    Discount (USD)
+                  </label>
+
+                  <input
+                    id="checkout-discount"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={checkoutDiscount}
+                    onChange={(event) =>
+                      setCheckoutDiscount(
+                        event.target.value,
+                      )
+                    }
+                  />
+                </div>
+
+                <div className="field">
+                  <label htmlFor="checkout-discount-reason">
+                    Reason
+                    {checkoutDiscountCents > 0
+                      ? " (required)"
+                      : ""}
+                  </label>
+
+                  <input
+                    id="checkout-discount-reason"
+                    maxLength={500}
+                    required={
+                      checkoutDiscountCents > 0
+                    }
+                    placeholder="e.g. Returning customer"
+                    value={checkoutDiscountReason}
+                    onChange={(event) =>
+                      setCheckoutDiscountReason(
+                        event.target.value,
+                      )
+                    }
+                  />
+                </div>
+              </div>
+            </fieldset>
+
             {checkoutReservationQuote && (
               <div className="field full payment-due">
                 <dl>
@@ -4485,6 +4770,22 @@ export function ReservationComposer() {
                     </dd>
                   </div>
 
+                  {checkoutDiscountCents > 0 && (
+                    <div>
+                      <dt>
+                        {isAdmin
+                          ? "Discount"
+                          : "Discount (waiting for approval)"}
+                      </dt>
+                      <dd>
+                        −
+                        {formatMoney(
+                          checkoutDiscountCents,
+                        )}
+                      </dd>
+                    </div>
+                  )}
+
                   <div>
                     <dt>
                       Deposit (refundable)
@@ -4504,6 +4805,26 @@ export function ReservationComposer() {
                       )}
                     </dd>
                   </div>
+
+                  <div>
+                    <dt>Paid now (rental)</dt>
+                    <dd>
+                      {formatMoney(
+                        checkoutPaidNowCents,
+                      )}
+                    </dd>
+                  </div>
+
+                  <div className="payment-due-total">
+                    <dt>
+                      Balance due after checkout
+                    </dt>
+                    <dd>
+                      {formatMoney(
+                        balanceAfterCheckoutCents,
+                      )}
+                    </dd>
+                  </div>
                 </dl>
               </div>
             )}
@@ -4513,6 +4834,15 @@ export function ReservationComposer() {
               <legend>
                 Payment information
               </legend>
+
+              <p className="form-help">
+                Choose how the renter is paying, then
+                enter what they pay now. It is saved
+                as a payment on this rental; anything
+                not paid now stays as the balance due
+                and is collected on the Payment tab.
+                The deposit is recorded on its own.
+              </p>
 
               <div className="checkout-methods">
                 {PAYMENT_METHODS.map(
@@ -4571,6 +4901,48 @@ export function ReservationComposer() {
                     name="paymentCardHolder"
                     autoComplete="off"
                   />
+                </div>
+
+                <div className="field">
+                  <label htmlFor="checkout-paid-now">
+                    Paid now, excluding deposit (USD)
+                  </label>
+
+                  <input
+                    id="checkout-paid-now"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    max={(
+                      checkoutRentalDueCents / 100
+                    ).toFixed(2)}
+                    value={checkoutPaidNow}
+                    onChange={(event) =>
+                      setCheckoutPaidNow(
+                        event.target.value,
+                      )
+                    }
+                  />
+
+                  {checkoutReservationQuote && (
+                    <button
+                      className="text-button"
+                      type="button"
+                      onClick={() =>
+                        setCheckoutPaidNow(
+                          (
+                            checkoutRentalDueCents /
+                            100
+                          ).toFixed(2),
+                        )
+                      }
+                    >
+                      Paid in full ·{" "}
+                      {formatMoney(
+                        checkoutRentalDueCents,
+                      )}
+                    </button>
+                  )}
                 </div>
               </div>
             </fieldset>
@@ -4633,6 +5005,20 @@ export function ReservationComposer() {
                 ))}
               </div>
             </fieldset>
+
+            <div className="field full">
+              <DamageDiagram
+                label="Mark scratches and dents"
+                hint={
+                  checkoutDamageBaseline.length > 0
+                    ? "Damage already recorded on this vehicle is shown. Choose a kind, then tap the drawing where it is; tap a mark to remove it."
+                    : "Choose a kind, then tap the drawing where it is; tap a mark to remove it."
+                }
+                marks={checkoutDamageMarks}
+                onChange={setCheckoutDamage}
+                baseline={checkoutDamageBaseline}
+              />
+            </div>
 
             <div className="field full">
               <MediaCapture
@@ -4882,11 +5268,13 @@ export function ReservationComposer() {
                 name="rentalId"
                 required
                 value={returnRentalId}
-                onChange={(event) =>
+                onChange={(event) => {
                   setReturnRentalId(
                     event.target.value,
-                  )
-                }
+                  );
+
+                  setReturnDamage(null);
+                }}
               >
                 <option
                   value=""
@@ -5197,6 +5585,16 @@ export function ReservationComposer() {
 
               </div>
             </fieldset>
+
+            <div className="field full">
+              <DamageDiagram
+                label="Damage at return"
+                hint="What it went out with is already marked. Mark anything new — it is shown in red — and tap a mark to remove it if it has been put right."
+                marks={returnDamageMarks}
+                onChange={setReturnDamage}
+                baseline={returnDamageBaseline}
+              />
+            </div>
 
             <div className="field full">
               <MediaCapture

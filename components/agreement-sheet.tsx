@@ -11,18 +11,14 @@ import {
 
 import { formatMoney } from "@/lib/presentation";
 
-import type { RentalAgreementView } from "@/lib/services/firestore-client";
+import {
+  DAMAGE_KINDS,
+  DAMAGE_VIEWS,
+  damageKindOf,
+  summariseDamage,
+} from "@/lib/damage";
 
-/*
- * The four views the office marks damage on, in the order and
- * orientation they appear on the paper form.
- */
-const DAMAGE_VIEWS = [
-  { label: "FRONT", src: "/brand/vehicle-diagrams/front.png" },
-  { label: "BACK", src: "/brand/vehicle-diagrams/back.png" },
-  { label: "LEFT", src: "/brand/vehicle-diagrams/left.png" },
-  { label: "RIGHT", src: "/brand/vehicle-diagrams/right.png" },
-] as const;
+import type { RentalAgreementView } from "@/lib/services/firestore-client";
 
 /*
  * The printed rental agreement, laid out to match the form the
@@ -586,21 +582,56 @@ export function AgreementSheet({
 
         <div className="sheet-diagrams">
           <span className="sheet-field-label">
-            Vehicle damage &mdash; mark any existing
-            damage on the diagrams
+            Vehicle damage at checkout &mdash;{" "}
+            {agreement.damageMarks.length > 0
+              ? summariseDamage(
+                  agreement.damageMarks,
+                ).toLowerCase()
+              : "mark any existing damage on the diagrams"}
           </span>
 
           <div className="sheet-diagram-grid">
             {DAMAGE_VIEWS.map((view) => (
               <figure
                 key={view.label}
-                className={`sheet-diagram sheet-diagram-${view.label.toLowerCase()}`}
+                className={`sheet-diagram sheet-diagram-${view.view}`}
               >
-                <img src={view.src} alt="" />
+                <div className="sheet-diagram-canvas">
+                  <img src={view.src} alt="" />
+
+                  {agreement.damageMarks
+                    .filter(
+                      (mark) =>
+                        mark.view === view.view,
+                    )
+                    .map((mark) => (
+                      <span
+                        key={mark.id}
+                        className={`damage-pin damage-pin-${mark.kind} is-placed`}
+                        style={{
+                          left: `${mark.x * 100}%`,
+                          top: `${mark.y * 100}%`,
+                        }}
+                      >
+                        {
+                          damageKindOf(mark.kind)
+                            .letter
+                        }
+                      </span>
+                    ))}
+                </div>
+
                 <figcaption>{view.label}</figcaption>
               </figure>
             ))}
           </div>
+
+          <p className="sheet-damage-key">
+            {DAMAGE_KINDS.map(
+              (entry) =>
+                `${entry.letter} = ${entry.label}`,
+            ).join("   ·   ")}
+          </p>
         </div>
 
         {agreement.media.length > 0 && (

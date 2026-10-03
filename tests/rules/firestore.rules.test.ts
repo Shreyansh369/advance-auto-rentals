@@ -175,6 +175,30 @@ describe("Firestore access policy", () => {
     await assertSucceeds(setDoc(doc(db, "rentals", "rental_001"), { status: "active" }));
   });
 
+  it("only cancels a booking that says why", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(setDoc(doc(db, "reservations", "reservation_cancel"), { status: "confirmed" }));
+    await assertFails(
+      updateDoc(doc(db, "reservations", "reservation_cancel"), {
+        status: "cancelled",
+        cancellationReason: null,
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(db, "reservations", "reservation_cancel"), {
+        status: "cancelled",
+        cancellationReason: "   ",
+      }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(db, "reservations", "reservation_cancel"), {
+        status: "cancelled",
+        cancellationReason: "Customer changed their travel dates",
+      }),
+    );
+  });
+
   it("keeps profit reporting away from operations staff", async () => {
     const db = asUser(OPS);
 
