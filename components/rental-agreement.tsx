@@ -22,6 +22,8 @@ import { useFirebaseAuth } from "./firebase-provider";
 
 import { AgreementSheet } from "./agreement-sheet";
 
+import { DamageDiagram } from "./damage-diagram";
+
 import {
   LicenceImage,
   MediaGrid,
@@ -637,23 +639,48 @@ export function RentalAgreement({
             )}
 
             {activeView === "checkout" && (
-              <MediaGrid
-                items={
-                  documents?.checkoutMedia ??
-                  []
-                }
-                emptyMessage="No condition photographs were taken at checkout."
-              />
+              <>
+                {agreement && (
+                  <DamageDiagram
+                    label="Damage marked at checkout"
+                    marks={agreement.damageMarks}
+                  />
+                )}
+
+                <MediaGrid
+                  items={
+                    documents?.checkoutMedia ??
+                    []
+                  }
+                  emptyMessage="No condition photographs were taken at checkout."
+                />
+              </>
             )}
 
             {activeView === "return" && (
-              <MediaGrid
-                items={
-                  documents?.returnMedia ??
-                  []
-                }
-                emptyMessage="No condition photographs were taken at return. They are captured when the rental is closed."
-              />
+              <>
+                {/* New damage is drawn in red against
+                    what the vehicle went out with. */}
+                {agreement?.returnDamageMarks && (
+                  <DamageDiagram
+                    label="Damage marked at return"
+                    marks={
+                      agreement.returnDamageMarks
+                    }
+                    baseline={
+                      agreement.damageMarks
+                    }
+                  />
+                )}
+
+                <MediaGrid
+                  items={
+                    documents?.returnMedia ??
+                    []
+                  }
+                  emptyMessage="No condition photographs were taken at return. They are captured when the rental is closed."
+                />
+              </>
             )}
           </section>
         )}

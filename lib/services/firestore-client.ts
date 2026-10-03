@@ -27,6 +27,10 @@ import type {
 } from "@/packages/domain/src/types";
 import { isValidVehicleTransition } from "@/packages/domain/src/lifecycle";
 import { pickupWindowError } from "@/packages/domain/src/booking";
+import {
+  sanitizeDamageMarks,
+  type DamageMark,
+} from "@/lib/damage";
 
 /* =========================================================
    Shared types
@@ -2028,6 +2032,10 @@ export type RentalAgreementView = {
   additionalDriverSignatureDataUrl: string | null;
   additionalDriverSignatureName: string | null;
   media: Array<Record<string, unknown>>;
+  /* Marked on the drawings when the vehicle went out. */
+  damageMarks: DamageMark[];
+  /* As it came back; null until the vehicle is returned. */
+  returnDamageMarks: DamageMark[] | null;
 };
 
 function fuelToGas(
@@ -2337,6 +2345,18 @@ async function getRentalAgreement(
     media: sanitizeMediaList(
       rental.checkoutMedia,
     ) as Array<Record<string, unknown>>,
+
+    damageMarks: sanitizeDamageMarks(
+      rental.checkoutDamageMarks,
+    ),
+
+    returnDamageMarks: Array.isArray(
+      rental.returnDamageMarks,
+    )
+      ? sanitizeDamageMarks(
+          rental.returnDamageMarks,
+        )
+      : null,
   };
 }
 
@@ -2742,7 +2762,7 @@ async function createReservation(
 async function cancelReservation(
   input: {
     reservationId: string;
-    reason: string | null;
+    reason: string;
   },
 ): Promise<{
   reservationId: string;
@@ -2764,7 +2784,17 @@ async function cancelReservation(
 
   const reason = trimmedOrNull(input.reason);
 
-  if (reason && reason.length > 500) {
+  /*
+   * The cancelled list says why each booking was released, so
+   * a cancellation without a reason is refused.
+   */
+  if (!reason) {
+    throw new Error(
+      "Give a reason for cancelling this booking.",
+    );
+  }
+
+  if (reason.length > 500) {
     throw new Error(
       "Keep the cancellation reason under 500 characters.",
     );
@@ -3107,6 +3137,11 @@ function approvedAgreementSnapshot(
     checkedOutBy: String(
       rental.checkedOutByNameSnapshot ?? "",
     ),
+
+    /* What the renter signed for, drawn on the outlines. */
+    damageMarks: sanitizeDamageMarks(
+      rental.checkoutDamageMarks,
+    ),
   };
 }
 
@@ -3319,9 +3354,29 @@ async function checkoutReservation(
     };
     notes: string | null;
     checkoutMedia?: Array<Record<string, unknown>>;
+    /* Scratches, dents and the rest, marked on the drawings. */
+    damageMarks?: unknown;
+    /*
+     * A discount offered at the counter. An administrator's
+     * comes off the balance at once; anyone else's waits for
+     * an administrator, exactly as it does on the Payment tab.
+     */
+    discount?: {
+      amountCents: number;
+      reason: string;
+    } | null;
+    /*
+     * Money taken at the counter towards the rental, by the
+     * method chosen on the agreement. Whatever is not taken
+     * stays on the rental as its balance due.
+     */
+    paidNowCents?: number | null;
   } & Partial<AgreementInput>,
 ): Promise<{
   rentalId: string;
+  outstandingCents: number;
+  discountStatus: DiscountStatus | null;
+  paidNowCents: number;
 }> {
   const { db } =
     getFirebaseClient();
@@ -3368,6 +3423,63 @@ async function checkoutReservation(
     input.checkoutMedia,
   );
 
+  const damageMarks = sanitizeDamageMarks(
+    input.damageMarks,
+    { strict: true },
+  );
+
+  const discountCents = assertMoneyCents(
+    input.discount?.amountCents ?? 0,
+    "Discount amount",
+  );
+
+  const discountReason = trimmedOrNull(
+    input.discount?.reason,
+  );
+
+  if (discountCents > 0 && !discountReason) {
+    throw new Error(
+      "Say why the discount is being offered.",
+    );
+  }
+
+  if (
+    discountReason &&
+    discountReason.length > 500
+  ) {
+    throw new Error(
+      "Keep the discount reason under 500 characters.",
+    );
+  }
+
+  const paidNowCents = assertMoneyCents(
+    input.paidNowCents ?? 0,
+    "Amount paid now",
+  );
+
+  /*
+   * The agreement's own Cash / Check / Credit card choice is
+   * how the money was taken, so a payment needs one.
+   */
+  const paidNowMethod = (() => {
+    switch (agreement.paymentMethod) {
+      case "cash":
+        return "cash";
+      case "check":
+        return "check";
+      case "credit":
+        return "card";
+      default:
+        return null;
+    }
+  })();
+
+  if (paidNowCents > 0 && !paidNowMethod) {
+    throw new Error(
+      "Choose how the renter is paying — cash, check or credit card — before recording the amount paid now.",
+    );
+  }
+
   /*
    * The employee may record the odometer in kilometres or
    * miles. Only the converted kilometre value is treated as
@@ -3402,6 +3514,19 @@ async function checkoutReservation(
         "rentals",
       ),
     );
+
+  const discountRef = doc(
+    collection(db, "rentalDiscounts"),
+  );
+
+  const paymentRef = doc(
+    collection(db, "payments"),
+  );
+
+  let outstandingAfterCheckout = 0;
+
+  let discountStatus: DiscountStatus | null =
+    null;
 
   await runTransaction(
     db,
@@ -3451,6 +3576,14 @@ async function checkoutReservation(
           actorUid,
         );
 
+      const actor =
+        discountCents > 0
+          ? await actorProfileSnapshot(
+              transaction,
+              actorUid,
+            )
+          : null;
+
       if (
         !vehicleSnapshot.exists()
       ) {
@@ -3492,6 +3625,63 @@ async function checkoutReservation(
           rentalRef.id,
         );
 
+      const owedBeforeDiscountCents =
+        baseRentalCents +
+        agreementAdjustmentCents;
+
+      /*
+       * A discount can only forgive what is owed, and the
+       * money taken now cannot be more than is left once it
+       * is applied — a waiting discount included, or its
+       * approval would find nothing left to forgive.
+       */
+      if (
+        discountCents >
+        owedBeforeDiscountCents
+      ) {
+        throw new Error(
+          `The discount is more than the ${formatCents(
+            owedBeforeDiscountCents,
+          )} owed on this rental.`,
+        );
+      }
+
+      if (
+        paidNowCents >
+        owedBeforeDiscountCents -
+          discountCents
+      ) {
+        throw new Error(
+          `The amount paid now is more than the ${formatCents(
+            owedBeforeDiscountCents -
+              discountCents,
+          )} owed on this rental. The deposit is recorded separately.`,
+        );
+      }
+
+      discountStatus =
+        discountCents > 0
+          ? actor?.role === "admin"
+            ? "approved"
+            : "pending"
+          : null;
+
+      const appliedDiscountCents =
+        discountStatus === "approved"
+          ? discountCents
+          : 0;
+
+      const openingAdjustmentCents =
+        agreementAdjustmentCents -
+        appliedDiscountCents;
+
+      const openingTotalCents =
+        baseRentalCents +
+        openingAdjustmentCents;
+
+      outstandingAfterCheckout =
+        openingTotalCents - paidNowCents;
+
       transaction.set(
         rentalRef,
         {
@@ -3521,6 +3711,9 @@ async function checkoutReservation(
           agreement,
 
           checkoutMedia,
+
+          checkoutDamageMarks:
+            damageMarks,
 
           actualReturnAt:
             null,
@@ -3578,13 +3771,12 @@ async function checkoutReservation(
            * and then forgotten by the till.
            */
           adjustmentCents:
-            agreementAdjustmentCents,
+            openingAdjustmentCents,
 
           totalCents:
-            baseRentalCents +
-            agreementAdjustmentCents,
+            openingTotalCents,
 
-          paidCents: 0,
+          paidCents: paidNowCents,
 
           refundedCents: 0,
 
@@ -3608,8 +3800,7 @@ async function checkoutReservation(
             0,
 
           outstandingCents:
-            baseRentalCents +
-            agreementAdjustmentCents,
+            outstandingAfterCheckout,
 
           currency:
             "USD",
@@ -3636,11 +3827,21 @@ async function checkoutReservation(
         },
       );
 
+      /*
+       * The vehicle carries its damage from one hire to the
+       * next, so the next checkout starts from what this one
+       * recorded.
+       */
       transaction.update(
         vehicleRef,
         {
           status:
             "rented",
+
+          damageMarks,
+
+          damageUpdatedAt:
+            nowTimestamp(),
 
           updatedAt:
             nowTimestamp(),
@@ -3736,12 +3937,163 @@ async function checkoutReservation(
           },
         );
       }
+
+      if (discountStatus && actor) {
+        transaction.set(discountRef, {
+          rentalId: rentalRef.id,
+          customerNameSnapshot: String(
+            reservation.customerNameSnapshot ??
+              "",
+          ),
+          vehicleRegistrationSnapshot:
+            vehicleRegistration,
+          amountCents: discountCents,
+          reason: discountReason,
+          status: discountStatus,
+          offeredAt: "checkout",
+          requestedBy: actorUid,
+          requestedByNameSnapshot: actor.name,
+          requestedAt: nowTimestamp(),
+
+          /* An administrator's own discount is its own approval. */
+          reviewedBy:
+            discountStatus === "approved"
+              ? actorUid
+              : null,
+          reviewedByNameSnapshot:
+            discountStatus === "approved"
+              ? actor.name
+              : null,
+          reviewedAt:
+            discountStatus === "approved"
+              ? nowTimestamp()
+              : null,
+          reviewNote: null,
+          updatedAt: nowTimestamp(),
+        });
+
+        if (discountStatus === "approved") {
+          transaction.set(
+            doc(
+              collection(
+                db,
+                "financialLedger",
+              ),
+            ),
+            {
+              rentalId: rentalRef.id,
+              vehicleId: String(
+                reservation.vehicleId,
+              ),
+              vehicleRegistration,
+              customerId: String(
+                reservation.customerId,
+              ),
+              entryType: "rental_discount",
+              adjustmentType: "discount",
+              amountCents: -discountCents,
+              discountId: discountRef.id,
+              note: discountReason,
+              occurredAt: nowTimestamp(),
+              recordedBy: actorUid,
+            },
+          );
+        }
+
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action:
+              discountStatus === "approved"
+                ? "discount.applied"
+                : "discount.requested",
+            resource: {
+              collection: "rentalDiscounts",
+              id: discountRef.id,
+            },
+            details: {
+              rentalId: rentalRef.id,
+              amountCents: discountCents,
+              offeredAt: "checkout",
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
+      }
+
+      if (paidNowCents > 0) {
+        transaction.set(paymentRef, {
+          rentalId: rentalRef.id,
+
+          amountCents: paidNowCents,
+
+          additionalFees: [],
+
+          method: paidNowMethod,
+
+          externalReference:
+            agreement.paymentReferenceLast4
+              ? `Ending ${String(
+                  agreement.paymentReferenceLast4,
+                )}`
+              : null,
+
+          /* The checkout itself can only happen once. */
+          idempotencyKey: `checkout_${rentalRef.id}`,
+
+          takenAt: "checkout",
+
+          recordedBy: actorUid,
+
+          occurredAt: nowTimestamp(),
+        });
+
+        transaction.set(
+          doc(
+            collection(
+              db,
+              "financialLedger",
+            ),
+          ),
+          {
+            rentalId: rentalRef.id,
+
+            vehicleId: String(
+              reservation.vehicleId,
+            ),
+
+            vehicleRegistration,
+
+            customerId: String(
+              reservation.customerId,
+            ),
+
+            entryType: "payment",
+
+            amountCents: paidNowCents,
+
+            paymentId: paymentRef.id,
+
+            occurredAt: nowTimestamp(),
+
+            recordedBy: actorUid,
+          },
+        );
+      }
     },
   );
 
   return {
     rentalId:
       rentalRef.id,
+
+    outstandingCents:
+      outstandingAfterCheckout,
+
+    discountStatus,
+
+    paidNowCents,
   };
 }
 
@@ -4137,6 +4489,12 @@ async function returnRental(
     extraHours?: number | null;
     notes: string | null;
     returnMedia: Array<Record<string, unknown>>;
+    /*
+     * The damage on the vehicle as it came back: what it went
+     * out with, less anything found to be wrong, plus anything
+     * new. Left out, the checkout's marks stand.
+     */
+    damageMarks?: unknown;
   },
 ): Promise<{
   outstandingCents: number;
@@ -4171,6 +4529,14 @@ async function returnRental(
     sanitizeMediaList(
       input.returnMedia,
     );
+
+  const returnDamageMarks =
+    input.damageMarks === undefined
+      ? null
+      : sanitizeDamageMarks(
+          input.damageMarks,
+          { strict: true },
+        );
 
   const adjustments =
     (Array.isArray(
@@ -4481,6 +4847,20 @@ async function returnRental(
             "",
         );
 
+      const checkoutDamage =
+        sanitizeDamageMarks(
+          rental.checkoutDamageMarks,
+        );
+
+      const checkoutDamageIds = new Set(
+        checkoutDamage.map(
+          (mark) => mark.id,
+        ),
+      );
+
+      const damageAtReturn: DamageMark[] =
+        returnDamageMarks ?? checkoutDamage;
+
       /*
        * Every value below is explicitly defined or null.
        * Firestore rejects an undefined field outright, which
@@ -4508,6 +4888,17 @@ async function returnRental(
           returnNotes,
 
           returnMedia,
+
+          returnDamageMarks:
+            damageAtReturn,
+
+          newDamageCount:
+            damageAtReturn.filter(
+              (mark) =>
+                !checkoutDamageIds.has(
+                  mark.id,
+                ),
+            ).length,
 
           adjustments,
 
@@ -4593,6 +4984,12 @@ async function returnRental(
 
           statusNote:
             "Awaiting cleaning and detailing after return.",
+
+          damageMarks:
+            damageAtReturn,
+
+          damageUpdatedAt:
+            nowTimestamp(),
 
           updatedAt:
             nowTimestamp(),
@@ -6494,6 +6891,80 @@ async function changeVehicleStatus(
 /* =========================================================
    Vehicle expense
    ========================================================= */
+
+/*
+ * The damage the vehicle carries between hires. Checkout and
+ * return keep it up to date on their own; this is for the
+ * fleet screen, where a repair is cleared or damage found in
+ * the yard is marked.
+ */
+async function updateVehicleDamage(
+  input: {
+    vehicleId: string;
+    damageMarks: unknown;
+  },
+): Promise<{
+  damageMarks: DamageMark[];
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const vehicleId = trimmedOrNull(
+    input.vehicleId,
+  );
+
+  if (!vehicleId) {
+    throw new Error(
+      "Select the vehicle to update.",
+    );
+  }
+
+  const damageMarks = sanitizeDamageMarks(
+    input.damageMarks,
+    { strict: true },
+  );
+
+  const vehicleRef = doc(
+    db,
+    "vehicles",
+    vehicleId,
+  );
+
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(
+      vehicleRef,
+    );
+
+    if (!snapshot.exists()) {
+      throw new Error("Vehicle was not found.");
+    }
+
+    transaction.update(vehicleRef, {
+      damageMarks,
+      damageUpdatedAt: nowTimestamp(),
+      updatedAt: nowTimestamp(),
+    });
+
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+        action: "vehicle.damage_updated",
+        resource: {
+          collection: "vehicles",
+          id: vehicleId,
+        },
+        details: {
+          marks: damageMarks.length,
+        },
+        createdAt: nowTimestamp(),
+      },
+    );
+  });
+
+  return { damageMarks };
+}
 
 async function recordVehicleExpense(
   input: {
@@ -10122,12 +10593,22 @@ export async function callFirestoreOperation<
         )) as TResult
       );
 
+    case "updateVehicleDamage":
+      return (
+        (await updateVehicleDamage(
+          data as {
+            vehicleId: string;
+            damageMarks: unknown;
+          },
+        )) as TResult
+      );
+
     case "cancelReservation":
       return (
         (await cancelReservation(
           data as {
             reservationId: string;
-            reason: string | null;
+            reason: string;
           },
         )) as TResult
       );

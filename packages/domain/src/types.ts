@@ -77,6 +77,8 @@ export interface VehicleDocument {
   notes: string | null;
   photoPaths: string[];
   photos?: VehiclePhoto[];
+  /* Scratches, dents and the rest it carries between hires. */
+  damageMarks?: unknown;
   createdAt: unknown;
   updatedAt: unknown;
 }

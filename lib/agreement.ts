@@ -123,7 +123,9 @@ export type ChargeKey =
 export const PAYMENT_METHODS = [
   { value: "cash", label: "Cash" },
   { value: "check", label: "Check" },
-  { value: "credit", label: "Credit" },
+  /* A credit card — not "on credit". The money is still
+     taken at the counter or later on the Payment tab. */
+  { value: "credit", label: "Credit card" },
 ] as const;
 
 export type AgreementPaymentMethod =
