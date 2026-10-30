@@ -127,7 +127,8 @@ type DocumentView =
   | "licence"
   | "booking"
   | "checkout"
-  | "return";
+  | "return"
+  | "requests";
 
 /*
  * The agreement is rebuilt from the stored booking every time
@@ -492,6 +493,17 @@ export function RentalAgreement({
           },
         ]
       : []),
+
+    ...(documents &&
+    documents.requests.length > 0
+      ? [
+          {
+            id: "requests" as const,
+            label: "Requests",
+            count: documents.requests.length,
+          },
+        ]
+      : []),
   ];
 
   /*
@@ -681,6 +693,68 @@ export function RentalAgreement({
                   emptyMessage="No condition photographs were taken at return. They are captured when the rental is closed."
                 />
               </>
+            )}
+
+            {/* Approvals asked for on this hire and how each ended. */}
+            {activeView === "requests" && (
+              <ul className="receipt-lines">
+                {(documents?.requests ?? []).map(
+                  (request) => (
+                    <li key={request.id}>
+                      <span>
+                        <strong>
+                          {request.summary}
+                          {" · "}
+                          {request.status ===
+                          "pending"
+                            ? "Waiting for approval"
+                            : request.status
+                                .charAt(0)
+                                .toUpperCase() +
+                              request.status.slice(
+                                1,
+                              )}
+                        </strong>
+
+                        <small>
+                          {request.reason
+                            ? `“${request.reason}” · `
+                            : ""}
+                          asked by{" "}
+                          {request.requestedByName ||
+                            "staff"}
+                          {request.requestedAt
+                            ? ` · ${new Date(
+                                request.requestedAt,
+                              ).toLocaleString(
+                                "en-US",
+                              )}`
+                            : ""}
+                        </small>
+
+                        {request.reviewedByName && (
+                          <small>
+                            Decided by{" "}
+                            {
+                              request.reviewedByName
+                            }
+                            {request.reviewedAt
+                              ? ` · ${new Date(
+                                  request.reviewedAt,
+                                ).toLocaleString(
+                                  "en-US",
+                                )}`
+                              : ""}
+                            {request.reviewNote
+                              ? ` · “${request.reviewNote}”`
+                              : ""}
+                          </small>
+                        )}
+                      </span>
+                    </li>
+                  ),
+                )}
+              </ul>
             )}
           </section>
         )}

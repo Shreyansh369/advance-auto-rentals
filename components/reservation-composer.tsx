@@ -73,6 +73,7 @@ import {
   type ContractQueueEntry,
   type PayableRental,
   type RentalDiscount,
+  type ReturnRequest,
 } from "@/lib/services/firestore-client";
 
 import { rentOwedThrough } from "@/packages/domain/src/pricing";
@@ -155,6 +156,13 @@ type Rental = {
   /** Taken at the counter and owed back at return. */
   depositCents: number;
   status: string;
+  /*
+   * The earliest a return can be dated: the booked pickup, or
+   * the checkout if the vehicle was collected before it.
+   */
+  returnFloorAt: string | null;
+  /* A backdated return waiting on, or last refused by, an administrator. */
+  returnRequestStatus: string | null;
 };
 
 const tabs: Array<{
@@ -468,6 +476,53 @@ function tomorrowDate(): string {
     .slice(0, 10);
 }
 
+/* An instant as a datetime-local value, rounded up to the minute. */
+function localInputValue(
+  iso: string | null,
+): string | undefined {
+  if (!iso) {
+    return undefined;
+  }
+
+  const value = new Date(
+    Math.ceil(Date.parse(iso) / 60_000) *
+      60_000,
+  );
+
+  if (Number.isNaN(value.valueOf())) {
+    return undefined;
+  }
+
+  value.setMinutes(
+    value.getMinutes() -
+      value.getTimezoneOffset(),
+  );
+
+  return value.toISOString().slice(0, 16);
+}
+
+/*
+ * A return dated more than fifteen minutes before it is entered
+ * is backdated: it needs a reason, and an administrator's
+ * approval unless an administrator enters it.
+ */
+const BACKDATED_RETURN_MS = 15 * 60_000;
+
+function isBackdatedReturn(
+  localValue: string | null,
+): boolean {
+  if (!localValue) {
+    return false;
+  }
+
+  const at = new Date(localValue).getTime();
+
+  return (
+    Number.isFinite(at) &&
+    at < Date.now() - BACKDATED_RETURN_MS
+  );
+}
+
 function toDateTimeInput(
   value: unknown,
 ): string | null {
@@ -644,6 +699,28 @@ export function ReservationComposer() {
     cancellationNotes,
     setCancellationNotes,
   ] = useState<Record<string, string>>({});
+
+  /*
+   * Backdated returns waiting for an administrator, and this
+   * person's own, so a rejection reaches whoever asked.
+   */
+  const [returnRequests, setReturnRequests] =
+    useState<ReturnRequest[]>([]);
+
+  const [
+    returnRequestNotes,
+    setReturnRequestNotes,
+  ] = useState<Record<string, string>>({});
+
+  /*
+   * The return time once it has been changed from the default
+   * of now, which is what decides whether it is backdated.
+   */
+  const [returnTimeEdited, setReturnTimeEdited] =
+    useState<string | null>(null);
+
+  const [backdatedReason, setBackdatedReason] =
+    useState("");
 
   const [bookingMedia, setBookingMedia] =
     useState<CloudinaryMedia[]>([]);
@@ -1238,6 +1315,29 @@ export function ReservationComposer() {
               snapshot.get(
                 "status",
               ),
+            returnFloorAt: (() => {
+              const pickup = toDateTimeInput(
+                snapshot.get("pickupAt"),
+              );
+
+              const checkedOut =
+                toDateTimeInput(
+                  snapshot.get("createdAt"),
+                );
+
+              return pickup && checkedOut
+                ? new Date(
+                    Math.min(
+                      Date.parse(pickup),
+                      Date.parse(checkedOut),
+                    ),
+                  ).toISOString()
+                : pickup ?? checkedOut;
+            })(),
+            returnRequestStatus:
+              snapshot.get(
+                "returnRequestStatus",
+              ) ?? null,
           }),
         ),
       );
@@ -1368,6 +1468,24 @@ export function ReservationComposer() {
     }
   }
 
+  async function loadReturnRequests() {
+    try {
+      setReturnRequests(
+        await callFirestoreOperation<
+          undefined,
+          ReturnRequest[]
+        >("listReturnRequests", undefined),
+      );
+    } catch (cause) {
+      console.error(
+        "[ReservationComposer] loadReturnRequests failed:",
+        cause,
+      );
+
+      setReturnRequests([]);
+    }
+  }
+
   useEffect(() => {
     const timer =
       window.setTimeout(
@@ -1376,6 +1494,7 @@ export function ReservationComposer() {
           void loadPayableRentals();
           void loadContractQueue();
           void loadCancellationRequests();
+          void loadReturnRequests();
         },
         0,
       );
@@ -1431,6 +1550,7 @@ export function ReservationComposer() {
       await load();
       await loadPayableRentals();
       await loadCancellationRequests();
+      await loadReturnRequests();
     } catch (cause) {
       setError(
         firebaseErrorMessage(
@@ -2579,8 +2699,24 @@ export function ReservationComposer() {
       form.get("rentalId") ?? "",
     );
 
+    const returnIsBackdated =
+      isBackdatedReturn(
+        String(
+          form.get("actualReturnAt") ?? "",
+        ),
+      );
+
     void run(
       async () => {
+        if (
+          returnIsBackdated &&
+          !backdatedReason.trim()
+        ) {
+          throw new Error(
+            "Say why the return is being recorded at an earlier time.",
+          );
+        }
+
         /*
          * Every charge raised at return in one submission:
          * an extension, the cleaning and a tank of fuel are
@@ -2658,9 +2794,11 @@ export function ReservationComposer() {
                 | null;
               returnMedia: CloudinaryMedia[];
               damageMarks: DamageMark[];
+              reason: string | null;
             },
             {
               outstandingCents: number;
+              status: "returned" | "pending";
             }
           >(
             "returnRental",
@@ -2724,6 +2862,10 @@ export function ReservationComposer() {
 
               damageMarks:
                 returnDamageMarks,
+
+              reason: returnIsBackdated
+                ? backdatedReason.trim()
+                : null,
             },
           );
 
@@ -2748,6 +2890,8 @@ export function ReservationComposer() {
         setReturnAdjustments({});
         setReturnAdjustmentNotes({});
         setReturnExtraHours("0");
+        setReturnTimeEdited(null);
+        setBackdatedReason("");
 
         setWaivers({
           liabilityWaiver: false,
@@ -2768,6 +2912,14 @@ export function ReservationComposer() {
               )}.`
             : "";
 
+        /*
+         * Held for an administrator: the rental stays open and
+         * the vehicle stays rented until it is decided.
+         */
+        if (result.status === "pending") {
+          return "Backdated return sent to an administrator for approval. The rental stays open until it is decided.";
+        }
+
         if (result.outstandingCents > 0) {
           setPaymentRentalId(returnedRentalId);
 
@@ -2782,6 +2934,83 @@ export function ReservationComposer() {
       },
     );
   }
+
+  function decideReturn(
+    request: ReturnRequest,
+    decision: "approve" | "reject",
+  ) {
+    void run(async () => {
+      const result =
+        await callFirestoreOperation<
+          {
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+          {
+            status: string;
+            rentalId: string;
+            outstandingCents: number | null;
+          }
+        >("reviewReturnRequest", {
+          requestId: request.id,
+          decision,
+          note:
+            returnRequestNotes[request.id]?.trim() ||
+            null,
+        });
+
+      setReturnRequestNotes((current) => {
+        const next = { ...current };
+
+        delete next[request.id];
+
+        return next;
+      });
+
+      if (result.status !== "approved") {
+        return `Backdated return for ${request.vehicleRegistration} rejected · the rental stays open.`;
+      }
+
+      /*
+       * Exactly as a return at the counter: a balance left
+       * over goes straight to the payment tab.
+       */
+      if ((result.outstandingCents ?? 0) > 0) {
+        setPaymentRentalId(result.rentalId);
+
+        setTab("payment");
+
+        return `Backdated return approved · ${formatMoney(
+          result.outstandingCents ?? 0,
+        )} outstanding. Take the payment below.`;
+      }
+
+      return "Backdated return approved · nothing left to pay.";
+    });
+  }
+
+  const waitingReturns = returnRequests.filter(
+    (request) => request.status === "pending",
+  );
+
+  /* The latest refusal of a backdated return, while the rental is still out. */
+  const rejectedReturn =
+    returnRental?.returnRequestStatus ===
+    "rejected"
+      ? returnRequests.find(
+          (request) =>
+            request.rentalId === returnRental.id &&
+            request.status === "rejected",
+        )
+      : undefined;
+
+  const returnWaiting =
+    returnRental?.returnRequestStatus ===
+    "pending";
+
+  const returnTimeBackdated =
+    isBackdatedReturn(returnTimeEdited);
 
   function recordPayment(
     event: React.FormEvent<HTMLFormElement>,
@@ -5528,6 +5757,112 @@ export function ReservationComposer() {
           </form>
         )}
 
+        {tab === "return" &&
+          isAdmin &&
+          waitingReturns.length > 0 && (
+            <fieldset className="field full checkout-block">
+              <legend>
+                Backdated returns waiting for your
+                approval
+              </legend>
+
+              {waitingReturns.map((request) => (
+                <div
+                  className="discount-request"
+                  key={request.id}
+                >
+                  <p>
+                    <strong>
+                      {request.vehicleRegistration}
+                    </strong>
+                    {" · "}
+                    {request.customerName}
+                  </p>
+
+                  <p className="form-help">
+                    Returned{" "}
+                    <strong>
+                      {formatDate(
+                        request.requestedReturnAt,
+                        {
+                          hour: "numeric",
+                          minute: "2-digit",
+                        },
+                      )}
+                    </strong>
+                    {" · entered "}
+                    {formatDate(request.enteredAt, {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })}
+                    {" by "}
+                    {request.requestedByName ||
+                      "staff"}
+                  </p>
+
+                  <p className="form-help">
+                    “{request.reason}”
+                  </p>
+
+                  <input
+                    aria-label="Decision note"
+                    placeholder="Note (required to reject)"
+                    maxLength={1000}
+                    value={
+                      returnRequestNotes[
+                        request.id
+                      ] ?? ""
+                    }
+                    onChange={(event) =>
+                      setReturnRequestNotes(
+                        (current) => ({
+                          ...current,
+                          [request.id]:
+                            event.target.value,
+                        }),
+                      )
+                    }
+                  />
+
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      disabled={busy}
+                      onClick={() =>
+                        decideReturn(
+                          request,
+                          "approve",
+                        )
+                      }
+                    >
+                      Approve
+                    </button>
+
+                    <button
+                      type="button"
+                      className="button"
+                      disabled={
+                        busy ||
+                        !returnRequestNotes[
+                          request.id
+                        ]?.trim()
+                      }
+                      onClick={() =>
+                        decideReturn(
+                          request,
+                          "reject",
+                        )
+                      }
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </fieldset>
+          )}
+
         {tab ===
           "return" && (
           <form
@@ -5599,10 +5934,38 @@ export function ReservationComposer() {
                       "overdue"
                         ? " · OVERDUE"
                         : ""}
+                      {rental.returnRequestStatus ===
+                      "pending"
+                        ? " · BACKDATED RETURN WAITING"
+                        : ""}
                     </option>
                   ),
                 )}
               </select>
+
+              {returnWaiting && (
+                <p className="form-help">
+                  <span className="status-pill cleaning">
+                    Backdated return waiting for
+                    approval
+                  </span>{" "}
+                  The rental stays open until an
+                  administrator decides it, and it
+                  cannot be returned again meanwhile.
+                </p>
+              )}
+
+              {!returnWaiting && rejectedReturn && (
+                <p className="form-help">
+                  Backdated return rejected
+                  {rejectedReturn.reviewedByName
+                    ? ` by ${rejectedReturn.reviewedByName}`
+                    : ""}
+                  {rejectedReturn.reviewNote
+                    ? ` · “${rejectedReturn.reviewNote}”`
+                    : ""}
+                </p>
+              )}
             </div>
 
             <div className="field">
@@ -5610,14 +5973,59 @@ export function ReservationComposer() {
                 Return time
               </label>
 
+              {/*
+                * Any time from when the vehicle went out up to
+                * now. More than fifteen minutes back is a
+                * backdated return, which needs a reason.
+                */}
               <input
                 id="return-time"
                 name="actualReturnAt"
                 type="datetime-local"
                 defaultValue={todayDateTime()}
+                min={localInputValue(
+                  returnRental?.returnFloorAt ??
+                    null,
+                )}
+                max={todayDateTime()}
+                onChange={(event) =>
+                  setReturnTimeEdited(
+                    event.target.value,
+                  )
+                }
                 required
               />
+
+              {returnTimeBackdated && (
+                <p className="form-help">
+                  {isAdmin
+                    ? "Backdated return: recorded at once, with the reason below."
+                    : "Backdated return: it is sent to an administrator for approval, and the rental stays open until then."}
+                </p>
+              )}
             </div>
+
+            {returnTimeBackdated && (
+              <div className="field full">
+                <label htmlFor="backdated-reason">
+                  Reason for the earlier return
+                  time (required)
+                </label>
+
+                <input
+                  id="backdated-reason"
+                  maxLength={500}
+                  required
+                  placeholder="e.g. Returned after hours, keys left in the drop box"
+                  value={backdatedReason}
+                  onChange={(event) =>
+                    setBackdatedReason(
+                      event.target.value,
+                    )
+                  }
+                />
+              </div>
+            )}
 
             <div className="field">
               <label htmlFor="return-odometer">
@@ -5926,10 +6334,13 @@ export function ReservationComposer() {
                 className="button button-primary"
                 disabled={
                   busy ||
-                  !rentals.length
+                  !rentals.length ||
+                  returnWaiting
                 }
               >
-                Complete return
+                {returnTimeBackdated && !isAdmin
+                  ? "Send for approval"
+                  : "Complete return"}
               </button>
             </div>
           </form>

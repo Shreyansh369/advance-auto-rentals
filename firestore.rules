@@ -472,6 +472,83 @@ allow list: if isAdmin();
         && resource.data.get("status", null) != "returned";
     }
 
+    /* The return time sits between the vehicle going out —
+       the booked pickup, or the checkout if it was collected
+       early — and now (five minutes allowed for a browser
+       clock running fast). A return more than fifteen minutes
+       in the past is backdated, and only an administrator
+       writes one directly; anyone else's goes through a
+       returnRequests approval. One minute beyond the fifteen
+       absorbs clock drift and the time the write takes. */
+    function returnTimeAllowed() {
+      let returnedAt = request.resource.data.get(
+        "actualReturnAt", null
+      );
+
+      return returnedAt is timestamp
+        && returnedAt
+            <= request.time + duration.value(5, "m")
+        && (
+          !(resource.data.get("pickupAt", null)
+              is timestamp)
+          || returnedAt >= resource.data.pickupAt
+          || (
+            resource.data.get("createdAt", null)
+                is timestamp
+            && returnedAt >= resource.data.createdAt
+          )
+        )
+        && (
+          isAdmin()
+          || (
+            returnedAt
+                >= request.time - duration.value(16, "m")
+            && resource.data.get(
+                "returnRequestStatus", null
+              ) != "pending"
+          )
+        );
+    }
+
+    function returnLockUntouched() {
+      return !request.resource.data.diff(resource.data)
+        .affectedKeys()
+        .hasAny([
+          "returnRequestId",
+          "returnRequestStatus",
+          "returnApprovedBy",
+          "returnApprovedByNameSnapshot"
+        ]);
+    }
+
+    /* Staff point the rental at the backdated return they
+       have just asked for, and only when none is waiting. */
+    function openingReturnRequest(rentalId) {
+      let requestId =
+        request.resource.data.get(
+          "returnRequestId", null
+        );
+      let after = getAfter(
+        /databases/$(database)/documents/returnRequests/$(requestId)
+      ).data;
+
+      return resource.data.get(
+            "returnRequestStatus", null
+          ) != "pending"
+        && request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasOnly([
+              "returnRequestId",
+              "returnRequestStatus",
+              "updatedAt"
+            ])
+        && request.resource.data.returnRequestStatus
+            == "pending"
+        && requestId is string
+        && after.status == "pending"
+        && after.rentalId == rentalId;
+    }
+
     match /rentals/{rentalId} {
 
       allow read: if isStaff();
@@ -479,9 +556,68 @@ allow list: if isAdmin();
       allow create: if isStaff();
 
       allow update: if isStaff()
-        && (!closingRental() || returnRecordValid());
+        && (
+          !closingRental()
+          || (returnRecordValid() && returnTimeAllowed())
+        )
+        && (
+          isAdmin()
+          || closingRental()
+          || !request.resource.data.diff(resource.data)
+              .affectedKeys().hasAny(["actualReturnAt"])
+        )
+        && (
+          isAdmin()
+          || returnLockUntouched()
+          || openingReturnRequest(rentalId)
+        );
 
       allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       BACKDATED RETURN REQUESTS
+       ========================================================= */
+
+    match /returnRequests/{requestId} {
+
+      allow read: if isStaff();
+
+      /* Staff ask, in their own name, for a rental still out,
+         and the rental is locked to this request in the same
+         write. */
+      allow create: if isStaff()
+        && pendingRequestInOwnName()
+        && request.resource.data.rentalId is string
+        && request.resource.data.requestedReturnAt
+            is timestamp
+        && get(
+          /databases/$(database)/documents/rentals/$(request.resource.data.rentalId)
+        ).data.status in ["active", "overdue"]
+        && getAfter(
+          /databases/$(database)/documents/rentals/$(request.resource.data.rentalId)
+        ).data.returnRequestId == requestId;
+
+      /* An administrator approves only by closing the rental
+         at the time that was asked for, in the same write, or
+         rejects with a note. */
+      allow update: if adminDecidesPending()
+        && rejectionExplained()
+        && (
+          request.resource.data.status != "approved"
+          || (
+            getAfter(
+              /databases/$(database)/documents/rentals/$(resource.data.rentalId)
+            ).data.status == "returned"
+            && getAfter(
+              /databases/$(database)/documents/rentals/$(resource.data.rentalId)
+            ).data.actualReturnAt
+                == resource.data.requestedReturnAt
+          )
+        );
+
+      allow delete: if false;
     }
 
 

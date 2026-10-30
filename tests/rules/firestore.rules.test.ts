@@ -14,6 +14,7 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
   deleteDoc,
   where,
@@ -91,6 +92,36 @@ beforeAll(async () => {
     await setDoc(doc(db, "vehicleRegistry", "reg_RT-001"), { vehicleId: "vehicle_001", value: "RT-001" });
     await setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1000 });
     await setDoc(doc(db, "rentals", "rental_open"), { status: "active", pickupOdometerKm: 1000 });
+
+    /* Backdated returns: rentals out since three days ago, and
+       rentals already waiting on a backdated return. */
+    const outSince = Timestamp.fromMillis(Date.now() - 3 * 86_400_000);
+    for (const rentalId of ["rental_out", "rental_out_2", "rental_out_3"]) {
+      await setDoc(doc(db, "rentals", rentalId), { status: "active", pickupAt: outSince, pickupOdometerKm: 1000 });
+    }
+    for (const [requestId, rentalId, requestedBy] of [
+      ["return_pending", "rental_req", OPS],
+      ["return_pending_2", "rental_req_2", OPS],
+      ["return_admin_own", "rental_req_admin", ADMIN],
+    ]) {
+      await setDoc(doc(db, "rentals", rentalId), {
+        status: "active",
+        pickupAt: outSince,
+        pickupOdometerKm: 1000,
+        returnRequestId: requestId,
+        returnRequestStatus: "pending",
+      });
+      await setDoc(doc(db, "returnRequests", requestId), {
+        rentalId,
+        reason: "Car came back last night, desk was closed",
+        requestedReturnAt: Timestamp.fromMillis(Date.now() - 12 * 3_600_000),
+        returnInput: { returnFuelLevel: "full", returnOdometer: null },
+        status: "pending",
+        requestedBy,
+        reviewedBy: null,
+        reviewNote: null,
+      });
+    }
 
     /* Cancellation requests: one booking free to ask about, and
        bookings already waiting on a request. */
@@ -371,6 +402,115 @@ describe("Firestore access policy", () => {
       withdrawnAt: serverTimestamp(),
     });
     await assertSucceeds(checkout.commit());
+  });
+
+  it("lets only an administrator record a backdated return directly", async () => {
+    const hoursAgo = (hours: number) => Timestamp.fromMillis(Date.now() - hours * 3_600_000);
+    const closing = { status: "returned", returnFuelLevel: "full", returnOdometerKm: null };
+    const ops = asUser(OPS);
+    const admin = asUser(ADMIN);
+
+    await assertFails(updateDoc(doc(ops, "rentals", "rental_out"), { ...closing, actualReturnAt: hoursAgo(2) }));
+    await assertFails(updateDoc(doc(ops, "rentals", "rental_out"), { ...closing, actualReturnAt: hoursAgo(-1) }));
+    await assertSucceeds(updateDoc(doc(ops, "rentals", "rental_out"), { ...closing, actualReturnAt: hoursAgo(0.1) }));
+
+    /* Not moved back afterwards, either. */
+    await assertFails(updateDoc(doc(ops, "rentals", "rental_out"), { actualReturnAt: hoursAgo(5) }));
+
+    /* Never before the vehicle went out, never in the future, even for an administrator. */
+    await assertFails(updateDoc(doc(admin, "rentals", "rental_out_2"), { ...closing, actualReturnAt: hoursAgo(24 * 4) }));
+    await assertFails(updateDoc(doc(admin, "rentals", "rental_out_2"), { ...closing, actualReturnAt: hoursAgo(-1) }));
+    await assertSucceeds(updateDoc(doc(admin, "rentals", "rental_out_2"), { ...closing, actualReturnAt: hoursAgo(5) }));
+  });
+
+  it("lets staff ask for a backdated return only as their own pending request, locked to the rental", async () => {
+    const db = asUser(OPS);
+    const asked = {
+      rentalId: "rental_out_3",
+      reason: "Returned overnight",
+      requestedReturnAt: Timestamp.fromMillis(Date.now() - 10 * 3_600_000),
+      returnInput: { returnFuelLevel: "half", returnOdometer: null },
+      status: "pending",
+      requestedBy: OPS,
+    };
+    const request = (id: string, data: Record<string, unknown>) => {
+      const batch = writeBatch(db);
+      batch.set(doc(db, "returnRequests", id), data);
+      batch.update(doc(db, "rentals", "rental_out_3"), { returnRequestId: id, returnRequestStatus: "pending" });
+      return batch.commit();
+    };
+
+    await assertFails(request("rr_other_name", { ...asked, requestedBy: ADMIN }));
+    await assertFails(request("rr_approved", { ...asked, status: "approved" }));
+    await assertFails(request("rr_no_reason", { ...asked, reason: "" }));
+    await assertFails(setDoc(doc(db, "returnRequests", "rr_unlocked"), asked));
+    await assertSucceeds(request("rr_ok", asked));
+    await assertFails(request("rr_second", asked));
+
+    /* While it waits, no second return can be written. */
+    await assertFails(
+      updateDoc(doc(db, "rentals", "rental_out_3"), {
+        status: "returned",
+        returnFuelLevel: "full",
+        returnOdometerKm: null,
+        actualReturnAt: serverTimestamp(),
+      }),
+    );
+  });
+
+  it("keeps the backdated-return decision with an administrator, once, and as asked", async () => {
+    const admin = asUser(ADMIN);
+    const ops = asUser(OPS);
+    let requested = Timestamp.now();
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      requested = (await getDoc(doc(context.firestore(), "returnRequests", "return_pending"))).get("requestedReturnAt");
+    });
+    const decided = { status: "approved", reviewedBy: ADMIN, reviewNote: null };
+    const close = (at: Timestamp) => ({ status: "returned", returnFuelLevel: "full", returnOdometerKm: null, actualReturnAt: at, returnRequestStatus: "approved" });
+
+    const opsBatch = writeBatch(ops);
+    opsBatch.update(doc(ops, "returnRequests", "return_pending"), { ...decided, reviewedBy: OPS });
+    await assertFails(opsBatch.commit());
+
+    /* Approving without closing the rental, or closing it at another time, is refused. */
+    await assertFails(updateDoc(doc(admin, "returnRequests", "return_pending"), decided));
+    const wrongTime = writeBatch(admin);
+    wrongTime.update(doc(admin, "rentals", "rental_req"), close(Timestamp.fromMillis(requested.toMillis() + 3_600_000)));
+    wrongTime.update(doc(admin, "returnRequests", "return_pending"), decided);
+    await assertFails(wrongTime.commit());
+
+    /* Nothing asked for changes while deciding. */
+    const rewrite = writeBatch(admin);
+    rewrite.update(doc(admin, "rentals", "rental_req"), close(requested));
+    rewrite.update(doc(admin, "returnRequests", "return_pending"), { ...decided, reason: "edited" });
+    await assertFails(rewrite.commit());
+
+    const approve = writeBatch(admin);
+    approve.update(doc(admin, "rentals", "rental_req"), close(requested));
+    approve.update(doc(admin, "returnRequests", "return_pending"), decided);
+    await assertSucceeds(approve.commit());
+
+    await assertFails(
+      updateDoc(doc(admin, "returnRequests", "return_pending"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "No" }),
+    );
+
+    await assertFails(
+      updateDoc(doc(admin, "returnRequests", "return_pending_2"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "" }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(admin, "returnRequests", "return_pending_2"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "The car was seen on the road that evening",
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(admin, "returnRequests", "return_admin_own"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "Mine" }),
+    );
+
+    await assertFails(deleteDoc(doc(admin, "returnRequests", "return_pending")));
+    await assertFails(deleteDoc(doc(ops, "returnRequests", "return_pending_2")));
   });
 
   it("keeps profit reporting away from operations staff", async () => {
@@ -864,6 +1004,7 @@ describe("Firestore access policy", () => {
     ["idempotencyKeys", "payment_001"],
     ["rentalDiscounts", "discount_decided"],
     ["cancellationRequests", "cancel_pending_3"],
+    ["returnRequests", "return_pending_2"],
   ];
 
   it("matches every collection the application reads with a rule", async () => {

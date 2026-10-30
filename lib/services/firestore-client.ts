@@ -5122,52 +5122,82 @@ async function extendRental(
    Return
    ========================================================= */
 
-async function returnRental(
-  input: {
-    rentalId: string;
-    actualReturnAt: string;
-    returnFuelLevel: string;
-    /* Optional: left blank, no reading is recorded. */
-    returnOdometer: {
-      value: number;
-      unit: "km" | "mi";
-    } | null;
-    adjustments: Array<{
-      type: string;
-      amountCents: number;
-      note: string;
-    }>;
-    /*
-     * The waivers taken and the hours run over are settled
-     * when the vehicle comes back, so they are recorded here
-     * and merged into the stored agreement rather than
-     * guessed at the counter.
-     */
-    waivers?: Record<string, unknown> | null;
-    extraHours?: number | null;
-    notes: string | null;
-    returnMedia: Array<Record<string, unknown>>;
-    /*
-     * The damage on the vehicle as it came back: what it went
-     * out with, less anything found to be wrong, plus anything
-     * new. Left out, the checkout's marks stand.
-     */
-    damageMarks?: unknown;
-  },
-): Promise<{
-  outstandingCents: number;
-}> {
-  const { db } =
-    getFirebaseClient();
+/*
+ * A return entered more than this long after the time it
+ * records is a backdated return, and anyone but an
+ * administrator has to have it approved.
+ */
+const BACKDATED_RETURN_MS = 15 * 60_000;
 
-  const actorUid =
-    getActorUid();
+/* Clock drift tolerated before a return reads as future. */
+const RETURN_CLOCK_SKEW_MS = 60_000;
 
+export type ReturnInput = {
+  rentalId: string;
+  actualReturnAt: string;
+  returnFuelLevel: string;
+  /* Optional: left blank, no reading is recorded. */
+  returnOdometer: {
+    value: number;
+    unit: "km" | "mi";
+  } | null;
+  adjustments: Array<{
+    type: string;
+    amountCents: number;
+    note: string;
+  }>;
   /*
-   * Everything that can be judged without reading the rental
-   * is validated before the transaction opens, so a bad entry
-   * fails fast and never leaves a partially applied return.
+   * The waivers taken and the hours run over are settled
+   * when the vehicle comes back, so they are recorded here
+   * and merged into the stored agreement rather than
+   * guessed at the counter.
    */
+  waivers?: Record<string, unknown> | null;
+  extraHours?: number | null;
+  notes: string | null;
+  returnMedia: Array<Record<string, unknown>>;
+  /*
+   * The damage on the vehicle as it came back: what it went
+   * out with, less anything found to be wrong, plus anything
+   * new. Left out, the checkout's marks stand.
+   */
+  damageMarks?: unknown;
+  /* Required when the return time is backdated. */
+  reason?: string | null;
+};
+
+type NormalisedReturn = {
+  returnOdometer: {
+    km: number;
+    value: number;
+    unit: "km" | "mi";
+  } | null;
+  returnFuelLevel: (typeof FUEL_LEVELS)[number];
+  returnNotes: string | null;
+  returnMedia: Array<Record<string, unknown>>;
+  returnDamageMarks: DamageMark[] | null;
+  adjustments: Array<{
+    type: string;
+    amountCents: number;
+    note: string;
+  }>;
+  returnWaivers: Record<string, boolean>;
+  extraHours: number;
+};
+
+/*
+ * Everything that can be judged without reading the rental
+ * is validated before the transaction opens, so a bad entry
+ * fails fast and never leaves a partially applied return.
+ * A backdated return's stored entry is put through the same
+ * checks again when it is approved.
+ */
+function normaliseReturn(
+  input: Omit<
+    ReturnInput,
+    "rentalId" | "actualReturnAt" | "reason"
+  >,
+): NormalisedReturn {
   /*
    * The return odometer may be left blank. A blank is stored as
    * null, never as 0: a zero would read as a real reading and
@@ -5204,7 +5234,8 @@ async function returnRental(
     );
 
   const returnDamageMarks =
-    input.damageMarks === undefined
+    input.damageMarks === undefined ||
+    input.damageMarks === null
       ? null
       : sanitizeDamageMarks(
           input.damageMarks,
@@ -5276,6 +5307,514 @@ async function returnRental(
     );
   }
 
+  return {
+    returnOdometer,
+    returnFuelLevel,
+    returnNotes,
+    returnMedia,
+    returnDamageMarks,
+    adjustments,
+    returnWaivers,
+    extraHours: Math.trunc(extraHours),
+  };
+}
+
+/*
+ * The earliest the vehicle can have come back: when it went
+ * out. That is the booked pickup, or the checkout if the renter
+ * collected it before the time they had booked — the rental
+ * keeps the booked pickup, so comparing with that alone refused
+ * any return earlier than a pickup that never happened.
+ */
+function earliestReturnMs(
+  rental: Record<string, unknown>,
+): number {
+  const pickupMs = asTimestamp(
+    toIso(rental.pickupAt),
+  ).toMillis();
+
+  return rental.createdAt instanceof Timestamp
+    ? Math.min(
+        pickupMs,
+        rental.createdAt.toMillis(),
+      )
+    : pickupMs;
+}
+
+/* The checks a return has to pass against the rental itself. */
+function assertReturnFits(
+  rental: Record<string, unknown>,
+  actualReturnAt: Timestamp,
+  normalised: NormalisedReturn,
+): void {
+  /*
+   * Re-reading the status inside the transaction is what
+   * makes a repeated submission safe: the second attempt
+   * sees "returned" and aborts instead of applying the
+   * adjustments twice.
+   */
+  if (
+    ![
+      "active",
+      "overdue",
+    ].includes(
+      String(
+        rental.status,
+      ),
+    )
+  ) {
+    throw new Error(
+      "Only active or overdue rentals can be returned.",
+    );
+  }
+
+  if (
+    actualReturnAt.toMillis() <
+    earliestReturnMs(rental)
+  ) {
+    throw new Error(
+      "Actual return cannot be before pickup.",
+    );
+  }
+
+  if (
+    normalised.returnOdometer &&
+    normalised.returnOdometer.km <
+    Number(
+      rental.pickupOdometerKm ??
+        0,
+    )
+  ) {
+    throw new Error(
+      "Return odometer cannot be lower than pickup odometer.",
+    );
+  }
+}
+
+/*
+ * Closes a rental. A return entered at the counter and a
+ * backdated return an administrator approves both land here,
+ * so an approved one completes exactly as a normal one does.
+ * Every read has already been made; this only writes.
+ */
+function applyReturn(
+  transaction: {
+    update: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    rentalRef: ReturnType<typeof doc>;
+    rental: Record<string, any>;
+    financialRef: ReturnType<typeof doc>;
+    financial: Record<string, any>;
+    reservationRef: ReturnType<typeof doc> | null;
+    reservationExists: boolean;
+    actualReturnAt: Timestamp;
+    normalised: NormalisedReturn;
+    /* Who took the vehicle back. */
+    returnedBy: { uid: string; name: string };
+    /* Who is writing it: the same, or the approver. */
+    actorUid: string;
+    /* Extra fields for the rental, such as the approval. */
+    rentalFields?: Record<string, unknown>;
+  },
+): number {
+  const { db } = getFirebaseClient();
+
+  const {
+    rental,
+    financial,
+    actualReturnAt,
+    normalised,
+    actorUid,
+  } = input;
+
+  const {
+    returnOdometer,
+    returnFuelLevel,
+    returnNotes,
+    returnMedia,
+    returnDamageMarks,
+    adjustments,
+    returnWaivers,
+    extraHours,
+  } = normalised;
+
+  const totalAdjustment =
+    adjustments.reduce(
+      (
+        total,
+        adjustment,
+      ) =>
+        adjustment.type ===
+        "discount"
+          ? total -
+            adjustment.amountCents
+          : total +
+            adjustment.amountCents,
+      0,
+    );
+
+  const adjustmentCents =
+    Number(
+      financial.adjustmentCents ??
+        0,
+    ) +
+    totalAdjustment;
+
+  const totalCents =
+    Number(
+      financial.baseRentalCents ??
+        0,
+    ) +
+    adjustmentCents;
+
+  if (
+    !Number.isFinite(
+      totalCents,
+    ) ||
+    totalCents < 0 ||
+    totalCents > MAX_MONEY_CENTS
+  ) {
+    throw new Error(
+      "Adjustments produce an invalid rental total.",
+    );
+  }
+
+  const outstandingCents =
+    calculateBalance(
+      Math.round(
+        totalCents,
+      ),
+      assertMoneyCents(
+        financial.paidCents ?? 0,
+        "Amount received",
+      ),
+      assertMoneyCents(
+        financial.refundedCents ??
+          0,
+        "Amount refunded",
+      ),
+    );
+
+  const vehicleId =
+    trimmedOrNull(
+      rental.vehicleId,
+    );
+
+  if (!vehicleId) {
+    throw new Error(
+      "This rental is not linked to a vehicle.",
+    );
+  }
+
+  const vehicleRegistration =
+    String(
+      rental.vehicleRegistrationSnapshot ??
+        financial.vehicleRegistration ??
+        "",
+    );
+
+  const customerId =
+    String(
+      rental.customerId ??
+        financial.customerId ??
+        "",
+    );
+
+  const checkoutDamage =
+    sanitizeDamageMarks(
+      rental.checkoutDamageMarks,
+    );
+
+  const checkoutDamageIds = new Set(
+    checkoutDamage.map(
+      (mark) => mark.id,
+    ),
+  );
+
+  const damageAtReturn: DamageMark[] =
+    returnDamageMarks ?? checkoutDamage;
+
+  /*
+   * Every value below is explicitly defined or null.
+   * Firestore rejects an undefined field outright, which
+   * previously aborted the whole return.
+   */
+  transaction.update(
+    input.rentalRef,
+    {
+      status:
+        "returned",
+
+      actualReturnAt,
+
+      returnFuelLevel,
+
+      returnOdometerKm:
+        returnOdometer?.km ?? null,
+
+      returnOdometerValue:
+        returnOdometer?.value ?? null,
+
+      returnOdometerUnit:
+        returnOdometer?.unit ?? null,
+
+      returnNotes,
+
+      returnMedia,
+
+      returnDamageMarks:
+        damageAtReturn,
+
+      newDamageCount:
+        damageAtReturn.filter(
+          (mark) =>
+            !checkoutDamageIds.has(
+              mark.id,
+            ),
+        ).length,
+
+      adjustments,
+
+      /*
+       * The agreement is rebuilt from the rental every
+       * time it is opened, so recording the waivers and
+       * the overrun here puts them on the printed copy.
+       * An approved contract snapshot is a separate,
+       * immutable document and is untouched.
+       */
+      agreement: {
+        ...((rental.agreement ??
+          {}) as Record<
+          string,
+          unknown
+        >),
+
+        waivers: returnWaivers,
+
+        extraHours,
+      },
+
+      returnedBy:
+        input.returnedBy.uid,
+
+      returnedByNameSnapshot:
+        input.returnedBy.name,
+
+      ...(input.rentalFields ?? {}),
+
+      updatedAt:
+        nowTimestamp(),
+    },
+  );
+
+  transaction.update(
+    input.financialRef,
+    {
+      adjustmentCents,
+
+      totalCents,
+
+      outstandingCents,
+
+      rentalStatus:
+        "returned",
+
+      actualReturnAt,
+
+      updatedAt:
+        nowTimestamp(),
+    },
+  );
+
+  if (
+    input.reservationRef &&
+    input.reservationExists
+  ) {
+    transaction.update(
+      input.reservationRef,
+      {
+        status: "completed",
+
+        completedAt: actualReturnAt,
+
+        updatedAt: nowTimestamp(),
+      },
+    );
+  }
+
+  /*
+   * A returned vehicle always goes to cleaning before it
+   * can be offered again, which is also the only valid
+   * transition out of rented or overdue.
+   */
+  transaction.update(
+    doc(
+      db,
+      "vehicles",
+      vehicleId,
+    ),
+    {
+      status:
+        "cleaning",
+
+      statusNote:
+        "Awaiting cleaning and detailing after return.",
+
+      damageMarks:
+        damageAtReturn,
+
+      damageUpdatedAt:
+        nowTimestamp(),
+
+      updatedAt:
+        nowTimestamp(),
+    },
+  );
+
+  for (
+    const adjustment of
+    adjustments
+  ) {
+    if (
+      adjustment.amountCents <=
+      0
+    ) {
+      continue;
+    }
+
+    const ledgerRef =
+      doc(
+        collection(
+          db,
+          "financialLedger",
+        ),
+      );
+
+    transaction.set(
+      ledgerRef,
+      {
+        rentalId:
+          input.rentalRef.id,
+
+        vehicleId,
+
+        vehicleRegistration,
+
+        customerId,
+
+        entryType:
+          adjustment.type ===
+          "discount"
+            ? "rental_discount"
+            : "rental_adjustment",
+
+        adjustmentType:
+          adjustment.type,
+
+        amountCents:
+          adjustment.type ===
+          "discount"
+            ? -adjustment.amountCents
+            : adjustment.amountCents,
+
+        note:
+          adjustment.note,
+
+        occurredAt:
+          nowTimestamp(),
+
+        recordedBy:
+          actorUid,
+      },
+    );
+  }
+
+  return outstandingCents;
+}
+
+/* The stored form of a return that waits for approval. */
+function storedReturn(
+  normalised: NormalisedReturn,
+): Record<string, unknown> {
+  return {
+    returnFuelLevel:
+      normalised.returnFuelLevel,
+    returnOdometer: normalised.returnOdometer
+      ? {
+          value: normalised.returnOdometer.value,
+          unit: normalised.returnOdometer.unit,
+        }
+      : null,
+    adjustments: normalised.adjustments,
+    waivers: normalised.returnWaivers,
+    extraHours: normalised.extraHours,
+    notes: normalised.returnNotes,
+    returnMedia: normalised.returnMedia,
+    damageMarks: normalised.returnDamageMarks,
+  };
+}
+
+async function returnRental(
+  input: ReturnInput,
+): Promise<{
+  outstandingCents: number;
+  /*
+   * "returned" when it took effect; "pending" when a
+   * backdated return was sent to an administrator.
+   */
+  status: "returned" | "pending";
+}> {
+  const { db } =
+    getFirebaseClient();
+
+  const actorUid =
+    getActorUid();
+
+  const normalised =
+    normaliseReturn(input);
+
+  const actualReturnAt =
+    asTimestamp(
+      input.actualReturnAt,
+    );
+
+  const enteredAtMs = Date.now();
+
+  if (
+    actualReturnAt.toMillis() >
+    enteredAtMs + RETURN_CLOCK_SKEW_MS
+  ) {
+    throw new Error(
+      "The return time cannot be in the future.",
+    );
+  }
+
+  const backdated =
+    actualReturnAt.toMillis() <
+    enteredAtMs - BACKDATED_RETURN_MS;
+
+  const reason = trimmedOrNull(input.reason);
+
+  if (backdated && !reason) {
+    throw new Error(
+      "Say why the return is being recorded at an earlier time.",
+    );
+  }
+
+  if (reason && reason.length > 500) {
+    throw new Error(
+      "Keep the reason under 500 characters.",
+    );
+  }
+
   const rentalRef =
     doc(
       db,
@@ -5294,7 +5833,14 @@ async function returnRental(
       ),
     );
 
+  const requestRef = doc(
+    collection(db, "returnRequests"),
+  );
+
   let outstandingCents = 0;
+
+  let status: "returned" | "pending" =
+    "returned";
 
   await runTransaction(
     db,
@@ -5356,27 +5902,6 @@ async function returnRental(
           : null;
 
       /*
-       * Re-reading the status inside the transaction is what
-       * makes a repeated submission safe: the second attempt
-       * sees "returned" and aborts instead of applying the
-       * adjustments twice.
-       */
-      if (
-        ![
-          "active",
-          "overdue",
-        ].includes(
-          String(
-            rental.status,
-          ),
-        )
-      ) {
-        throw new Error(
-          "Only active or overdue rentals can be returned.",
-        );
-      }
-
-      /*
        * Read before any write: a Firestore transaction
        * refuses a read once it has started writing, and the
        * rental update below is the first one.
@@ -5387,8 +5912,24 @@ async function returnRental(
           actorUid,
         );
 
-      const returnedByNameSnapshot =
-        returnedBy.name;
+      /*
+       * A backdated return waiting for an administrator is
+       * the return; a second one cannot be entered beside it.
+       */
+      if (
+        rental.returnRequestStatus ===
+        "pending"
+      ) {
+        throw new Error(
+          "A backdated return for this rental is waiting for an administrator. It cannot be returned again until that is decided.",
+        );
+      }
+
+      assertReturnFits(
+        rental,
+        actualReturnAt,
+        normalised,
+      );
 
       /*
        * A discount needs an administrator's say-so. Anyone
@@ -5397,7 +5938,7 @@ async function returnRental(
        */
       if (
         returnedBy.role !== "admin" &&
-        adjustments.some(
+        normalised.adjustments.some(
           (adjustment) =>
             adjustment.type === "discount" &&
             adjustment.amountCents > 0,
@@ -5408,322 +5949,129 @@ async function returnRental(
         );
       }
 
-      const actualReturnAt =
-        asTimestamp(
-          input.actualReturnAt,
-        );
-
-      if (
-        actualReturnAt.toMillis() <
-        asTimestamp(
-          toIso(
-            rental.pickupAt,
-          ),
-        ).toMillis()
-      ) {
-        throw new Error(
-          "Actual return cannot be before pickup.",
-        );
-      }
-
-      if (
-        returnOdometer &&
-        returnOdometer.km <
-        Number(
-          rental.pickupOdometerKm ??
-            0,
-        )
-      ) {
-        throw new Error(
-          "Return odometer cannot be lower than pickup odometer.",
-        );
-      }
-
-      const totalAdjustment =
-        adjustments.reduce(
-          (
-            total,
-            adjustment,
-          ) =>
-            adjustment.type ===
-            "discount"
-              ? total -
-                adjustment.amountCents
-              : total +
-                adjustment.amountCents,
-          0,
-        );
-
-      const adjustmentCents =
-        Number(
-          financial.adjustmentCents ??
-            0,
-        ) +
-        totalAdjustment;
-
-      const totalCents =
-        Number(
-          financial.baseRentalCents ??
-            0,
-        ) +
-        adjustmentCents;
-
-      if (
-        !Number.isFinite(
-          totalCents,
-        ) ||
-        totalCents < 0 ||
-        totalCents > MAX_MONEY_CENTS
-      ) {
-        throw new Error(
-          "Adjustments produce an invalid rental total.",
-        );
-      }
-
-      outstandingCents =
-        calculateBalance(
-          Math.round(
-            totalCents,
-          ),
-          assertMoneyCents(
-            financial.paidCents ?? 0,
-            "Amount received",
-          ),
-          assertMoneyCents(
-            financial.refundedCents ??
-              0,
-            "Amount refunded",
-          ),
-        );
-
-      const vehicleId =
-        trimmedOrNull(
-          rental.vehicleId,
-        );
-
-      if (!vehicleId) {
-        throw new Error(
-          "This rental is not linked to a vehicle.",
-        );
-      }
-
-      const vehicleRegistration =
-        String(
-          rental.vehicleRegistrationSnapshot ??
-            financial.vehicleRegistration ??
-            "",
-        );
-
-      const customerId =
-        String(
-          rental.customerId ??
-            financial.customerId ??
-            "",
-        );
-
-      const checkoutDamage =
-        sanitizeDamageMarks(
-          rental.checkoutDamageMarks,
-        );
-
-      const checkoutDamageIds = new Set(
-        checkoutDamage.map(
-          (mark) => mark.id,
-        ),
-      );
-
-      const damageAtReturn: DamageMark[] =
-        returnDamageMarks ?? checkoutDamage;
-
       /*
-       * Every value below is explicitly defined or null.
-       * Firestore rejects an undefined field outright, which
-       * previously aborted the whole return.
+       * A backdated return entered by anyone but an
+       * administrator is held as a request with everything
+       * entered on the Return tab. The rental stays open and
+       * the vehicle stays rented until it is decided.
        */
-      transaction.update(
-        rentalRef,
-        {
-          status:
-            "returned",
-
-          actualReturnAt,
-
-          returnFuelLevel,
-
-          returnOdometerKm:
-            returnOdometer?.km ?? null,
-
-          returnOdometerValue:
-            returnOdometer?.value ?? null,
-
-          returnOdometerUnit:
-            returnOdometer?.unit ?? null,
-
-          returnNotes,
-
-          returnMedia,
-
-          returnDamageMarks:
-            damageAtReturn,
-
-          newDamageCount:
-            damageAtReturn.filter(
-              (mark) =>
-                !checkoutDamageIds.has(
-                  mark.id,
-                ),
-            ).length,
-
-          adjustments,
-
-          /*
-           * The agreement is rebuilt from the rental every
-           * time it is opened, so recording the waivers and
-           * the overrun here puts them on the printed copy.
-           * An approved contract snapshot is a separate,
-           * immutable document and is untouched.
-           */
-          agreement: {
-            ...((rental.agreement ??
-              {}) as Record<
-              string,
-              unknown
-            >),
-
-            waivers: returnWaivers,
-
-            extraHours:
-              Math.trunc(extraHours),
-          },
-
-          returnedBy:
-            actorUid,
-
-          returnedByNameSnapshot,
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      transaction.update(
-        financialRef,
-        {
-          adjustmentCents,
-
-          totalCents,
-
-          outstandingCents,
-
-          rentalStatus:
-            "returned",
-
-          actualReturnAt,
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
       if (
-        reservationRef &&
-        reservationSnapshot?.exists()
+        backdated &&
+        returnedBy.role !== "admin"
       ) {
-        transaction.update(
-          reservationRef,
-          {
-            status: "completed",
+        status = "pending";
 
-            completedAt: actualReturnAt,
-
-            updatedAt: nowTimestamp(),
-          },
+        outstandingCents = Number(
+          financial.outstandingCents ?? 0,
         );
-      }
 
-      /*
-       * A returned vehicle always goes to cleaning before it
-       * can be offered again, which is also the only valid
-       * transition out of rented or overdue.
-       */
-      transaction.update(
-        doc(
-          db,
-          "vehicles",
-          vehicleId,
-        ),
-        {
-          status:
-            "cleaning",
+        transaction.set(requestRef, {
+          rentalId: rentalRef.id,
+          reservationId,
+          vehicleId: trimmedOrNull(
+            rental.vehicleId,
+          ),
+          customerNameSnapshot: String(
+            rental.customerNameSnapshot ?? "",
+          ),
+          vehicleRegistrationSnapshot: String(
+            rental.vehicleRegistrationSnapshot ??
+              "",
+          ),
+          requestedReturnAt: actualReturnAt,
+          enteredAt: nowTimestamp(),
+          reason,
+          returnInput: storedReturn(normalised),
+          status: "pending",
+          requestedBy: actorUid,
+          requestedByNameSnapshot:
+            returnedBy.name,
+          requestedAt: nowTimestamp(),
+          reviewedBy: null,
+          reviewedByNameSnapshot: null,
+          reviewedAt: null,
+          reviewNote: null,
+          updatedAt: nowTimestamp(),
+        });
 
-          statusNote:
-            "Awaiting cleaning and detailing after return.",
-
-          damageMarks:
-            damageAtReturn,
-
-          damageUpdatedAt:
-            nowTimestamp(),
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      for (
-        const adjustment of
-        adjustments
-      ) {
-        if (
-          adjustment.amountCents <=
-          0
-        ) {
-          continue;
-        }
-
-        const ledgerRef =
-          doc(
-            collection(
-              db,
-              "financialLedger",
-            ),
-          );
+        transaction.update(rentalRef, {
+          returnRequestId: requestRef.id,
+          returnRequestStatus: "pending",
+          updatedAt: nowTimestamp(),
+        });
 
         transaction.set(
-          ledgerRef,
+          doc(collection(db, "auditLogs")),
           {
-            rentalId:
-              rentalRef.id,
+            actorUid,
+            action:
+              "rental.backdated_return_requested",
+            resource: {
+              collection: "returnRequests",
+              id: requestRef.id,
+            },
+            details: {
+              actorName: returnedBy.name,
+              rentalId: rentalRef.id,
+              requestedReturnAt:
+                input.actualReturnAt,
+              enteredAt: new Date(
+                enteredAtMs,
+              ).toISOString(),
+              reason,
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
 
-            vehicleId,
+        return;
+      }
 
-            vehicleRegistration,
+      outstandingCents = applyReturn(
+        transaction,
+        {
+          rentalRef,
+          rental,
+          financialRef,
+          financial,
+          reservationRef,
+          reservationExists: Boolean(
+            reservationSnapshot?.exists(),
+          ),
+          actualReturnAt,
+          normalised,
+          returnedBy: {
+            uid: actorUid,
+            name: returnedBy.name,
+          },
+          actorUid,
+          rentalFields: backdated
+            ? { backdatedReturnReason: reason }
+            : undefined,
+        },
+      );
 
-            customerId,
-
-            entryType:
-              adjustment.type ===
-              "discount"
-                ? "rental_discount"
-                : "rental_adjustment",
-
-            adjustmentType:
-              adjustment.type,
-
-            amountCents:
-              adjustment.type ===
-              "discount"
-                ? -adjustment.amountCents
-                : adjustment.amountCents,
-
-            note:
-              adjustment.note,
-
-            occurredAt:
-              nowTimestamp(),
-
-            recordedBy:
-              actorUid,
+      if (backdated) {
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action: "rental.backdated_return",
+            resource: {
+              collection: "rentals",
+              id: rentalRef.id,
+            },
+            details: {
+              actorName: returnedBy.name,
+              requestedReturnAt:
+                input.actualReturnAt,
+              enteredAt: new Date(
+                enteredAtMs,
+              ).toISOString(),
+              reason,
+              decision: "applied by an administrator",
+            },
+            createdAt: nowTimestamp(),
           },
         );
       }
@@ -5732,7 +6080,381 @@ async function returnRental(
 
   return {
     outstandingCents,
+    status,
   };
+}
+
+export type ReturnRequest = {
+  id: string;
+  rentalId: string;
+  customerName: string;
+  vehicleRegistration: string;
+  requestedReturnAt: string | null;
+  enteredAt: string | null;
+  reason: string;
+  status: RequestStatus;
+  requestedBy: string;
+  requestedByName: string;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+function returnRequestFrom(
+  id: string,
+  data: Record<string, unknown>,
+): ReturnRequest {
+  return {
+    id,
+    rentalId: String(data.rentalId ?? ""),
+    customerName: String(
+      data.customerNameSnapshot ?? "",
+    ),
+    vehicleRegistration: String(
+      data.vehicleRegistrationSnapshot ?? "",
+    ),
+    requestedReturnAt: data.requestedReturnAt
+      ? toIso(data.requestedReturnAt)
+      : null,
+    enteredAt: data.enteredAt
+      ? toIso(data.enteredAt)
+      : null,
+    reason: String(data.reason ?? ""),
+    status: requestStatusOf(data.status),
+    requestedBy: String(data.requestedBy ?? ""),
+    requestedByName: String(
+      data.requestedByNameSnapshot ?? "",
+    ),
+    reviewedByName: trimmedOrNull(
+      data.reviewedByNameSnapshot,
+    ),
+    reviewedAt: data.reviewedAt
+      ? toIso(data.reviewedAt)
+      : null,
+    reviewNote: trimmedOrNull(data.reviewNote),
+  };
+}
+
+/* Every waiting request, and the caller's own. */
+async function listReturnRequests(): Promise<
+  ReturnRequest[]
+> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const [pending, mine] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "returnRequests"),
+        where("status", "==", "pending"),
+        limit(200),
+      ),
+    ),
+
+    getDocs(
+      query(
+        collection(db, "returnRequests"),
+        where("requestedBy", "==", actorUid),
+        limit(100),
+      ),
+    ),
+  ]);
+
+  const byId = new Map<string, ReturnRequest>();
+
+  for (const entry of [
+    ...pending.docs,
+    ...mine.docs,
+  ]) {
+    byId.set(
+      entry.id,
+      returnRequestFrom(entry.id, entry.data()),
+    );
+  }
+
+  return [...byId.values()].sort((a, b) =>
+    String(b.enteredAt).localeCompare(
+      String(a.enteredAt),
+    ),
+  );
+}
+
+/*
+ * An administrator decides a backdated return. Approval
+ * completes the return exactly as a normal one, at the time
+ * that was entered, from what was entered; rejection leaves
+ * the rental open. The request is re-read in the transaction,
+ * so only one decision can land.
+ */
+async function reviewReturnRequest(
+  input: {
+    requestId: string;
+    decision: "approve" | "reject";
+    note: string | null;
+  },
+): Promise<{
+  status: RequestStatus;
+  rentalId: string;
+  outstandingCents: number | null;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const requestId = trimmedOrNull(
+    input.requestId,
+  );
+
+  if (!requestId) {
+    throw new Error(
+      "Select the backdated return to review.",
+    );
+  }
+
+  if (
+    input.decision !== "approve" &&
+    input.decision !== "reject"
+  ) {
+    throw new Error(
+      "Choose whether to approve or reject the return.",
+    );
+  }
+
+  const note = trimmedOrNull(input.note);
+
+  if (input.decision === "reject" && !note) {
+    throw new Error(
+      "Say why the backdated return is rejected.",
+    );
+  }
+
+  if (note && note.length > 1000) {
+    throw new Error(
+      "Keep the review note under 1000 characters.",
+    );
+  }
+
+  const requestRef = doc(
+    db,
+    "returnRequests",
+    requestId,
+  );
+
+  let result: {
+    status: RequestStatus;
+    rentalId: string;
+    outstandingCents: number | null;
+  } = {
+    status: "pending",
+    rentalId: "",
+    outstandingCents: null,
+  };
+
+  await runTransaction(db, async (transaction) => {
+    const requestSnapshot =
+      await transaction.get(requestRef);
+
+    if (!requestSnapshot.exists()) {
+      throw new Error(
+        "Backdated return was not found.",
+      );
+    }
+
+    const request = requestSnapshot.data();
+
+    if (
+      requestStatusOf(request.status) !==
+      "pending"
+    ) {
+      throw new Error(
+        "This backdated return has already been decided.",
+      );
+    }
+
+    const rentalId = String(
+      request.rentalId ?? "",
+    );
+
+    const rentalRef = doc(
+      db,
+      "rentals",
+      rentalId,
+    );
+
+    const financialRef = doc(
+      db,
+      "rentalFinancials",
+      rentalId,
+    );
+
+    const [rentalSnapshot, financialSnapshot] =
+      await Promise.all([
+        transaction.get(rentalRef),
+        transaction.get(financialRef),
+      ]);
+
+    if (
+      !rentalSnapshot.exists() ||
+      !financialSnapshot.exists()
+    ) {
+      throw new Error(
+        "Rental was not found.",
+      );
+    }
+
+    const rental = rentalSnapshot.data();
+
+    const reservationId = trimmedOrNull(
+      rental.reservationId,
+    );
+
+    const reservationRef = reservationId
+      ? doc(db, "reservations", reservationId)
+      : null;
+
+    const reservationSnapshot = reservationRef
+      ? await transaction.get(reservationRef)
+      : null;
+
+    const actor = await actorProfileSnapshot(
+      transaction,
+      actorUid,
+    );
+
+    if (actor.role !== "admin") {
+      throw new Error(
+        "Only an administrator can decide a backdated return.",
+      );
+    }
+
+    if (request.requestedBy === actorUid) {
+      throw new Error(
+        "A request has to be decided by another administrator.",
+      );
+    }
+
+    const status: RequestStatus =
+      input.decision === "approve"
+        ? "approved"
+        : "rejected";
+
+    let outstandingCents: number | null = null;
+
+    if (status === "approved") {
+      const requestedReturnAt =
+        request.requestedReturnAt instanceof
+        Timestamp
+          ? request.requestedReturnAt
+          : asTimestamp(
+              toIso(request.requestedReturnAt),
+            );
+
+      const normalised = normaliseReturn(
+        (request.returnInput ?? {}) as Omit<
+          ReturnInput,
+          "rentalId" | "actualReturnAt" | "reason"
+        >,
+      );
+
+      assertReturnFits(
+        rental,
+        requestedReturnAt,
+        normalised,
+      );
+
+      outstandingCents = applyReturn(
+        transaction,
+        {
+          rentalRef,
+          rental,
+          financialRef,
+          financial: financialSnapshot.data(),
+          reservationRef,
+          reservationExists: Boolean(
+            reservationSnapshot?.exists(),
+          ),
+          actualReturnAt: requestedReturnAt,
+          normalised,
+          /* The employee who took the car back. */
+          returnedBy: {
+            uid: String(request.requestedBy ?? ""),
+            name: String(
+              request.requestedByNameSnapshot ??
+                "",
+            ),
+          },
+          actorUid,
+          rentalFields: {
+            returnRequestStatus: "approved",
+            backdatedReturnReason: String(
+              request.reason ?? "",
+            ),
+            returnApprovedBy: actorUid,
+            returnApprovedByNameSnapshot:
+              actor.name,
+          },
+        },
+      );
+    } else {
+      transaction.update(rentalRef, {
+        returnRequestStatus: "rejected",
+        updatedAt: nowTimestamp(),
+      });
+    }
+
+    transaction.update(requestRef, {
+      status,
+      reviewedBy: actorUid,
+      reviewedByNameSnapshot: actor.name,
+      reviewedAt: nowTimestamp(),
+      reviewNote: note,
+      updatedAt: nowTimestamp(),
+    });
+
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+        action:
+          status === "approved"
+            ? "rental.backdated_return_approved"
+            : "rental.backdated_return_rejected",
+        resource: {
+          collection: "returnRequests",
+          id: requestId,
+        },
+        details: {
+          actorName: actor.name,
+          rentalId,
+          requestedReturnAt: request.requestedReturnAt
+            ? toIso(request.requestedReturnAt)
+            : null,
+          enteredAt: request.enteredAt
+            ? toIso(request.enteredAt)
+            : null,
+          reason: String(request.reason ?? ""),
+          requestedBy: String(
+            request.requestedBy ?? "",
+          ),
+          requestedByName: String(
+            request.requestedByNameSnapshot ?? "",
+          ),
+          decision: status,
+          reviewNote: note,
+        },
+        createdAt: nowTimestamp(),
+      },
+    );
+
+    result = {
+      status,
+      rentalId,
+      outstandingCents,
+    };
+  });
+
+  return result;
 }
 
 /* =========================================================
@@ -10973,7 +11695,123 @@ export type RentalDocuments = {
   bookingMedia: RentalMediaItem[];
   checkoutMedia: RentalMediaItem[];
   returnMedia: RentalMediaItem[];
+  /* Every approval asked for on this hire, and how it ended. */
+  requests: RentalRequestEntry[];
 };
+
+export type RentalRequestEntry = {
+  id: string;
+  kind:
+    | "cancellation"
+    | "backdated_return"
+    | "daily_rate_discount";
+  summary: string;
+  reason: string;
+  status: string;
+  requestedByName: string;
+  requestedAt: string | null;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+/*
+ * The approval requests filed against one hire. Each is its
+ * own single-field query, and a collection the deployed rules
+ * do not cover yet costs its own entries and nothing else.
+ */
+async function rentalRequests(
+  rentalId: string,
+  reservationId: string | null,
+): Promise<RentalRequestEntry[]> {
+  const { db } = getFirebaseClient();
+
+  const read = (
+    name: string,
+    field: string,
+    value: string | null,
+  ) =>
+    value
+      ? getDocs(
+          query(
+            collection(db, name),
+            where(field, "==", value),
+            limit(50),
+          ),
+        )
+          .then((snapshot) => snapshot.docs)
+          .catch(() => [])
+      : Promise.resolve([]);
+
+  const [cancellations, returns] =
+    await Promise.all([
+      read(
+        "cancellationRequests",
+        "reservationId",
+        reservationId,
+      ),
+      read("returnRequests", "rentalId", rentalId),
+    ]);
+
+  const entries: RentalRequestEntry[] = [
+    ...cancellations.map((entry) => {
+      const request = cancellationRequestFrom(
+        entry.id,
+        entry.data(),
+      );
+
+      return {
+        id: request.id,
+        kind: "cancellation" as const,
+        summary: "Cancel the booking",
+        reason: request.reason,
+        status: request.status,
+        requestedByName: request.requestedByName,
+        requestedAt: request.requestedAt,
+        reviewedByName: request.reviewedByName,
+        reviewedAt: request.reviewedAt,
+        reviewNote: request.reviewNote,
+      };
+    }),
+
+    ...returns.map((entry) => {
+      const request = returnRequestFrom(
+        entry.id,
+        entry.data(),
+      );
+
+      return {
+        id: request.id,
+        kind: "backdated_return" as const,
+        summary: `Backdated return to ${
+          request.requestedReturnAt
+            ? new Date(
+                request.requestedReturnAt,
+              ).toLocaleString("en-US", {
+                month: "short",
+                day: "numeric",
+                hour: "numeric",
+                minute: "2-digit",
+              })
+            : "an earlier time"
+        }`,
+        reason: request.reason,
+        status: request.status,
+        requestedByName: request.requestedByName,
+        requestedAt: request.enteredAt,
+        reviewedByName: request.reviewedByName,
+        reviewedAt: request.reviewedAt,
+        reviewNote: request.reviewNote,
+      };
+    }),
+  ];
+
+  return entries.sort((a, b) =>
+    String(a.requestedAt).localeCompare(
+      String(b.requestedAt),
+    ),
+  );
+}
 
 /*
  * Only what is needed to show a picture: the stored media
@@ -11084,6 +11922,13 @@ async function getRentalDocuments(
 
     returnMedia: mediaItems(
       rental.get("returnMedia"),
+    ),
+
+    requests: await rentalRequests(
+      rental.id,
+      trimmedOrNull(
+        rental.get("reservationId"),
+      ),
     ),
   };
 }
@@ -11335,28 +12180,22 @@ export async function callFirestoreOperation<
     case "returnRental":
       return (
         (await returnRental(
+          data as ReturnInput,
+        )) as TResult
+      );
+
+    case "listReturnRequests":
+      return (
+        (await listReturnRequests()) as TResult
+      );
+
+    case "reviewReturnRequest":
+      return (
+        (await reviewReturnRequest(
           data as {
-            rentalId: string;
-            actualReturnAt: string;
-            returnFuelLevel: string;
-            returnOdometer: {
-              value: number;
-              unit: "km" | "mi";
-            } | null;
-            adjustments: Array<{
-              type: string;
-              amountCents: number;
-              note: string;
-            }>;
-            waivers?: Record<
-              string,
-              unknown
-            > | null;
-            extraHours?: number | null;
-            notes: string | null;
-            returnMedia: Array<
-              Record<string, unknown>
-            >;
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
           },
         )) as TResult
       );

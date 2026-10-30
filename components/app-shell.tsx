@@ -286,10 +286,17 @@ export function AppShell({
     return () => unsubscribe?.();
   }, [role]);
 
-  /* Cancellations asked for by staff, waiting the same way. */
+  /* Cancellations and backdated returns asked for by staff,
+     waiting the same way. */
   const pendingCancellationRequests =
     usePendingRequestCount(
       "cancellationRequests",
+      role,
+    );
+
+  const pendingReturnRequests =
+    usePendingRequestCount(
+      "returnRequests",
       role,
     );
 
@@ -486,7 +493,8 @@ export function AppShell({
                   ? pendingStaff
                   : countsPendingDiscounts
                     ? pendingDiscounts +
-                      pendingCancellationRequests
+                      pendingCancellationRequests +
+                      pendingReturnRequests
                     : 0;
 
               return (
