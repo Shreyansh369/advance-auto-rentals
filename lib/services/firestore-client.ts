@@ -2767,6 +2767,12 @@ async function cancelReservation(
 ): Promise<{
   reservationId: string;
   vehicleReleased: boolean;
+  /*
+   * "cancelled" when it took effect; "pending" when it was
+   * sent to an administrator, which is what a cancellation
+   * by anyone else now is.
+   */
+  status: "cancelled" | "pending";
 }> {
   const { db } = getFirebaseClient();
 
@@ -2806,7 +2812,14 @@ async function cancelReservation(
     reservationId,
   );
 
+  const requestRef = doc(
+    collection(db, "cancellationRequests"),
+  );
+
   let vehicleReleased = false;
+
+  let status: "cancelled" | "pending" =
+    "cancelled";
 
   await runTransaction(
     db,
@@ -2822,28 +2835,7 @@ async function cancelReservation(
         );
       }
 
-      const status = String(
-        snapshot.get("status"),
-      );
-
-      if (status === "cancelled") {
-        throw new Error(
-          "This booking has already been cancelled.",
-        );
-      }
-
-      /*
-       * Once the car has gone out the booking is no longer
-       * the thing holding it — the rental is — so it is
-       * returned, not cancelled.
-       */
-      if (status !== "confirmed") {
-        throw new Error(
-          status === "checked_out"
-            ? "This booking has already been checked out. Complete the return instead."
-            : "Only a confirmed booking can be cancelled.",
-        );
-      }
+      assertCancellable(snapshot.get("status"));
 
       const vehicleId = trimmedOrNull(
         snapshot.get("vehicleId"),
@@ -2857,45 +2849,608 @@ async function cancelReservation(
         ? await transaction.get(vehicleRef)
         : null;
 
-      const actorName =
-        await actorNameSnapshot(
+      const actor =
+        await actorProfileSnapshot(
           transaction,
           actorUid,
         );
 
-      transaction.update(reservationRef, {
-        status: "cancelled",
-
-        cancelledBy: actorUid,
-
-        cancelledByNameSnapshot: actorName,
-
-        cancelledAt: nowTimestamp(),
-
-        cancellationReason: reason,
-
-        updatedAt: nowTimestamp(),
-      });
+      const waiting =
+        snapshot.get(
+          "cancellationRequestStatus",
+        ) === "pending";
 
       /*
-       * The vehicle only goes back on offer if this booking is
-       * what took it off. A car already out on another rental,
-       * in for maintenance or waiting to be cleaned keeps the
-       * status it has.
+       * An administrator's cancellation applies at once, as it
+       * always has. Anyone else's is a request: the booking
+       * stays listed and the vehicle stays held until an
+       * administrator decides it.
        */
-      if (
-        vehicleRef &&
-        vehicleSnapshot?.exists() &&
-        String(vehicleSnapshot.get("status")) ===
-          "reserved"
-      ) {
-        vehicleReleased = true;
+      if (actor.role !== "admin") {
+        if (waiting) {
+          throw new Error(
+            "A cancellation for this booking is already waiting for an administrator.",
+          );
+        }
 
-        transaction.update(vehicleRef, {
-          status: "available",
+        status = "pending";
 
-          statusNote: null,
+        transaction.set(requestRef, {
+          reservationId,
+          vehicleId,
+          customerNameSnapshot: String(
+            snapshot.get(
+              "customerNameSnapshot",
+            ) ?? "",
+          ),
+          vehicleRegistrationSnapshot: String(
+            snapshot.get(
+              "vehicleRegistrationSnapshot",
+            ) ?? "",
+          ),
+          pickupAt:
+            snapshot.get("pickupAt") ?? null,
+          expectedReturnAt:
+            snapshot.get("expectedReturnAt") ??
+            null,
+          reason,
+          status: "pending",
+          requestedBy: actorUid,
+          requestedByNameSnapshot: actor.name,
+          requestedAt: nowTimestamp(),
+          reviewedBy: null,
+          reviewedByNameSnapshot: null,
+          reviewedAt: null,
+          reviewNote: null,
+          updatedAt: nowTimestamp(),
+        });
 
+        /*
+         * The booking carries the request it is waiting on.
+         * Two requests at once both write it, so one of them
+         * is retried and then sees the other.
+         */
+        transaction.update(reservationRef, {
+          cancellationRequestId: requestRef.id,
+          cancellationRequestStatus: "pending",
+          updatedAt: nowTimestamp(),
+        });
+
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action:
+              "reservation.cancellation_requested",
+            resource: {
+              collection: "cancellationRequests",
+              id: requestRef.id,
+            },
+            details: {
+              actorName: actor.name,
+              reservationId,
+              reason,
+              vehicleId,
+              customerNameSnapshot: String(
+                snapshot.get(
+                  "customerNameSnapshot",
+                ) ?? "",
+              ),
+              vehicleRegistrationSnapshot: String(
+                snapshot.get(
+                  "vehicleRegistrationSnapshot",
+                ) ?? "",
+              ),
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
+
+        return;
+      }
+
+      if (waiting) {
+        throw new Error(
+          "A cancellation for this booking is waiting for a decision. Approve or reject it instead.",
+        );
+      }
+
+      vehicleReleased = writeCancellation(
+        transaction,
+        {
+          reservationId,
+          snapshot,
+          vehicleRef,
+          vehicleSnapshot,
+          reason,
+          cancelledBy: actorUid,
+          cancelledByName: actor.name,
+          request: null,
+        },
+      );
+    },
+  );
+
+  return {
+    reservationId,
+    vehicleReleased,
+    status,
+  };
+}
+
+/*
+ * Once the car has gone out the booking is no longer the thing
+ * holding it — the rental is — so it is returned, not
+ * cancelled.
+ */
+function assertCancellable(value: unknown): void {
+  const status = String(value);
+
+  if (status === "cancelled") {
+    throw new Error(
+      "This booking has already been cancelled.",
+    );
+  }
+
+  if (status !== "confirmed") {
+    throw new Error(
+      status === "checked_out"
+        ? "This booking has already been checked out. Complete the return instead."
+        : "Only a confirmed booking can be cancelled.",
+    );
+  }
+}
+
+/*
+ * Cancels a booking: the same writes whether an administrator
+ * cancels it directly or approves somebody else's request, so
+ * an approved request lands exactly as a cancellation always
+ * has. Returns whether the vehicle was released.
+ */
+function writeCancellation(
+  transaction: {
+    update: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    reservationId: string;
+    snapshot: { get: (field: string) => unknown };
+    vehicleRef: ReturnType<typeof doc> | null;
+    vehicleSnapshot: {
+      exists: () => boolean;
+      get: (field: string) => unknown;
+    } | null;
+    reason: string;
+    cancelledBy: string;
+    cancelledByName: string;
+    /* Set when this approves somebody's request. */
+    request: {
+      id: string;
+      requestedBy: string;
+      requestedByName: string;
+      reviewNote: string | null;
+    } | null;
+  },
+): boolean {
+  const { db } = getFirebaseClient();
+
+  const { snapshot } = input;
+
+  transaction.update(
+    doc(db, "reservations", input.reservationId),
+    {
+      status: "cancelled",
+
+      cancelledBy: input.cancelledBy,
+
+      cancelledByNameSnapshot:
+        input.cancelledByName,
+
+      cancelledAt: nowTimestamp(),
+
+      cancellationReason: input.reason,
+
+      ...(input.request
+        ? {
+            cancellationRequestStatus:
+              "approved",
+            cancellationRequestedBy:
+              input.request.requestedBy,
+            cancellationRequestedByNameSnapshot:
+              input.request.requestedByName,
+          }
+        : {}),
+
+      updatedAt: nowTimestamp(),
+    },
+  );
+
+  /*
+   * The vehicle only goes back on offer if this booking is
+   * what took it off. A car already out on another rental,
+   * in for maintenance or waiting to be cleaned keeps the
+   * status it has.
+   */
+  const vehicleReleased = Boolean(
+    input.vehicleRef &&
+      input.vehicleSnapshot?.exists() &&
+      String(
+        input.vehicleSnapshot.get("status"),
+      ) === "reserved",
+  );
+
+  if (vehicleReleased && input.vehicleRef) {
+    transaction.update(input.vehicleRef, {
+      status: "available",
+
+      statusNote: null,
+
+      updatedAt: nowTimestamp(),
+    });
+  }
+
+  transaction.set(
+    doc(collection(db, "auditLogs")),
+    {
+      actorUid: input.cancelledBy,
+
+      action: input.request
+        ? "reservation.cancellation_approved"
+        : "reservation.cancelled",
+
+      resource: {
+        collection: "reservations",
+        id: input.reservationId,
+      },
+
+      details: {
+        actorName: input.cancelledByName,
+        reason: input.reason,
+        vehicleId: input.vehicleRef?.id ?? null,
+        vehicleReleased,
+
+        ...(input.request
+          ? {
+              requestId: input.request.id,
+              requestedBy:
+                input.request.requestedBy,
+              requestedByName:
+                input.request.requestedByName,
+              decision: "approved",
+              reviewNote:
+                input.request.reviewNote,
+            }
+          : {}),
+
+        customerNameSnapshot: String(
+          snapshot.get(
+            "customerNameSnapshot",
+          ) ?? "",
+        ),
+
+        vehicleRegistrationSnapshot: String(
+          snapshot.get(
+            "vehicleRegistrationSnapshot",
+          ) ?? "",
+        ),
+      },
+
+      createdAt: nowTimestamp(),
+    },
+  );
+
+  return vehicleReleased;
+}
+
+export type RequestStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "withdrawn";
+
+function requestStatusOf(
+  value: unknown,
+): RequestStatus {
+  return value === "approved" ||
+    value === "rejected" ||
+    value === "withdrawn"
+    ? value
+    : "pending";
+}
+
+export type CancellationRequest = {
+  id: string;
+  reservationId: string;
+  customerName: string;
+  vehicleRegistration: string;
+  pickupAt: string | null;
+  expectedReturnAt: string | null;
+  reason: string;
+  status: RequestStatus;
+  requestedBy: string;
+  requestedByName: string;
+  requestedAt: string | null;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+function cancellationRequestFrom(
+  id: string,
+  data: Record<string, unknown>,
+): CancellationRequest {
+  return {
+    id,
+    reservationId: String(
+      data.reservationId ?? "",
+    ),
+    customerName: String(
+      data.customerNameSnapshot ?? "",
+    ),
+    vehicleRegistration: String(
+      data.vehicleRegistrationSnapshot ?? "",
+    ),
+    pickupAt: data.pickupAt
+      ? toIso(data.pickupAt)
+      : null,
+    expectedReturnAt: data.expectedReturnAt
+      ? toIso(data.expectedReturnAt)
+      : null,
+    reason: String(data.reason ?? ""),
+    status: requestStatusOf(data.status),
+    requestedBy: String(data.requestedBy ?? ""),
+    requestedByName: String(
+      data.requestedByNameSnapshot ?? "",
+    ),
+    requestedAt: data.requestedAt
+      ? toIso(data.requestedAt)
+      : null,
+    reviewedByName: trimmedOrNull(
+      data.reviewedByNameSnapshot,
+    ),
+    reviewedAt: data.reviewedAt
+      ? toIso(data.reviewedAt)
+      : null,
+    reviewNote: trimmedOrNull(data.reviewNote),
+  };
+}
+
+/*
+ * Every request still waiting, and the caller's own requests
+ * whatever became of them, so whoever asked can see a
+ * rejection and why. Two single-field queries: no composite
+ * index to deploy.
+ */
+async function listCancellationRequests(): Promise<
+  CancellationRequest[]
+> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const [pending, mine] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "cancellationRequests"),
+        where("status", "==", "pending"),
+        limit(200),
+      ),
+    ),
+
+    getDocs(
+      query(
+        collection(db, "cancellationRequests"),
+        where("requestedBy", "==", actorUid),
+        limit(100),
+      ),
+    ),
+  ]);
+
+  const byId = new Map<
+    string,
+    CancellationRequest
+  >();
+
+  for (const entry of [
+    ...pending.docs,
+    ...mine.docs,
+  ]) {
+    byId.set(
+      entry.id,
+      cancellationRequestFrom(
+        entry.id,
+        entry.data(),
+      ),
+    );
+  }
+
+  return [...byId.values()].sort((a, b) =>
+    String(b.requestedAt).localeCompare(
+      String(a.requestedAt),
+    ),
+  );
+}
+
+/*
+ * An administrator decides a waiting cancellation. The request
+ * is re-read inside the transaction, so of two administrators
+ * deciding at once only the first can win; the second sees it
+ * already decided. Approval cancels the booking exactly as a
+ * direct cancellation does, in the same transaction.
+ */
+async function reviewCancellationRequest(
+  input: {
+    requestId: string;
+    decision: "approve" | "reject";
+    note: string | null;
+  },
+): Promise<{
+  status: RequestStatus;
+  vehicleReleased: boolean;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const requestId = trimmedOrNull(
+    input.requestId,
+  );
+
+  if (!requestId) {
+    throw new Error(
+      "Select the cancellation to review.",
+    );
+  }
+
+  if (
+    input.decision !== "approve" &&
+    input.decision !== "reject"
+  ) {
+    throw new Error(
+      "Choose whether to approve or reject the cancellation.",
+    );
+  }
+
+  const note = trimmedOrNull(input.note);
+
+  if (input.decision === "reject" && !note) {
+    throw new Error(
+      "Say why the cancellation is rejected.",
+    );
+  }
+
+  if (note && note.length > 1000) {
+    throw new Error(
+      "Keep the review note under 1000 characters.",
+    );
+  }
+
+  const requestRef = doc(
+    db,
+    "cancellationRequests",
+    requestId,
+  );
+
+  let result: {
+    status: RequestStatus;
+    vehicleReleased: boolean;
+  } = { status: "pending", vehicleReleased: false };
+
+  await runTransaction(db, async (transaction) => {
+    const requestSnapshot =
+      await transaction.get(requestRef);
+
+    if (!requestSnapshot.exists()) {
+      throw new Error(
+        "Cancellation request was not found.",
+      );
+    }
+
+    const request = requestSnapshot.data();
+
+    if (
+      requestStatusOf(request.status) !==
+      "pending"
+    ) {
+      throw new Error(
+        "This cancellation has already been decided.",
+      );
+    }
+
+    const reservationId = String(
+      request.reservationId ?? "",
+    );
+
+    const reservationRef = doc(
+      db,
+      "reservations",
+      reservationId,
+    );
+
+    const reservationSnapshot =
+      await transaction.get(reservationRef);
+
+    const vehicleId = trimmedOrNull(
+      reservationSnapshot.get("vehicleId"),
+    );
+
+    const vehicleRef = vehicleId
+      ? doc(db, "vehicles", vehicleId)
+      : null;
+
+    const vehicleSnapshot = vehicleRef
+      ? await transaction.get(vehicleRef)
+      : null;
+
+    const actor = await actorProfileSnapshot(
+      transaction,
+      actorUid,
+    );
+
+    if (actor.role !== "admin") {
+      throw new Error(
+        "Only an administrator can decide a cancellation.",
+      );
+    }
+
+    if (request.requestedBy === actorUid) {
+      throw new Error(
+        "A request has to be decided by another administrator.",
+      );
+    }
+
+    const status: RequestStatus =
+      input.decision === "approve"
+        ? "approved"
+        : "rejected";
+
+    let vehicleReleased = false;
+
+    if (status === "approved") {
+      if (!reservationSnapshot.exists()) {
+        throw new Error(
+          "Booking was not found.",
+        );
+      }
+
+      assertCancellable(
+        reservationSnapshot.get("status"),
+      );
+
+      vehicleReleased = writeCancellation(
+        transaction,
+        {
+          reservationId,
+          snapshot: reservationSnapshot,
+          vehicleRef,
+          vehicleSnapshot,
+          reason: String(request.reason ?? ""),
+          cancelledBy: actorUid,
+          cancelledByName: actor.name,
+          request: {
+            id: requestId,
+            requestedBy: String(
+              request.requestedBy ?? "",
+            ),
+            requestedByName: String(
+              request.requestedByNameSnapshot ??
+                "",
+            ),
+            reviewNote: note,
+          },
+        },
+      );
+    } else {
+      if (reservationSnapshot.exists()) {
+        transaction.update(reservationRef, {
+          cancellationRequestStatus:
+            "rejected",
           updatedAt: nowTimestamp(),
         });
       }
@@ -2904,40 +3459,44 @@ async function cancelReservation(
         doc(collection(db, "auditLogs")),
         {
           actorUid,
-
-          action: "reservation.cancelled",
-
+          action:
+            "reservation.cancellation_rejected",
           resource: {
-            collection: "reservations",
-            id: reservationId,
+            collection: "cancellationRequests",
+            id: requestId,
           },
-
           details: {
-            actorName,
-            reason,
-            vehicleId,
-            vehicleReleased,
-
-            customerNameSnapshot: String(
-              snapshot.get(
-                "customerNameSnapshot",
-              ) ?? "",
+            actorName: actor.name,
+            reservationId,
+            reason: String(request.reason ?? ""),
+            requestedBy: String(
+              request.requestedBy ?? "",
             ),
-
-            vehicleRegistrationSnapshot: String(
-              snapshot.get(
-                "vehicleRegistrationSnapshot",
-              ) ?? "",
+            requestedByName: String(
+              request.requestedByNameSnapshot ??
+                "",
             ),
+            decision: "rejected",
+            reviewNote: note,
           },
-
           createdAt: nowTimestamp(),
         },
       );
-    },
-  );
+    }
 
-  return { reservationId, vehicleReleased };
+    transaction.update(requestRef, {
+      status,
+      reviewedBy: actorUid,
+      reviewedByNameSnapshot: actor.name,
+      reviewedAt: nowTimestamp(),
+      reviewNote: note,
+      updatedAt: nowTimestamp(),
+    });
+
+    result = { status, vehicleReleased };
+  });
+
+  return result;
 }
 
 /* =========================================================
@@ -3562,6 +4121,47 @@ async function checkoutReservation(
         );
       }
 
+      /*
+       * A booking waiting on a cancellation can still be
+       * checked out — the renter turned up after all — and
+       * doing so withdraws the request. Read before any write.
+       */
+      const waitingCancellationId =
+        reservation.cancellationRequestStatus ===
+        "pending"
+          ? trimmedOrNull(
+              reservation.cancellationRequestId,
+            )
+          : null;
+
+      const waitingCancellationRef =
+        waitingCancellationId
+          ? doc(
+              db,
+              "cancellationRequests",
+              waitingCancellationId,
+            )
+          : null;
+
+      const waitingCancellation =
+        waitingCancellationRef
+          ? await transaction.get(
+              waitingCancellationRef,
+            )
+          : null;
+
+      /*
+       * The request bookkeeping belongs to the booking, not
+       * to the rental made from it.
+       */
+      const {
+        cancellationRequestId:
+          _cancellationRequestId,
+        cancellationRequestStatus:
+          _cancellationRequestStatus,
+        ...bookingFields
+      } = reservation;
+
       const vehicleRef =
         doc(
           db,
@@ -3691,7 +4291,7 @@ async function checkoutReservation(
       transaction.set(
         rentalRef,
         {
-          ...reservation,
+          ...bookingFields,
 
           reservationId:
             reservationRef.id,
@@ -3828,10 +4428,61 @@ async function checkoutReservation(
           rentalId:
             rentalRef.id,
 
+          ...(waitingCancellationRef
+            ? {
+                cancellationRequestStatus:
+                  "withdrawn",
+              }
+            : {}),
+
           updatedAt:
             nowTimestamp(),
         },
       );
+
+      if (
+        waitingCancellationRef &&
+        waitingCancellation?.exists() &&
+        waitingCancellation.get("status") ===
+          "pending"
+      ) {
+        transaction.update(
+          waitingCancellationRef,
+          {
+            status: "withdrawn",
+            withdrawnBy: actorUid,
+            withdrawnAt: nowTimestamp(),
+            updatedAt: nowTimestamp(),
+          },
+        );
+
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action:
+              "reservation.cancellation_withdrawn",
+            resource: {
+              collection:
+                "cancellationRequests",
+              id: waitingCancellationRef.id,
+            },
+            details: {
+              reservationId:
+                reservationRef.id,
+              rentalId: rentalRef.id,
+              reason: String(
+                waitingCancellation.get(
+                  "reason",
+                ) ?? "",
+              ),
+              decision: "withdrawn",
+              note: "The booking was checked out while the cancellation waited.",
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
+      }
 
       /*
        * The vehicle carries its damage from one hire to the
@@ -10634,6 +11285,22 @@ export async function callFirestoreOperation<
           data as {
             reservationId: string;
             reason: string;
+          },
+        )) as TResult
+      );
+
+    case "listCancellationRequests":
+      return (
+        (await listCancellationRequests()) as TResult
+      );
+
+    case "reviewCancellationRequest":
+      return (
+        (await reviewCancellationRequest(
+          data as {
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
           },
         )) as TResult
       );

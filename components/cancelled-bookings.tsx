@@ -141,6 +141,9 @@ export function CancelledBookings() {
               {" by "}
               {booking.cancelledByName ??
                 "an unrecorded account"}
+              {booking.requestedByName
+                ? ` at ${booking.requestedByName}'s request`
+                : ""}
               {booking.reason
                 ? ` · “${booking.reason}”`
                 : " · no reason given"}

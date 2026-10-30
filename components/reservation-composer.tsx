@@ -69,6 +69,7 @@ import {
 import {
   callFirestoreOperation,
   type AdditionalFeeType,
+  type CancellationRequest,
   type ContractQueueEntry,
   type PayableRental,
   type RentalDiscount,
@@ -132,6 +133,8 @@ type Reservation = {
   expectedReturnAt: string | null;
   /* Written down after the pickup it records had passed. */
   backdated: boolean;
+  /* The cancellation it is waiting on, or was last refused. */
+  cancellationRequestStatus: string | null;
   /* Extended prices for the agreement's charges table:
      units booked multiplied by the rate quoted at booking. */
   dailyCents: number;
@@ -625,6 +628,22 @@ export function ReservationComposer() {
 
   const [cancelBusy, setCancelBusy] =
     useState(false);
+
+  /*
+   * Cancellations asked for by anyone other than an
+   * administrator wait for one. Every waiting request is
+   * listed, plus this person's own, so a rejection reaches
+   * whoever asked.
+   */
+  const [
+    cancellationRequests,
+    setCancellationRequests,
+  ] = useState<CancellationRequest[]>([]);
+
+  const [
+    cancellationNotes,
+    setCancellationNotes,
+  ] = useState<Record<string, string>>({});
 
   const [bookingMedia, setBookingMedia] =
     useState<CloudinaryMedia[]>([]);
@@ -1138,6 +1157,10 @@ export function ReservationComposer() {
               snapshot.get(
                 "backdated",
               ) === true,
+            cancellationRequestStatus:
+              snapshot.get(
+                "cancellationRequestStatus",
+              ) ?? null,
             dailyCents:
               extendedPrice(
                 snapshot,
@@ -1319,6 +1342,32 @@ export function ReservationComposer() {
     }
   }
 
+  /*
+   * Read on its own, like the contract queue, so rules that
+   * have not been deployed yet cost this panel and nothing
+   * else on the desk.
+   */
+  async function loadCancellationRequests() {
+    try {
+      setCancellationRequests(
+        await callFirestoreOperation<
+          undefined,
+          CancellationRequest[]
+        >(
+          "listCancellationRequests",
+          undefined,
+        ),
+      );
+    } catch (cause) {
+      console.error(
+        "[ReservationComposer] loadCancellationRequests failed:",
+        cause,
+      );
+
+      setCancellationRequests([]);
+    }
+  }
+
   useEffect(() => {
     const timer =
       window.setTimeout(
@@ -1326,6 +1375,7 @@ export function ReservationComposer() {
           void load();
           void loadPayableRentals();
           void loadContractQueue();
+          void loadCancellationRequests();
         },
         0,
       );
@@ -1380,6 +1430,7 @@ export function ReservationComposer() {
 
       await load();
       await loadPayableRentals();
+      await loadCancellationRequests();
     } catch (cause) {
       setError(
         firebaseErrorMessage(
@@ -1904,6 +1955,7 @@ export function ReservationComposer() {
           {
             reservationId: string;
             vehicleReleased: boolean;
+            status: "cancelled" | "pending";
           }
         >("cancelReservation", {
           reservationId: reservation.id,
@@ -1914,11 +1966,14 @@ export function ReservationComposer() {
       setCancelReason("");
 
       await load();
+      await loadCancellationRequests();
 
       setNotice(
-        result.vehicleReleased
-          ? `Booking cancelled · ${reservation.vehicleRegistration} is available again.`
-          : "Booking cancelled.",
+        result.status === "pending"
+          ? `Cancellation of ${reservation.vehicleRegistration} sent to an administrator for approval. The booking stays reserved until then.`
+          : result.vehicleReleased
+            ? `Booking cancelled · ${reservation.vehicleRegistration} is available again.`
+            : "Booking cancelled.",
       );
     } catch (cause) {
       setError(
@@ -1928,6 +1983,89 @@ export function ReservationComposer() {
       setCancelBusy(false);
     }
   }
+
+  function decideCancellation(
+    request: CancellationRequest,
+    decision: "approve" | "reject",
+  ) {
+    void run(async () => {
+      const result =
+        await callFirestoreOperation<
+          {
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+          {
+            status: string;
+            vehicleReleased: boolean;
+          }
+        >("reviewCancellationRequest", {
+          requestId: request.id,
+          decision,
+          note:
+            cancellationNotes[request.id]?.trim() ||
+            null,
+        });
+
+      setCancellationNotes((current) => {
+        const next = { ...current };
+
+        delete next[request.id];
+
+        return next;
+      });
+
+      return result.status === "approved"
+        ? `Cancellation approved · ${request.vehicleRegistration} booking cancelled${
+            result.vehicleReleased
+              ? " and the vehicle is available again"
+              : ""
+          }.`
+        : `Cancellation of ${request.vehicleRegistration} rejected · the booking stays active.`;
+    });
+  }
+
+  /* The request a booking is waiting on, if any. */
+  function waitingCancellation(
+    reservationId: string,
+  ): CancellationRequest | undefined {
+    return cancellationRequests.find(
+      (request) =>
+        request.reservationId ===
+          reservationId &&
+        request.status === "pending",
+    );
+  }
+
+  /*
+   * The most recent refusal of a cancellation this person asked
+   * for, while the booking is still live and nothing newer is
+   * waiting.
+   */
+  function rejectedCancellation(
+    reservation: Reservation,
+  ): CancellationRequest | undefined {
+    if (
+      reservation.cancellationRequestStatus !==
+      "rejected"
+    ) {
+      return undefined;
+    }
+
+    return cancellationRequests.find(
+      (request) =>
+        request.reservationId ===
+          reservation.id &&
+        request.status === "rejected",
+    );
+  }
+
+  const waitingCancellations =
+    cancellationRequests.filter(
+      (request) =>
+        request.status === "pending",
+    );
 
   function createReservation(
     event: React.FormEvent<HTMLFormElement>,
@@ -3121,6 +3259,14 @@ export function ReservationComposer() {
                       </span>
                     )}
 
+                    {waitingCancellation(
+                      reservation.id,
+                    ) && (
+                      <span className="status-pill cleaning">
+                        Cancellation waiting for approval
+                      </span>
+                    )}
+
                     <span className="booking-list-detail">
                       <strong>
                         {
@@ -3140,9 +3286,30 @@ export function ReservationComposer() {
                             )}`
                           : ""}
                       </small>
+
+                      {(() => {
+                        const rejected =
+                          rejectedCancellation(
+                            reservation,
+                          );
+
+                        return rejected ? (
+                          <small>
+                            Cancellation rejected
+                            {rejected.reviewedByName
+                              ? ` by ${rejected.reviewedByName}`
+                              : ""}
+                            {rejected.reviewNote
+                              ? ` · “${rejected.reviewNote}”`
+                              : ""}
+                          </small>
+                        ) : null;
+                      })()}
                     </span>
 
-                    {cancellingId ===
+                    {waitingCancellation(
+                      reservation.id,
+                    ) ? null : cancellingId ===
                     reservation.id ? (
                       <span className="booking-list-confirm">
                         <input
@@ -3177,7 +3344,9 @@ export function ReservationComposer() {
                         >
                           {cancelBusy
                             ? "Cancelling…"
-                            : "Yes, cancel"}
+                            : isAdmin
+                              ? "Yes, cancel"
+                              : "Ask to cancel"}
                         </button>
 
                         <button
@@ -3223,6 +3392,114 @@ export function ReservationComposer() {
                         Cancel booking
                       </button>
                     )}
+                  </li>
+                ),
+              )}
+            </ul>
+          </section>
+        )}
+
+      {/*
+        * Cancellations asked for by staff, waiting for an
+        * administrator. Nothing about the booking changes until
+        * one is approved here.
+        */}
+      {tab === "booking" &&
+        isAdmin &&
+        waitingCancellations.length > 0 && (
+          <section className="surface booking-list">
+            <p className="section-kicker">
+              Cancellations waiting for your
+              approval
+            </p>
+
+            <ul>
+              {waitingCancellations.map(
+                (request) => (
+                  <li key={request.id}>
+                    <span className="booking-list-detail">
+                      <strong>
+                        {request.vehicleRegistration}
+                        {" · "}
+                        {request.customerName}
+                      </strong>
+
+                      <small>
+                        {request.pickupAt
+                          ? `${bookingMoment(
+                              request.pickupAt,
+                            )} → ${bookingMoment(
+                              request.expectedReturnAt,
+                            )} · `
+                          : ""}
+                        “{request.reason}”
+                      </small>
+
+                      <small>
+                        Asked by{" "}
+                        {request.requestedByName ||
+                          "staff"}
+                        {" · "}
+                        {bookingMoment(
+                          request.requestedAt,
+                        )}
+                      </small>
+                    </span>
+
+                    <span className="booking-list-confirm">
+                      <input
+                        aria-label="Decision note"
+                        placeholder="Note (required to reject)"
+                        maxLength={1000}
+                        value={
+                          cancellationNotes[
+                            request.id
+                          ] ?? ""
+                        }
+                        onChange={(event) =>
+                          setCancellationNotes(
+                            (current) => ({
+                              ...current,
+                              [request.id]:
+                                event.target.value,
+                            }),
+                          )
+                        }
+                      />
+
+                      <button
+                        className="button button-danger compact"
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          decideCancellation(
+                            request,
+                            "approve",
+                          )
+                        }
+                      >
+                        Approve
+                      </button>
+
+                      <button
+                        className="button button-secondary compact"
+                        type="button"
+                        disabled={
+                          busy ||
+                          !cancellationNotes[
+                            request.id
+                          ]?.trim()
+                        }
+                        onClick={() =>
+                          decideCancellation(
+                            request,
+                            "reject",
+                          )
+                        }
+                      >
+                        Reject
+                      </button>
+                    </span>
                   </li>
                 ),
               )}
@@ -4531,6 +4808,17 @@ export function ReservationComposer() {
                   ),
                 )}
               </select>
+
+              {checkoutReservationId &&
+                waitingCancellation(
+                  checkoutReservationId,
+                ) && (
+                  <p className="form-help">
+                    A cancellation of this booking is
+                    waiting for approval. Checking it out
+                    withdraws the request.
+                  </p>
+                )}
             </div>
 
             <div className="field">

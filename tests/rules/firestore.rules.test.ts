@@ -17,6 +17,7 @@ import {
   updateDoc,
   deleteDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
 import { afterAll, beforeAll, describe, it } from "vitest";
 
@@ -90,6 +91,30 @@ beforeAll(async () => {
     await setDoc(doc(db, "vehicleRegistry", "reg_RT-001"), { vehicleId: "vehicle_001", value: "RT-001" });
     await setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1000 });
     await setDoc(doc(db, "rentals", "rental_open"), { status: "active", pickupOdometerKm: 1000 });
+
+    /* Cancellation requests: one booking free to ask about, and
+       bookings already waiting on a request. */
+    await setDoc(doc(db, "reservations", "res_free"), { status: "confirmed", vehicleId: "vehicle_001" });
+    for (const [requestId, reservationId, requestedBy] of [
+      ["cancel_pending", "res_waiting", OPS],
+      ["cancel_pending_2", "res_waiting_2", OPS],
+      ["cancel_pending_3", "res_waiting_3", OPS],
+      ["cancel_admin_own", "res_waiting_admin", ADMIN],
+    ]) {
+      await setDoc(doc(db, "reservations", reservationId), {
+        status: "confirmed",
+        cancellationRequestId: requestId,
+        cancellationRequestStatus: "pending",
+      });
+      await setDoc(doc(db, "cancellationRequests", requestId), {
+        reservationId,
+        reason: "Customer changed plans",
+        status: "pending",
+        requestedBy,
+        reviewedBy: null,
+        reviewNote: null,
+      });
+    }
 
     await setDoc(doc(db, "reservationContracts", "contract_review"), {
       status: "in_review",
@@ -191,7 +216,7 @@ describe("Firestore access policy", () => {
   });
 
   it("only cancels a booking that says why", async () => {
-    const db = asUser(OPS);
+    const db = asUser(ADMIN);
 
     await assertSucceeds(setDoc(doc(db, "reservations", "reservation_cancel"), { status: "confirmed" }));
     await assertFails(
@@ -212,6 +237,140 @@ describe("Firestore access policy", () => {
         cancellationReason: "Customer changed their travel dates",
       }),
     );
+  });
+
+  it("stops operations staff cancelling a booking directly", async () => {
+    await assertSucceeds(setDoc(doc(asUser(OPS), "reservations", "reservation_ops_cancel"), { status: "confirmed" }));
+    await assertFails(
+      updateDoc(doc(asUser(OPS), "reservations", "reservation_ops_cancel"), {
+        status: "cancelled",
+        cancellationReason: "Customer changed their travel dates",
+      }),
+    );
+  });
+
+  it("lets staff ask for a cancellation only as their own pending request, locked to the booking", async () => {
+    const db = asUser(OPS);
+    const request = (id: string, data: Record<string, unknown>) => {
+      const batch = writeBatch(db);
+      batch.set(doc(db, "cancellationRequests", id), data);
+      batch.update(doc(db, "reservations", "res_free"), {
+        cancellationRequestId: id,
+        cancellationRequestStatus: "pending",
+      });
+      return batch.commit();
+    };
+    const asked = { reservationId: "res_free", reason: "Flight cancelled", status: "pending", requestedBy: OPS };
+
+    await assertFails(request("cr_other_name", { ...asked, requestedBy: ADMIN }));
+    await assertFails(request("cr_self_approved", { ...asked, status: "approved" }));
+    await assertFails(request("cr_no_reason", { ...asked, reason: "  " }));
+    await assertFails(setDoc(doc(db, "cancellationRequests", "cr_unlocked"), asked));
+    await assertSucceeds(request("cr_ok", asked));
+
+    /* Nothing else can be asked while that one waits. */
+    await assertFails(request("cr_second", asked));
+
+    /* The booking is still confirmed, and staff cannot fake the decision on it. */
+    await assertFails(updateDoc(doc(db, "reservations", "res_free"), { cancellationRequestStatus: "approved" }));
+    await assertSucceeds(getDoc(doc(db, "cancellationRequests", "cr_ok")));
+  });
+
+  it("keeps the cancellation decision with an administrator, once, and as asked", async () => {
+    const admin = asUser(ADMIN);
+    const ops = asUser(OPS);
+    const decided = { status: "approved", reviewedBy: ADMIN, reviewedAt: serverTimestamp(), reviewNote: null };
+
+    /* Staff cannot approve, even with the booking cancelled alongside. */
+    const opsBatch = writeBatch(ops);
+    opsBatch.update(doc(ops, "cancellationRequests", "cancel_pending"), { ...decided, reviewedBy: OPS });
+    await assertFails(opsBatch.commit());
+
+    /* An approval that does not cancel the booking is refused. */
+    await assertFails(updateDoc(doc(admin, "cancellationRequests", "cancel_pending"), decided));
+
+    /* The reason asked for cannot be rewritten while deciding. */
+    const rewrite = writeBatch(admin);
+    rewrite.update(doc(admin, "reservations", "res_waiting"), { status: "cancelled", cancellationReason: "x" });
+    rewrite.update(doc(admin, "cancellationRequests", "cancel_pending"), { ...decided, reason: "Something else" });
+    await assertFails(rewrite.commit());
+
+    /* Recorded in somebody else's name. */
+    const otherName = writeBatch(admin);
+    otherName.update(doc(admin, "reservations", "res_waiting"), { status: "cancelled", cancellationReason: "x" });
+    otherName.update(doc(admin, "cancellationRequests", "cancel_pending"), { ...decided, reviewedBy: OPS });
+    await assertFails(otherName.commit());
+
+    const approve = writeBatch(admin);
+    approve.update(doc(admin, "reservations", "res_waiting"), {
+      status: "cancelled",
+      cancellationReason: "Customer changed plans",
+      cancellationRequestStatus: "approved",
+    });
+    approve.update(doc(admin, "cancellationRequests", "cancel_pending"), decided);
+    await assertSucceeds(approve.commit());
+
+    /* Only once. */
+    await assertFails(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_pending"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "Changed my mind",
+      }),
+    );
+
+    /* A rejection needs a note. */
+    await assertFails(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_pending_2"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: " ",
+      }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_pending_2"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "The customer confirmed the booking by phone",
+      }),
+    );
+
+    /* Never one's own request. */
+    await assertFails(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_admin_own"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "Mine",
+      }),
+    );
+
+    /* Never deleted. */
+    await assertFails(deleteDoc(doc(admin, "cancellationRequests", "cancel_pending")));
+    await assertFails(deleteDoc(doc(ops, "cancellationRequests", "cancel_pending_3")));
+  });
+
+  it("withdraws a waiting cancellation only by checking the booking out", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(
+      updateDoc(doc(db, "cancellationRequests", "cancel_pending_3"), {
+        status: "withdrawn",
+        withdrawnBy: OPS,
+      }),
+    );
+
+    const checkout = writeBatch(db);
+    checkout.update(doc(db, "reservations", "res_waiting_3"), {
+      status: "checked_out",
+      rentalId: "rental_x",
+      cancellationRequestStatus: "withdrawn",
+    });
+    checkout.update(doc(db, "cancellationRequests", "cancel_pending_3"), {
+      status: "withdrawn",
+      withdrawnBy: OPS,
+      withdrawnAt: serverTimestamp(),
+    });
+    await assertSucceeds(checkout.commit());
   });
 
   it("keeps profit reporting away from operations staff", async () => {
@@ -704,6 +863,7 @@ describe("Firestore access policy", () => {
     ["auditLogs", "audit_001"],
     ["idempotencyKeys", "payment_001"],
     ["rentalDiscounts", "discount_decided"],
+    ["cancellationRequests", "cancel_pending_3"],
   ];
 
   it("matches every collection the application reads with a rule", async () => {

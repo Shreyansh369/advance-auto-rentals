@@ -103,6 +103,51 @@ type AppShellProps = {
   action?: React.ReactNode;
 };
 
+/*
+ * Requests from staff waiting for an administrator, counted
+ * live from one collection. Only an administrator decides
+ * them, so nobody else is shown the number.
+ */
+function usePendingRequestCount(
+  collectionName: string,
+  role: string | null | undefined,
+): number {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    if (role !== "admin") {
+      return;
+    }
+
+    let unsubscribe:
+      | (() => void)
+      | undefined;
+
+    try {
+      const { db } = getFirebaseClient();
+
+      unsubscribe = onSnapshot(
+        query(
+          collection(db, collectionName),
+          where("status", "==", "pending"),
+          limit(PENDING_BADGE_CEILING + 1),
+        ),
+
+        (snapshot) => setCount(snapshot.size),
+
+        /* A refused or failed read shows no count. */
+        () => setCount(0),
+      );
+    } catch {
+      // Firebase is unconfigured; the shell reports that itself.
+    }
+
+    return () => unsubscribe?.();
+  }, [collectionName, role]);
+
+  return role === "admin" ? count : 0;
+}
+
 export function AppShell({
   children,
   title,
@@ -240,6 +285,13 @@ export function AppShell({
 
     return () => unsubscribe?.();
   }, [role]);
+
+  /* Cancellations asked for by staff, waiting the same way. */
+  const pendingCancellationRequests =
+    usePendingRequestCount(
+      "cancellationRequests",
+      role,
+    );
 
   /*
    * A booking called off leaves the list without a trace, so
@@ -433,7 +485,8 @@ export function AppShell({
                 countsPendingStaff
                   ? pendingStaff
                   : countsPendingDiscounts
-                    ? pendingDiscounts
+                    ? pendingDiscounts +
+                      pendingCancellationRequests
                     : 0;
 
               return (

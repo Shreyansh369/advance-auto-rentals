@@ -44,6 +44,64 @@ service cloud.firestore {
 
 
     /* =========================================================
+       APPROVAL REQUESTS
+       ========================================================= */
+
+    /* A decision may write only these fields, so nothing that
+       was asked for can be changed while deciding it. */
+    function decisionFieldsOnly() {
+      return request.resource.data.diff(resource.data)
+        .affectedKeys()
+        .hasOnly([
+          "status",
+          "reviewedBy",
+          "reviewedByNameSnapshot",
+          "reviewedAt",
+          "reviewNote",
+          "updatedAt"
+        ]);
+    }
+
+    /* An administrator decides a waiting request once, in
+       their own name, and never their own request. */
+    function adminDecidesPending() {
+      return isAdmin()
+        && resource.data.status == "pending"
+        && request.resource.data.status in [
+          "approved",
+          "rejected"
+        ]
+        && decisionFieldsOnly()
+        && request.resource.data.reviewedBy
+            == request.auth.uid
+        && resource.data.requestedBy
+            != request.auth.uid;
+    }
+
+    /* A rejection always says why. */
+    function rejectionExplained() {
+      return request.resource.data.status != "rejected"
+        || (
+          request.resource.data.get("reviewNote", null)
+              is string
+          && request.resource.data.reviewNote.trim().size()
+              > 0
+        );
+    }
+
+    /* Asked in the caller's own name, waiting, with a reason. */
+    function pendingRequestInOwnName() {
+      return request.resource.data.status == "pending"
+        && request.resource.data.requestedBy
+            == request.auth.uid
+        && request.resource.data.get("reason", null)
+            is string
+        && request.resource.data.reason.trim().size() > 0
+        && request.resource.data.reason.size() <= 500;
+    }
+
+
+    /* =========================================================
        USERS / STAFF
        ========================================================= */
 
@@ -162,6 +220,58 @@ allow list: if isAdmin();
        RESERVATIONS
        ========================================================= */
 
+    function cancellationLockUntouched() {
+      return !request.resource.data.diff(resource.data)
+        .affectedKeys()
+        .hasAny([
+          "cancellationRequestId",
+          "cancellationRequestStatus",
+          "cancellationRequestedBy",
+          "cancellationRequestedByNameSnapshot"
+        ]);
+    }
+
+    /* Staff point the booking at the request they have just
+       written, and only when nothing else is waiting on it. */
+    function openingCancellationRequest(reservationId) {
+      let requestId =
+        request.resource.data.get(
+          "cancellationRequestId", null
+        );
+      let after = getAfter(
+        /databases/$(database)/documents/cancellationRequests/$(requestId)
+      ).data;
+
+      return resource.data.get(
+            "cancellationRequestStatus", null
+          ) != "pending"
+        && request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasOnly([
+              "cancellationRequestId",
+              "cancellationRequestStatus",
+              "updatedAt"
+            ])
+        && request.resource.data.cancellationRequestStatus
+            == "pending"
+        && requestId is string
+        && after.status == "pending"
+        && after.reservationId == reservationId;
+    }
+
+    /* Checking a booking out withdraws the cancellation it was
+       waiting on. */
+    function withdrawingCancellationAtCheckout() {
+      return resource.data.get(
+            "cancellationRequestStatus", null
+          ) == "pending"
+        && request.resource.data.status == "checked_out"
+        && request.resource.data.cancellationRequestStatus
+            == "withdrawn"
+        && request.resource.data.cancellationRequestId
+            == resource.data.cancellationRequestId;
+    }
+
     match /reservations/{reservationId} {
 
       allow read: if isStaff();
@@ -169,7 +279,9 @@ allow list: if isAdmin();
       allow create: if isStaff();
 
       /* A booking is only cancelled with a reason: the
-         cancelled list on Bookings says why each one went. */
+         cancelled list on Bookings says why each one went.
+         Only an administrator cancels; anyone else asks, and
+         the booking carries the request it is waiting on. */
       allow update: if isStaff()
         && (
           request.resource.data.get("status", null)
@@ -177,15 +289,76 @@ allow list: if isAdmin();
           || resource.data.get("status", null)
               == "cancelled"
           || (
-            request.resource.data.get(
+            isAdmin()
+            && request.resource.data.get(
               "cancellationReason", null
             ) is string
             && request.resource.data.cancellationReason
                 .trim().size() > 0
           )
+        )
+        && (
+          isAdmin()
+          || cancellationLockUntouched()
+          || openingCancellationRequest(reservationId)
+          || withdrawingCancellationAtCheckout()
         );
 
       allow delete: if isAdmin();
+    }
+
+
+    /* =========================================================
+       CANCELLATION REQUESTS
+       ========================================================= */
+
+    match /cancellationRequests/{requestId} {
+
+      allow read: if isStaff();
+
+      /* Staff ask, in their own name, for a booking that is
+         still confirmed, and the booking is locked to this
+         request in the same write. */
+      allow create: if isStaff()
+        && pendingRequestInOwnName()
+        && request.resource.data.reservationId is string
+        && get(
+          /databases/$(database)/documents/reservations/$(request.resource.data.reservationId)
+        ).data.status == "confirmed"
+        && getAfter(
+          /databases/$(database)/documents/reservations/$(request.resource.data.reservationId)
+        ).data.cancellationRequestId == requestId;
+
+      /* An administrator approves only by cancelling the
+         booking in the same write, or rejects with a note. */
+      allow update: if adminDecidesPending()
+        && rejectionExplained()
+        && (
+          request.resource.data.status != "approved"
+          || getAfter(
+            /databases/$(database)/documents/reservations/$(resource.data.reservationId)
+          ).data.status == "cancelled"
+        );
+
+      /* Checking the booking out withdraws the request. */
+      allow update: if isStaff()
+        && resource.data.status == "pending"
+        && request.resource.data.status == "withdrawn"
+        && request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasOnly([
+              "status",
+              "withdrawnBy",
+              "withdrawnAt",
+              "updatedAt"
+            ])
+        && request.resource.data.withdrawnBy
+            == request.auth.uid
+        && getAfter(
+          /databases/$(database)/documents/reservations/$(resource.data.reservationId)
+        ).data.status == "checked_out";
+
+      allow delete: if false;
     }
 
 
