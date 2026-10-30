@@ -9,7 +9,11 @@ import {
 
 import {
   connectAuthEmulator,
+  browserLocalPersistence,
+  browserPopupRedirectResolver,
   getAuth,
+  indexedDBLocalPersistence,
+  initializeAuth,
   type Auth,
 } from "firebase/auth";
 
@@ -49,6 +53,36 @@ let emulatorsConnected = false;
 
 let appCheckInitialized = false;
 
+/*
+ * The signed-in session is kept in localStorage first.
+ *
+ * Firebase's default store, IndexedDB, closes itself whenever the
+ * page is hidden and refuses to reopen until it is visible again.
+ * On an iPad or a phone "Continue with Google" opens Google in a
+ * new tab, which hides this one, so when Google handed the session
+ * back it could not be saved and sign-in failed with "Database is
+ * closing/hidden". localStorage has no such state.
+ *
+ * IndexedDB stays second in the list: a session already stored
+ * there is found and moved across, so nobody signed in today has
+ * to sign in again.
+ */
+function browserAuth(app: FirebaseApp): Auth {
+  try {
+    return initializeAuth(app, {
+      persistence: [
+        browserLocalPersistence,
+        indexedDBLocalPersistence,
+      ],
+      popupRedirectResolver:
+        browserPopupRedirectResolver,
+    });
+  } catch {
+    /* Already set up, e.g. after a hot reload in development. */
+    return getAuth(app);
+  }
+}
+
 export function getFirebaseClient(): FirebaseClient {
   if (client) {
     return client;
@@ -71,7 +105,9 @@ export function getFirebaseClient(): FirebaseClient {
         );
 
   const auth =
-    getAuth(app);
+    typeof window === "undefined"
+      ? getAuth(app)
+      : browserAuth(app);
 
   const db =
     getFirestore(app);
