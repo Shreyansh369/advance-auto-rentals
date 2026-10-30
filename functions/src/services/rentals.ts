@@ -849,7 +849,7 @@ export async function returnRental(
     rentalId: string;
     actualReturnAt: string;
     returnFuelLevel: string;
-    returnOdometer: { value: number; unit: "km" | "mi" };
+    returnOdometer: { value: number; unit: "km" | "mi" } | null;
 
     adjustments: Array<{
       amountCents: number;
@@ -921,12 +921,15 @@ export async function returnRental(
         );
       }
 
-      const returnOdometerKm = odometerToKm(
-        input.returnOdometer.value,
-        input.returnOdometer.unit,
-      );
+      const returnOdometerKm = input.returnOdometer
+        ? odometerToKm(
+            input.returnOdometer.value,
+            input.returnOdometer.unit,
+          )
+        : null;
 
       if (
+        returnOdometerKm !== null &&
         returnOdometerKm <
         Number(
           rentalSnapshot.get("pickupOdometerKm") ?? 0,
@@ -995,9 +998,9 @@ export async function returnRental(
 
           returnOdometerKm,
           returnOdometerValue:
-            input.returnOdometer.value,
+            input.returnOdometer?.value ?? null,
           returnOdometerUnit:
-            input.returnOdometer.unit,
+            input.returnOdometer?.unit ?? null,
 
           returnNotes:
             input.notes,

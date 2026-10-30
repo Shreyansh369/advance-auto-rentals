@@ -2504,7 +2504,7 @@ export function ReservationComposer() {
                 unit:
                   | "km"
                   | "mi";
-              };
+              } | null;
               adjustments: Array<{
                 type: string;
                 amountCents: number;
@@ -2543,21 +2543,28 @@ export function ReservationComposer() {
                   ),
                 ),
 
-              returnOdometer: {
-                value: Number(
-                  form.get(
-                    "returnOdometerValue",
-                  ),
-                ),
-                unit:
-                  String(
-                    form.get(
-                      "returnOdometerUnit",
+              /* Optional: a blank is sent as no reading. */
+              returnOdometer: String(
+                form.get(
+                  "returnOdometerValue",
+                ) ?? "",
+              ).trim()
+                ? {
+                    value: Number(
+                      form.get(
+                        "returnOdometerValue",
+                      ),
                     ),
-                  ) as
-                    | "km"
-                    | "mi",
-              },
+                    unit:
+                      String(
+                        form.get(
+                          "returnOdometerUnit",
+                        ),
+                      ) as
+                        | "km"
+                        | "mi",
+                  }
+                : null,
 
               adjustments,
 
@@ -5326,7 +5333,7 @@ export function ReservationComposer() {
 
             <div className="field">
               <label htmlFor="return-odometer">
-                Return odometer
+                Return odometer (optional)
               </label>
 
               <div
@@ -5345,7 +5352,6 @@ export function ReservationComposer() {
                   min="0"
                   step="0.1"
                   inputMode="decimal"
-                  required
                 />
 
                 <select
@@ -5372,7 +5378,13 @@ export function ReservationComposer() {
               <select
                 id="return-fuel"
                 name="returnFuelLevel"
+                required
+                defaultValue=""
               >
+                <option value="">
+                  Select fuel level
+                </option>
+
                 {fuelLevels.map(
                   (level) => (
                     <option

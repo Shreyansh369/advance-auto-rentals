@@ -12,6 +12,7 @@ import {
   getDocs,
   limit,
   query,
+  serverTimestamp,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -88,6 +89,7 @@ beforeAll(async () => {
     await setDoc(doc(db, "idempotencyKeys", "payment_001"), { response: { outstandingCents: 0 } });
     await setDoc(doc(db, "vehicleRegistry", "reg_RT-001"), { vehicleId: "vehicle_001", value: "RT-001" });
     await setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1000 });
+    await setDoc(doc(db, "rentals", "rental_open"), { status: "active", pickupOdometerKm: 1000 });
 
     await setDoc(doc(db, "reservationContracts", "contract_review"), {
       status: "in_review",
@@ -173,6 +175,19 @@ describe("Firestore access policy", () => {
     await assertSucceeds(setDoc(doc(db, "customers", "customer_002"), { fullName: "New Customer" }));
     await assertSucceeds(setDoc(doc(db, "reservations", "reservation_001"), { status: "confirmed" }));
     await assertSucceeds(setDoc(doc(db, "rentals", "rental_001"), { status: "active" }));
+  });
+
+  it("only closes a rental with a valid return fuel level and a sensible odometer", async () => {
+    const db = asUser(OPS);
+    const ref = doc(db, "rentals", "rental_open");
+    const closing = { status: "returned", actualReturnAt: serverTimestamp() };
+
+    await assertFails(updateDoc(ref, { ...closing, returnOdometerKm: null }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "", returnOdometerKm: null }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "brimming", returnOdometerKm: null }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "full", returnOdometerKm: 900 }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "full", returnOdometerKm: "1100" }));
+    await assertSucceeds(updateDoc(ref, { ...closing, returnFuelLevel: "half", returnOdometerKm: null, returnOdometerValue: null, returnOdometerUnit: null }));
   });
 
   it("only cancels a booking that says why", async () => {

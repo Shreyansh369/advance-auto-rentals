@@ -256,11 +256,57 @@ allow list: if isAdmin();
        RENTALS
        ========================================================= */
 
+    function validFuelLevel(value) {
+      return value in [
+        "empty",
+        "one_eighth",
+        "quarter",
+        "three_eighths",
+        "half",
+        "five_eighths",
+        "three_quarters",
+        "seven_eighths",
+        "full"
+      ];
+    }
+
+    /* A rental being closed: the fuel it came back with is
+       required, and the odometer is either not recorded (null,
+       never a made-up 0) or a reading not below the pickup. */
+    function returnRecordValid() {
+      return validFuelLevel(
+          request.resource.data.get("returnFuelLevel", null)
+        )
+        && (
+          request.resource.data.get("returnOdometerKm", null)
+              == null
+          || (
+            request.resource.data.returnOdometerKm is number
+            && request.resource.data.returnOdometerKm >= 0
+            && (
+              !(resource.data.get("pickupOdometerKm", null)
+                  is number)
+              || request.resource.data.returnOdometerKm
+                  >= resource.data.pickupOdometerKm
+            )
+          )
+        );
+    }
+
+    function closingRental() {
+      return request.resource.data.get("status", null)
+          == "returned"
+        && resource.data.get("status", null) != "returned";
+    }
+
     match /rentals/{rentalId} {
 
       allow read: if isStaff();
 
-      allow create, update: if isStaff();
+      allow create: if isStaff();
+
+      allow update: if isStaff()
+        && (!closingRental() || returnRecordValid());
 
       allow delete: if isAdmin();
     }

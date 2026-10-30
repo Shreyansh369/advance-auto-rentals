@@ -4476,10 +4476,11 @@ async function returnRental(
     rentalId: string;
     actualReturnAt: string;
     returnFuelLevel: string;
+    /* Optional: left blank, no reading is recorded. */
     returnOdometer: {
       value: number;
       unit: "km" | "mi";
-    };
+    } | null;
     adjustments: Array<{
       type: string;
       amountCents: number;
@@ -4516,10 +4517,25 @@ async function returnRental(
    * is validated before the transaction opens, so a bad entry
    * fails fast and never leaves a partially applied return.
    */
+  /*
+   * The return odometer may be left blank. A blank is stored as
+   * null, never as 0: a zero would read as a real reading and
+   * give a negative distance on the agreement.
+   */
+  const returnOdometerInput =
+    (input.returnOdometer ?? null) as {
+      value?: unknown;
+      unit?: unknown;
+    } | null;
+
   const returnOdometer =
-    odometerToKm(
-      input.returnOdometer,
-    );
+    returnOdometerInput === null ||
+    returnOdometerInput.value == null ||
+    String(returnOdometerInput.value).trim() === ""
+      ? null
+      : odometerToKm(
+          returnOdometerInput,
+        );
 
   const returnFuelLevel =
     assertFuelLevel(
@@ -4760,6 +4776,7 @@ async function returnRental(
       }
 
       if (
+        returnOdometer &&
         returnOdometer.km <
         Number(
           rental.pickupOdometerKm ??
@@ -4883,13 +4900,13 @@ async function returnRental(
           returnFuelLevel,
 
           returnOdometerKm:
-            returnOdometer.km,
+            returnOdometer?.km ?? null,
 
           returnOdometerValue:
-            returnOdometer.value,
+            returnOdometer?.value ?? null,
 
           returnOdometerUnit:
-            returnOdometer.unit,
+            returnOdometer?.unit ?? null,
 
           returnNotes,
 
@@ -10658,7 +10675,7 @@ export async function callFirestoreOperation<
             returnOdometer: {
               value: number;
               unit: "km" | "mi";
-            };
+            } | null;
             adjustments: Array<{
               type: string;
               amountCents: number;
