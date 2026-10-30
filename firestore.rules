@@ -43,6 +43,55 @@ service cloud.firestore {
     }
 
 
+    function docPath(collectionName, documentId) {
+      return /databases/$(database)/documents/$(collectionName)/$(documentId);
+    }
+
+    /* What one bundle of rental units costs at a rate; units
+       at a rate that is not set must be zero. */
+    function unitsCost(units, rate) {
+      return units == 0 ? 0 : units * rate;
+    }
+
+    /* A quote is a bundle of daily, weekly and monthly units at
+       the document's own rates that covers every started day
+       from pickup to return. The cheapest such bundle is what
+       the application charges, so any quote that passes costs
+       at least the right price: it can never be priced lower. */
+    function quoteValid(data) {
+      let quote = data.get("quote", {});
+      let rates = data.get("rateSnapshot", {});
+      let days = math.ceil(
+        (data.expectedReturnAt.toMillis()
+          - data.pickupAt.toMillis()) / 86400000.0
+      );
+
+      return data.get("pickupAt", null) is timestamp
+        && data.get("expectedReturnAt", null) is timestamp
+        && data.expectedReturnAt > data.pickupAt
+        && quote.get("dailyUnits", null) is int
+        && quote.get("weeklyUnits", null) is int
+        && quote.get("monthlyUnits", null) is int
+        && quote.dailyUnits >= 0
+        && quote.weeklyUnits >= 0
+        && quote.monthlyUnits >= 0
+        && (quote.dailyUnits == 0
+            || rates.get("dailyCents", null) is int)
+        && (quote.weeklyUnits == 0
+            || rates.get("weeklyCents", null) is int)
+        && (quote.monthlyUnits == 0
+            || rates.get("monthlyCents", null) is int)
+        && quote.get("chargedDays", null) == days
+        && quote.dailyUnits
+            + 7 * quote.weeklyUnits
+            + 30 * quote.monthlyUnits >= days
+        && quote.get("baseRentalCents", null)
+            == unitsCost(quote.dailyUnits, rates.get("dailyCents", 0))
+              + unitsCost(quote.weeklyUnits, rates.get("weeklyCents", 0))
+              + unitsCost(quote.monthlyUnits, rates.get("monthlyCents", 0));
+    }
+
+
     /* =========================================================
        APPROVAL REQUESTS
        ========================================================= */
@@ -168,11 +217,101 @@ allow list: if isAdmin();
        VEHICLES
        ========================================================= */
 
+    /* Statuses staff may set by hand: the ones a vehicle has
+       while it is not booked or out. */
+    function manualVehicleStatus(status) {
+      return status in [
+        "available",
+        "cleaning",
+        "maintenance",
+        "out_of_service"
+      ];
+    }
+
+    /* A vehicle's status moves with a booking or a rental only
+       as the workflow moves it, proven by the booking or rental
+       written alongside it: reserved by a new confirmed
+       booking, rented by its checkout, to cleaning by its
+       return. Between the other statuses staff move it by hand
+       as the lifecycle allows. Anything else — releasing a car
+       that is booked or out — is an administrator's. */
+    function staffVehicleStatusChange(vehicleId) {
+      let from = resource.data.get("status", null);
+      let to = request.resource.data.get("status", null);
+      let data = request.resource.data;
+
+      return from == to
+        || (
+          to == "reserved"
+          && from in ["available", "reserved"]
+          && data.get("statusReservationId", null) is string
+          && getAfter(
+            docPath("reservations", data.statusReservationId)
+          ).data.status == "confirmed"
+          && getAfter(
+            docPath("reservations", data.statusReservationId)
+          ).data.vehicleId == vehicleId
+        )
+        || (
+          to == "rented"
+          && from == "reserved"
+          && data.get("statusRentalId", null) is string
+          && getAfter(
+            docPath("rentals", data.statusRentalId)
+          ).data.status == "active"
+          && getAfter(
+            docPath("rentals", data.statusRentalId)
+          ).data.vehicleId == vehicleId
+        )
+        || (
+          to == "cleaning"
+          && from in ["rented", "overdue"]
+          && data.get("statusRentalId", null) is string
+          && get(
+            docPath("rentals", data.statusRentalId)
+          ).data.status != "returned"
+          && getAfter(
+            docPath("rentals", data.statusRentalId)
+          ).data.status == "returned"
+          && getAfter(
+            docPath("rentals", data.statusRentalId)
+          ).data.vehicleId == vehicleId
+        )
+        || (
+          manualVehicleStatus(from)
+          && manualVehicleStatus(to)
+          && !(from == "out_of_service" && to == "cleaning")
+          && !(from == "maintenance" && to == "cleaning")
+        );
+    }
+
     match /vehicles/{vehicleId} {
 
       allow read: if isStaff();
 
-      allow create, update: if isStaff();
+      /* A vehicle's rates are what every hire is priced from,
+         so only an administrator sets or changes them. */
+      allow create: if isAdmin()
+        || (
+          isStaff()
+          && request.resource.data.get("rates", {})
+              .get("dailyCents", null) == null
+          && request.resource.data.get("rates", {})
+              .get("weeklyCents", null) == null
+          && request.resource.data.get("rates", {})
+              .get("monthlyCents", null) == null
+          && manualVehicleStatus(
+            request.resource.data.get("status", null)
+          )
+        );
+
+      allow update: if isAdmin()
+        || (
+          isStaff()
+          && request.resource.data.get("rates", null)
+              == resource.data.get("rates", null)
+          && staffVehicleStatusChange(vehicleId)
+        );
 
       allow delete: if isAdmin();
     }
@@ -335,6 +474,24 @@ allow list: if isAdmin();
         );
     }
 
+    /* Staff change a booking's dates or price only as an
+       extension does: later return, a quote that covers it at
+       the booking's own rates, and its rental extended to the
+       same moment in the same write. */
+    function bookingExtendedWithRental() {
+      return request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly(["expectedReturnAt", "quote", "updatedAt"])
+        && resource.data.get("status", null) == "checked_out"
+        && request.resource.data.expectedReturnAt
+            > resource.data.expectedReturnAt
+        && quoteValid(request.resource.data)
+        && getAfter(
+          docPath("rentals", resource.data.rentalId)
+        ).data.expectedReturnAt
+            == request.resource.data.expectedReturnAt;
+    }
+
     /* Staff book at the vehicle's own daily rate; a discount
        on it can only be asked for, never applied, by them. */
     function bookingPricedFromVehicle(reservationId) {
@@ -345,7 +502,8 @@ allow list: if isAdmin();
 
       return data.get("status", null) != "confirmed"
         || (
-          data.get("rateSnapshot", {})
+          quoteValid(data)
+          && data.get("rateSnapshot", {})
               .get("dailyCents", null)
             == get(
               /databases/$(database)/documents/vehicles/$(data.vehicleId)
@@ -407,6 +565,18 @@ allow list: if isAdmin();
               || openingDiscountRequest(reservationId)
             )
             && staffBookingStatusChange()
+            && (
+              !request.resource.data.diff(resource.data)
+                .affectedKeys()
+                .hasAny([
+                  "quote",
+                  "pickupAt",
+                  "expectedReturnAt",
+                  "vehicleId",
+                  "customerId"
+                ])
+              || bookingExtendedWithRental()
+            )
           )
         );
 
@@ -657,13 +827,80 @@ allow list: if isAdmin();
 
     /* A rental checked out by staff is priced at its
        booking's rates, not at rates of its own. */
-    function rentalPricedFromBooking() {
-      return request.resource.data.get("status", null)
-          != "active"
-        || request.resource.data.get("rateSnapshot", null)
-          == get(
-            /databases/$(database)/documents/reservations/$(request.resource.data.reservationId)
-          ).data.get("rateSnapshot", null);
+    function rentalPricedFromBooking(rentalId) {
+      let data = request.resource.data;
+      let booking = get(
+        docPath("reservations", data.reservationId)
+      ).data;
+
+      return data.get("status", null) != "active"
+        || (
+          booking.get("status", null) == "confirmed"
+          && getAfter(
+            docPath("reservations", data.reservationId)
+          ).data.get("rentalId", null) == rentalId
+          && data.get("rateSnapshot", null)
+              == booking.get("rateSnapshot", null)
+          && data.get("quote", null)
+              == booking.get("quote", null)
+          && data.get("pickupAt", null)
+              == booking.get("pickupAt", null)
+          && data.get("expectedReturnAt", null)
+              == booking.get("expectedReturnAt", null)
+          && data.get("vehicleId", null)
+              == booking.get("vehicleId", null)
+          && data.get("customerId", null)
+              == booking.get("customerId", null)
+        );
+    }
+
+    /* What a return writes, and nothing else: the waivers and
+       extra hours are the only part of the agreement it may
+       touch, and it is recorded in the caller's own name. */
+    function staffClosingRental() {
+      return closingRental()
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly([
+            "status",
+            "actualReturnAt",
+            "returnFuelLevel",
+            "returnOdometerKm",
+            "returnOdometerValue",
+            "returnOdometerUnit",
+            "returnNotes",
+            "returnMedia",
+            "returnDamageMarks",
+            "newDamageCount",
+            "adjustments",
+            "agreement",
+            "returnedBy",
+            "returnedByNameSnapshot",
+            "updatedAt"
+          ])
+        && request.resource.data.get("returnedBy", null)
+            == request.auth.uid
+        && request.resource.data.get("agreement", {})
+          .diff(resource.data.get("agreement", {}))
+          .affectedKeys()
+          .hasOnly(["waivers", "extraHours"]);
+    }
+
+    /* What an extension writes: a later return, re-priced at
+       the rental's own rates, with its booking moved alike. */
+    function staffExtendingRental() {
+      return request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly(["expectedReturnAt", "quote", "updatedAt"])
+        && resource.data.get("status", null)
+            in ["active", "overdue"]
+        && request.resource.data.expectedReturnAt
+            > resource.data.expectedReturnAt
+        && quoteValid(request.resource.data)
+        && getAfter(
+          docPath("reservations", resource.data.reservationId)
+        ).data.expectedReturnAt
+            == request.resource.data.expectedReturnAt;
     }
 
     match /rentals/{rentalId} {
@@ -671,8 +908,11 @@ allow list: if isAdmin();
       allow read: if isStaff();
 
       allow create: if isStaff()
-        && (isAdmin() || rentalPricedFromBooking());
+        && (isAdmin() || rentalPricedFromBooking(rentalId));
 
+      /* An administrator may write a rental as needed, within
+         the return checks. Staff write one only as a return,
+         an extension or a backdated-return request does. */
       allow update: if isStaff()
         && (
           !closingRental()
@@ -680,19 +920,9 @@ allow list: if isAdmin();
         )
         && (
           isAdmin()
-          || closingRental()
-          || !request.resource.data.diff(resource.data)
-              .affectedKeys().hasAny(["actualReturnAt"])
-        )
-        && (
-          isAdmin()
-          || returnLockUntouched()
+          || staffClosingRental()
+          || staffExtendingRental()
           || openingReturnRequest(rentalId)
-        )
-        && (
-          isAdmin()
-          || request.resource.data.get("rateSnapshot", null)
-              == resource.data.get("rateSnapshot", null)
         );
 
       allow delete: if isAdmin();
@@ -783,11 +1013,42 @@ allow list: if isAdmin();
        PAYMENTS
        ========================================================= */
 
+    /* A payment raises what its rental has been paid by exactly
+       its own amount, in the same write: on a rental's first
+       record (checkout, past booking) that is all it has been
+       paid. */
+    function paymentRecorded() {
+      let data = request.resource.data;
+      let before = docPath("rentalFinancials", data.rentalId);
+
+      return data.get("rentalId", null) is string
+        && data.get("amountCents", null) is int
+        && data.amountCents > 0
+        && data.get("recordedBy", null) == request.auth.uid
+        && data.get("method", null) in [
+          "cash",
+          "card",
+          "check",
+          "bank_transfer",
+          "other",
+          "account_credit",
+          "ath"
+        ]
+        && getAfter(before).data.get("paidCents", null)
+            == (
+              exists(before)
+                ? get(before).data.get("paidCents", 0)
+                  + data.amountCents
+                : data.amountCents
+            );
+    }
+
     match /payments/{paymentId} {
 
       allow read: if isStaff();
 
-      allow create: if isStaff();
+      allow create: if isAdmin()
+        || (isStaff() && paymentRecorded());
 
       allow update, delete: if isAdmin();
     }
@@ -916,11 +1177,117 @@ allow list: if isAdmin();
        FINANCIAL LEDGER
        ========================================================= */
 
+    /* A rental document written for the first time in this
+       write. */
+    function rentalNewHere(rentalId) {
+      return !exists(docPath("rentals", rentalId))
+        && existsAfter(docPath("rentals", rentalId));
+    }
+
+    /* Every line staff add to the ledger is the record of
+       something written in the same transaction — a payment,
+       a checkout, an extension, a return, a past booking or an
+       expense — and says so in its own amount. Discounts are
+       administrators' lines. */
+    function ledgerLineBacked() {
+      let data = request.resource.data;
+      let type = data.get("entryType", null);
+      let rentalId = data.get("rentalId", "");
+
+      return data.get("amountCents", null) is int
+        && (
+          (
+            type == "payment"
+            && data.get("paymentId", null) is string
+            && !exists(docPath("payments", data.paymentId))
+            && getAfter(docPath("payments", data.paymentId))
+                .data.amountCents == data.amountCents
+            && getAfter(docPath("payments", data.paymentId))
+                .data.rentalId == rentalId
+          )
+          || (
+            /* A past booking's payment line names no payment
+               document; it is what that booking, written in
+               the same transaction, says was paid. */
+            type == "payment"
+            && data.get("isHistorical", false) == true
+            && rentalNewHere(rentalId)
+            && getAfter(docPath("rentals", rentalId))
+                .data.get("isHistorical", false) == true
+            && data.amountCents
+                == getAfter(docPath("rentalFinancials", rentalId))
+                  .data.paidCents
+          )
+          || (
+            type == "rental_fee"
+            && data.amountCents > 0
+            && data.get("paymentId", null) is string
+            && !exists(docPath("payments", data.paymentId))
+            && getAfter(docPath("payments", data.paymentId))
+                .data.rentalId == rentalId
+          )
+          || (
+            type == "rental_checkout"
+            && rentalNewHere(rentalId)
+            && getAfter(docPath("rentals", rentalId))
+                .data.status == "active"
+            && data.amountCents
+                == getAfter(docPath("rentals", rentalId))
+                  .data.quote.baseRentalCents
+          )
+          || (
+            type == "deposit_held"
+            && data.amountCents == 0
+            && rentalNewHere(rentalId)
+          )
+          || (
+            type == "rental_extension"
+            && data.amountCents > 0
+            && getAfter(docPath("rentals", rentalId))
+                .data.expectedReturnAt
+              > get(docPath("rentals", rentalId))
+                .data.expectedReturnAt
+            && data.amountCents
+                == getAfter(docPath("rentalFinancials", rentalId))
+                  .data.baseRentalCents
+                - get(docPath("rentalFinancials", rentalId))
+                  .data.baseRentalCents
+          )
+          || (
+            type == "rental_adjustment"
+            && data.amountCents > 0
+            && get(docPath("rentals", rentalId))
+                .data.status != "returned"
+            && getAfter(docPath("rentals", rentalId))
+                .data.status == "returned"
+          )
+          || (
+            type == "historical_rental"
+            && rentalNewHere(rentalId)
+            && getAfter(docPath("rentals", rentalId))
+                .data.get("isHistorical", false) == true
+            && data.amountCents
+                == getAfter(docPath("rentalFinancials", rentalId))
+                  .data.totalCents
+          )
+          || (
+            type == "expense"
+            && data.get("expenseId", null) is string
+            && !exists(docPath("vehicleExpenses", data.expenseId))
+            && getAfter(docPath("vehicleExpenses", data.expenseId))
+                .data.amountCents == -data.amountCents
+          )
+        );
+    }
+
     match /financialLedger/{entryId} {
 
       allow read: if isAdmin();
 
-      allow create: if isStaff();
+      allow create: if isStaff()
+        && request.resource.data.get("recordedBy", null)
+            == request.auth.uid
+        && (isAdmin() || ledgerLineBacked());
 
       allow update, delete: if isAdmin();
     }

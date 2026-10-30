@@ -663,6 +663,29 @@ async function actorNameSnapshot(
   );
 }
 
+/*
+ * The caller's role, read from their own profile. The rules
+ * make the same check; this is so the desk is told why in a
+ * sentence rather than with a permission error.
+ */
+async function callerRole(): Promise<string | null> {
+  const { db } = getFirebaseClient();
+
+  const profile = await getDoc(
+    doc(db, "users", getActorUid()),
+  );
+
+  return trimmedOrNull(profile.get("role"));
+}
+
+/* Statuses staff set by hand, outside a booking or a hire. */
+const MANUAL_VEHICLE_STATUSES = [
+  "available",
+  "cleaning",
+  "maintenance",
+  "out_of_service",
+];
+
 /* =========================================================
    Dashboard
    ========================================================= */
@@ -3057,6 +3080,10 @@ async function createReservation(
           status:
             "reserved",
 
+          /* The booking that holds it, for the rules. */
+          statusReservationId:
+            reservationRef.id,
+
           updatedAt:
             nowTimestamp(),
         },
@@ -4961,6 +4988,10 @@ async function checkoutReservation(
           status:
             "rented",
 
+          /* The hire that has it, for the rules. */
+          statusRentalId:
+            rentalRef.id,
+
           damageMarks,
 
           damageUpdatedAt:
@@ -6109,6 +6140,10 @@ function applyReturn(
     {
       status:
         "cleaning",
+
+      /* The hire it came back from, for the rules. */
+      statusRentalId:
+        input.rentalRef.id,
 
       statusNote:
         "Awaiting cleaning and detailing after return.",
@@ -8130,6 +8165,16 @@ async function createVehicle(
   const actorUid =
     getActorUid();
 
+  /*
+   * A vehicle's rates are what every hire is priced from, so
+   * only an administrator adds one.
+   */
+  if ((await callerRole()) !== "admin") {
+    throw new Error(
+      "Only an administrator can add a vehicle, because its rates are set by an administrator.",
+    );
+  }
+
   const registrationNumber =
     String(
       input.registrationNumber ?? "",
@@ -8473,6 +8518,9 @@ async function updateVehicleDetails(
   const actorUid =
     getActorUid();
 
+  const isAdmin =
+    (await callerRole()) === "admin";
+
   const vehicleRef =
     doc(
       db,
@@ -8605,6 +8653,22 @@ async function updateVehicleDetails(
       ) {
         throw new Error(
           "At least one vehicle rate is required.",
+        );
+      }
+
+      /* Every hire is priced from these, so only an
+         administrator changes them. */
+      if (
+        !isAdmin &&
+        (rates.dailyCents !==
+          (current.rates?.dailyCents ?? null) ||
+          rates.weeklyCents !==
+            (current.rates?.weeklyCents ?? null) ||
+          rates.monthlyCents !==
+            (current.rates?.monthlyCents ?? null))
+      ) {
+        throw new Error(
+          "Only an administrator can change a vehicle's rates.",
         );
       }
 
@@ -8815,6 +8879,27 @@ async function changeVehicleStatus(
 
       const vehicle =
         snapshot.data() as VehicleDocument;
+
+      /*
+       * A vehicle that is booked or out moves with its booking
+       * or rental. Changing it by hand releases it from under
+       * them, so that is an administrator's decision.
+       */
+      if (
+        !(
+          MANUAL_VEHICLE_STATUSES.includes(
+            vehicle.status,
+          ) &&
+          MANUAL_VEHICLE_STATUSES.includes(
+            input.status,
+          )
+        ) &&
+        (await callerRole()) !== "admin"
+      ) {
+        throw new Error(
+          "Only an administrator can change the status of a vehicle that is booked or out on hire.",
+        );
+      }
 
       if (
         !isValidVehicleTransition(

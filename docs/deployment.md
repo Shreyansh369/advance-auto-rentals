@@ -14,7 +14,9 @@ pnpm exec firebase deploy --project <project-id> --only firestore:rules,firestor
 
 `tests/rules/firestore.rules.test.ts` asserts that every collection the client reads is matched by a rule in this repository, which catches the rule that was never written. It cannot see what is actually deployed, so the deploy step above is still yours to run.
 
-Releases that have needed it so far: `reservationContracts` and its `versions`/`deliveries` subcollections, and `rentals/{id}/extensions`.
+Releases that have needed it so far: `reservationContracts` and its `versions`/`deliveries` subcollections, and `rentals/{id}/extensions`; and the admin-approvals release (`cancellationRequests`, `returnRequests`).
+
+**The admin-approvals release is the exception to "rules first".** Its rules expect the proof fields the new build writes (`statusReservationId` and `statusRentalId` on a vehicle) and refuse the bare writes the previous build makes, so with the new rules the previous build cannot take a booking, check out or return a vehicle for an operations account. Deploy the web build first, then the rules straight after. In between, only the new request screens (a staff cancellation, a backdated return, a discount request) report a permission error.
 
 ## Firebase Storage is not used
 
