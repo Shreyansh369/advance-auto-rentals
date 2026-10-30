@@ -12,6 +12,7 @@ import {
 
 import {
   callFirestoreOperation,
+  describeDailyRateDiscount,
   type LedgerEntryDetail,
 } from "@/lib/services/firestore-client";
 
@@ -19,6 +20,8 @@ import {
   firebaseErrorMessage,
   formatMoney,
 } from "@/lib/presentation";
+
+import { paymentMethodLabel } from "@/lib/agreement";
 
 /** The hydration flag never changes, so there is nothing to subscribe to. */
 function subscribeToNothing(): () => void {
@@ -268,7 +271,7 @@ export function LedgerEntryReceipt({
                 <>
                   <Row
                     label="Paid by"
-                    value={entryTypeLabel(
+                    value={paymentMethodLabel(
                       detail.payment.method,
                     )}
                   />
@@ -314,6 +317,15 @@ export function LedgerEntryReceipt({
                     />
                   )}
                 </>
+              )}
+
+              {discount?.dailyRate && (
+                <Row
+                  label="Discount"
+                  value={describeDailyRateDiscount(
+                    discount,
+                  )}
+                />
               )}
 
               {discount && (
@@ -604,9 +616,13 @@ export function LedgerEntryReceipt({
                         </span>
 
                         <b>
-                          {formatMoney(
-                            item.amountCents,
-                          )}
+                          {item.dailyRate
+                            ? describeDailyRateDiscount(
+                                item,
+                              )
+                            : formatMoney(
+                                item.amountCents,
+                              )}
                         </b>
                       </li>
                     ))}

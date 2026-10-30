@@ -36,6 +36,8 @@ export type CancelledBooking = {
   expectedReturnAt: string | null;
   cancelledAt: string;
   cancelledByName: string | null;
+  /* Set when staff asked and an administrator approved. */
+  requestedByName: string | null;
   reason: string | null;
 };
 
@@ -109,6 +111,9 @@ export function cancelledBookingFrom(
       new Date(0).toISOString(),
     cancelledByName: textOrNull(
       data.cancelledByNameSnapshot,
+    ),
+    requestedByName: textOrNull(
+      data.cancellationRequestedByNameSnapshot,
     ),
     reason: textOrNull(data.cancellationReason),
   };

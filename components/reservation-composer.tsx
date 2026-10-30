@@ -41,6 +41,13 @@ import { MediaCapture } from "./media-capture";
 import { CustomerSignaturePad } from "./customer-signature-pad";
 import { DamageDiagram } from "./damage-diagram";
 import { RentalAgreement } from "./rental-agreement";
+import {
+  DailyRateDiscountField,
+  EMPTY_DAILY_RATE_DISCOUNT,
+  dailyRateDiscountPayload,
+  previewDailyRateDiscount,
+  type DailyRateDiscountDraft,
+} from "./daily-rate-discount";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
@@ -69,12 +76,17 @@ import {
 import {
   callFirestoreOperation,
   type AdditionalFeeType,
+  type CancellationRequest,
   type ContractQueueEntry,
   type PayableRental,
   type RentalDiscount,
+  type ReturnRequest,
+  describeDailyRateDiscount,
 } from "@/lib/services/firestore-client";
 
 import { rentOwedThrough } from "@/packages/domain/src/pricing";
+
+import type { VehicleRates } from "@/packages/domain/src/types";
 
 type Tab =
   | "booking"
@@ -121,6 +133,8 @@ type Vehicle = {
   status: string;
   /* The damage it carries from its last hire. */
   damageMarks: DamageMark[];
+  /* Its own rates, which a booking discount never changes. */
+  rates: VehicleRates | null;
 };
 
 type Reservation = {
@@ -132,6 +146,12 @@ type Reservation = {
   expectedReturnAt: string | null;
   /* Written down after the pickup it records had passed. */
   backdated: boolean;
+  /* The cancellation it is waiting on, or was last refused. */
+  cancellationRequestStatus: string | null;
+  /* The booking's own rates, and its daily-rate discount. */
+  rates: VehicleRates | null;
+  dailyRateDiscountId: string | null;
+  dailyRateDiscountStatus: string | null;
   /* Extended prices for the agreement's charges table:
      units booked multiplied by the rate quoted at booking. */
   dailyCents: number;
@@ -152,6 +172,13 @@ type Rental = {
   /** Taken at the counter and owed back at return. */
   depositCents: number;
   status: string;
+  /*
+   * The earliest a return can be dated: the booked pickup, or
+   * the checkout if the vehicle was collected before it.
+   */
+  returnFloorAt: string | null;
+  /* A backdated return waiting on, or last refused by, an administrator. */
+  returnRequestStatus: string | null;
 };
 
 const tabs: Array<{
@@ -252,10 +279,6 @@ const returnAdjustmentOptions = [
   {
     type: "other",
     label: "Other",
-  },
-  {
-    type: "discount",
-    label: "Discount",
   },
 ] as const;
 
@@ -400,6 +423,34 @@ function extendedPrice(
   return Math.round(units * rate);
 }
 
+/* Stored rates in cents, or null where a rate is not set. */
+function ratesFrom(
+  value: unknown,
+): VehicleRates | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const rates = value as Record<string, unknown>;
+
+  const cents = (field: string) => {
+    const amount = Number(rates[field]);
+
+    return rates[field] == null ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0
+      ? null
+      : amount;
+  };
+
+  return {
+    currency: "USD",
+    dailyCents: cents("dailyCents"),
+    weeklyCents: cents("weeklyCents"),
+    monthlyCents: cents("monthlyCents"),
+  };
+}
+
 function bookingMoment(
   value: string | null,
 ): string {
@@ -463,6 +514,53 @@ function tomorrowDate(): string {
   return value
     .toISOString()
     .slice(0, 10);
+}
+
+/* An instant as a datetime-local value, rounded up to the minute. */
+function localInputValue(
+  iso: string | null,
+): string | undefined {
+  if (!iso) {
+    return undefined;
+  }
+
+  const value = new Date(
+    Math.ceil(Date.parse(iso) / 60_000) *
+      60_000,
+  );
+
+  if (Number.isNaN(value.valueOf())) {
+    return undefined;
+  }
+
+  value.setMinutes(
+    value.getMinutes() -
+      value.getTimezoneOffset(),
+  );
+
+  return value.toISOString().slice(0, 16);
+}
+
+/*
+ * A return dated more than fifteen minutes before it is entered
+ * is backdated: it needs a reason, and an administrator's
+ * approval unless an administrator enters it.
+ */
+const BACKDATED_RETURN_MS = 15 * 60_000;
+
+function isBackdatedReturn(
+  localValue: string | null,
+): boolean {
+  if (!localValue) {
+    return false;
+  }
+
+  const at = new Date(localValue).getTime();
+
+  return (
+    Number.isFinite(at) &&
+    at < Date.now() - BACKDATED_RETURN_MS
+  );
 }
 
 function toDateTimeInput(
@@ -603,12 +701,6 @@ export function ReservationComposer() {
   const [chargeThrough, setChargeThrough] =
     useState("");
 
-  const [discountAmount, setDiscountAmount] =
-    useState("");
-
-  const [discountReason, setDiscountReason] =
-    useState("");
-
   const [pendingDiscounts, setPendingDiscounts] =
     useState<RentalDiscount[]>([]);
 
@@ -625,6 +717,44 @@ export function ReservationComposer() {
 
   const [cancelBusy, setCancelBusy] =
     useState(false);
+
+  /*
+   * Cancellations asked for by anyone other than an
+   * administrator wait for one. Every waiting request is
+   * listed, plus this person's own, so a rejection reaches
+   * whoever asked.
+   */
+  const [
+    cancellationRequests,
+    setCancellationRequests,
+  ] = useState<CancellationRequest[]>([]);
+
+  const [
+    cancellationNotes,
+    setCancellationNotes,
+  ] = useState<Record<string, string>>({});
+
+  /*
+   * Backdated returns waiting for an administrator, and this
+   * person's own, so a rejection reaches whoever asked.
+   */
+  const [returnRequests, setReturnRequests] =
+    useState<ReturnRequest[]>([]);
+
+  const [
+    returnRequestNotes,
+    setReturnRequestNotes,
+  ] = useState<Record<string, string>>({});
+
+  /*
+   * The return time once it has been changed from the default
+   * of now, which is what decides whether it is backdated.
+   */
+  const [returnTimeEdited, setReturnTimeEdited] =
+    useState<string | null>(null);
+
+  const [backdatedReason, setBackdatedReason] =
+    useState("");
 
   const [bookingMedia, setBookingMedia] =
     useState<CloudinaryMedia[]>([]);
@@ -662,17 +792,33 @@ export function ReservationComposer() {
     useState<DamageMark[] | null>(null);
 
   /*
-   * A discount offered at the counter, and the money taken
-   * there. Whatever is not paid now is left as the rental's
-   * balance due.
+   * A discount on the daily rate offered at the counter, and
+   * the money taken there. Whatever is not paid now is left as
+   * the rental's balance due.
    */
-  const [checkoutDiscount, setCheckoutDiscount] =
+  const [checkoutRateDiscount, setCheckoutRateDiscount] =
+    useState<DailyRateDiscountDraft>(
+      EMPTY_DAILY_RATE_DISCOUNT,
+    );
+
+  /*
+   * The same discount asked for on the booking, and what it is
+   * priced against: held in state so the totals follow the
+   * vehicle and the dates as they are chosen.
+   */
+  const [bookingRateDiscount, setBookingRateDiscount] =
+    useState<DailyRateDiscountDraft>(
+      EMPTY_DAILY_RATE_DISCOUNT,
+    );
+
+  const [bookingVehicleId, setBookingVehicleId] =
     useState("");
 
-  const [
-    checkoutDiscountReason,
-    setCheckoutDiscountReason,
-  ] = useState("");
+  const [bookingPickupAt, setBookingPickupAt] =
+    useState("");
+
+  const [bookingReturnAt, setBookingReturnAt] =
+    useState("");
 
   const [checkoutPaidNow, setCheckoutPaidNow] =
     useState("");
@@ -1095,6 +1241,9 @@ export function ReservationComposer() {
                     "damageMarks",
                   ),
                 ),
+              rates: ratesFrom(
+                snapshot.get("rates"),
+              ),
             }),
           )
           .sort(
@@ -1138,6 +1287,21 @@ export function ReservationComposer() {
               snapshot.get(
                 "backdated",
               ) === true,
+            cancellationRequestStatus:
+              snapshot.get(
+                "cancellationRequestStatus",
+              ) ?? null,
+            rates: ratesFrom(
+              snapshot.get("rateSnapshot"),
+            ),
+            dailyRateDiscountId:
+              snapshot.get(
+                "dailyRateDiscountId",
+              ) ?? null,
+            dailyRateDiscountStatus:
+              snapshot.get(
+                "dailyRateDiscountStatus",
+              ) ?? null,
             dailyCents:
               extendedPrice(
                 snapshot,
@@ -1215,6 +1379,29 @@ export function ReservationComposer() {
               snapshot.get(
                 "status",
               ),
+            returnFloorAt: (() => {
+              const pickup = toDateTimeInput(
+                snapshot.get("pickupAt"),
+              );
+
+              const checkedOut =
+                toDateTimeInput(
+                  snapshot.get("createdAt"),
+                );
+
+              return pickup && checkedOut
+                ? new Date(
+                    Math.min(
+                      Date.parse(pickup),
+                      Date.parse(checkedOut),
+                    ),
+                  ).toISOString()
+                : pickup ?? checkedOut;
+            })(),
+            returnRequestStatus:
+              snapshot.get(
+                "returnRequestStatus",
+              ) ?? null,
           }),
         ),
       );
@@ -1319,6 +1506,50 @@ export function ReservationComposer() {
     }
   }
 
+  /*
+   * Read on its own, like the contract queue, so rules that
+   * have not been deployed yet cost this panel and nothing
+   * else on the desk.
+   */
+  async function loadCancellationRequests() {
+    try {
+      setCancellationRequests(
+        await callFirestoreOperation<
+          undefined,
+          CancellationRequest[]
+        >(
+          "listCancellationRequests",
+          undefined,
+        ),
+      );
+    } catch (cause) {
+      console.error(
+        "[ReservationComposer] loadCancellationRequests failed:",
+        cause,
+      );
+
+      setCancellationRequests([]);
+    }
+  }
+
+  async function loadReturnRequests() {
+    try {
+      setReturnRequests(
+        await callFirestoreOperation<
+          undefined,
+          ReturnRequest[]
+        >("listReturnRequests", undefined),
+      );
+    } catch (cause) {
+      console.error(
+        "[ReservationComposer] loadReturnRequests failed:",
+        cause,
+      );
+
+      setReturnRequests([]);
+    }
+  }
+
   useEffect(() => {
     const timer =
       window.setTimeout(
@@ -1326,6 +1557,8 @@ export function ReservationComposer() {
           void load();
           void loadPayableRentals();
           void loadContractQueue();
+          void loadCancellationRequests();
+          void loadReturnRequests();
         },
         0,
       );
@@ -1380,6 +1613,8 @@ export function ReservationComposer() {
 
       await load();
       await loadPayableRentals();
+      await loadCancellationRequests();
+      await loadReturnRequests();
     } catch (cause) {
       setError(
         firebaseErrorMessage(
@@ -1702,8 +1937,39 @@ export function ReservationComposer() {
       : 0;
   }
 
+  /*
+   * What a discount on the daily rate takes off the rental
+   * days, priced the way the checkout will price it: the
+   * booking's own rates and dates, the cheapest mix re-run.
+   */
+  const checkoutPeriod =
+    checkoutReservationQuote?.pickupAt &&
+    checkoutReservationQuote.expectedReturnAt
+      ? {
+          pickupAt:
+            checkoutReservationQuote.pickupAt,
+          expectedReturnAt:
+            checkoutReservationQuote.expectedReturnAt,
+        }
+      : null;
+
+  const checkoutDiscountPreview =
+    previewDailyRateDiscount(
+      checkoutRateDiscount,
+      checkoutReservationQuote?.rates ?? null,
+      checkoutPeriod,
+    );
+
   const checkoutDiscountCents =
-    centsFromDollars(checkoutDiscount);
+    checkoutDiscountPreview.discountedTotalCents !==
+      null &&
+    checkoutDiscountPreview.fullTotalCents !== null
+      ? Math.max(
+          0,
+          checkoutDiscountPreview.fullTotalCents -
+            checkoutDiscountPreview.discountedTotalCents,
+        )
+      : 0;
 
   /*
    * An administrator's discount comes straight off; anyone
@@ -1713,6 +1979,50 @@ export function ReservationComposer() {
   const checkoutDiscountAppliedCents = isAdmin
     ? checkoutDiscountCents
     : 0;
+
+  /*
+   * The booking tab prices the discount against the chosen
+   * vehicle's own rates and the dates as typed.
+   */
+  const bookingRates =
+    vehicles.find(
+      (vehicle) =>
+        vehicle.id === bookingVehicleId,
+    )?.rates ?? null;
+
+  const bookingPeriod =
+    bookingPickupAt && bookingReturnAt
+      ? (() => {
+          try {
+            return {
+              pickupAt: localToIso(
+                bookingPickupAt,
+              ),
+              expectedReturnAt: localToIso(
+                bookingReturnAt,
+              ),
+            };
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+
+  const bookingDiscountPreview =
+    previewDailyRateDiscount(
+      bookingRateDiscount,
+      bookingRates,
+      bookingPeriod,
+    );
+
+  /* The booking's own discount, already asked for or applied. */
+  const checkoutBookingDiscount =
+    checkoutReservationQuote?.dailyRateDiscountStatus ===
+      "pending" ||
+    checkoutReservationQuote?.dailyRateDiscountStatus ===
+      "approved"
+      ? checkoutReservationQuote.dailyRateDiscountStatus
+      : null;
 
   const dueAtCheckoutCents =
     agreementTotalCents -
@@ -1784,9 +2094,7 @@ export function ReservationComposer() {
           amount * 100,
         );
 
-        return option.type === "discount"
-          ? sum - cents
-          : sum + cents;
+        return sum + cents;
       },
       0,
     );
@@ -1904,6 +2212,7 @@ export function ReservationComposer() {
           {
             reservationId: string;
             vehicleReleased: boolean;
+            status: "cancelled" | "pending";
           }
         >("cancelReservation", {
           reservationId: reservation.id,
@@ -1914,11 +2223,14 @@ export function ReservationComposer() {
       setCancelReason("");
 
       await load();
+      await loadCancellationRequests();
 
       setNotice(
-        result.vehicleReleased
-          ? `Booking cancelled · ${reservation.vehicleRegistration} is available again.`
-          : "Booking cancelled.",
+        result.status === "pending"
+          ? `Cancellation of ${reservation.vehicleRegistration} sent to an administrator for approval. The booking stays reserved until then.`
+          : result.vehicleReleased
+            ? `Booking cancelled · ${reservation.vehicleRegistration} is available again.`
+            : "Booking cancelled.",
       );
     } catch (cause) {
       setError(
@@ -1928,6 +2240,89 @@ export function ReservationComposer() {
       setCancelBusy(false);
     }
   }
+
+  function decideCancellation(
+    request: CancellationRequest,
+    decision: "approve" | "reject",
+  ) {
+    void run(async () => {
+      const result =
+        await callFirestoreOperation<
+          {
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+          {
+            status: string;
+            vehicleReleased: boolean;
+          }
+        >("reviewCancellationRequest", {
+          requestId: request.id,
+          decision,
+          note:
+            cancellationNotes[request.id]?.trim() ||
+            null,
+        });
+
+      setCancellationNotes((current) => {
+        const next = { ...current };
+
+        delete next[request.id];
+
+        return next;
+      });
+
+      return result.status === "approved"
+        ? `Cancellation approved · ${request.vehicleRegistration} booking cancelled${
+            result.vehicleReleased
+              ? " and the vehicle is available again"
+              : ""
+          }.`
+        : `Cancellation of ${request.vehicleRegistration} rejected · the booking stays active.`;
+    });
+  }
+
+  /* The request a booking is waiting on, if any. */
+  function waitingCancellation(
+    reservationId: string,
+  ): CancellationRequest | undefined {
+    return cancellationRequests.find(
+      (request) =>
+        request.reservationId ===
+          reservationId &&
+        request.status === "pending",
+    );
+  }
+
+  /*
+   * The most recent refusal of a cancellation this person asked
+   * for, while the booking is still live and nothing newer is
+   * waiting.
+   */
+  function rejectedCancellation(
+    reservation: Reservation,
+  ): CancellationRequest | undefined {
+    if (
+      reservation.cancellationRequestStatus !==
+      "rejected"
+    ) {
+      return undefined;
+    }
+
+    return cancellationRequests.find(
+      (request) =>
+        request.reservationId ===
+          reservation.id &&
+        request.status === "rejected",
+    );
+  }
+
+  const waitingCancellations =
+    cancellationRequests.filter(
+      (request) =>
+        request.status === "pending",
+    );
 
   function createReservation(
     event: React.FormEvent<HTMLFormElement>,
@@ -1952,8 +2347,31 @@ export function ReservationComposer() {
         formElement,
       );
 
+    const bookingDiscount =
+      dailyRateDiscountPayload(
+        bookingRateDiscount,
+      );
+
     void run(
       async () => {
+        if (
+          bookingDiscount &&
+          !bookingDiscount.reason
+        ) {
+          throw new Error(
+            "Say why the discount is being offered.",
+          );
+        }
+
+        if (
+          bookingDiscount &&
+          bookingDiscountPreview.error
+        ) {
+          throw new Error(
+            bookingDiscountPreview.error,
+          );
+        }
+
         const result =
           await callFirestoreOperation<
             {
@@ -1972,6 +2390,11 @@ export function ReservationComposer() {
                 | null;
               bookingMedia: CloudinaryMedia[];
               backdated: boolean;
+              dailyRateDiscount: {
+                type: "amount" | "percent";
+                value: number;
+                reason: string;
+              } | null;
             },
             {
               reservationId: string;
@@ -1979,6 +2402,10 @@ export function ReservationComposer() {
                 baseRentalCents: number;
                 chargedDays: number;
               };
+              discountStatus:
+                | "approved"
+                | "pending"
+                | null;
             }
           >(
             "createReservation",
@@ -2039,10 +2466,19 @@ export function ReservationComposer() {
               bookingMedia: [],
 
               backdated,
+
+              dailyRateDiscount: bookingDiscount,
             },
           );
 
         formElement.reset();
+
+        setBookingRateDiscount(
+          EMPTY_DAILY_RATE_DISCOUNT,
+        );
+        setBookingVehicleId("");
+        setBookingPickupAt("");
+        setBookingReturnAt("");
 
         setSelectedCustomerId(
           "",
@@ -2079,13 +2515,20 @@ export function ReservationComposer() {
 
         setBackdated(false);
 
+        const discountNote =
+          result.discountStatus === "pending"
+            ? " · daily-rate discount waiting for an administrator, charged at the full rate until then"
+            : result.discountStatus === "approved"
+              ? " · daily-rate discount applied"
+              : "";
+
         return `${
           wasBackdated
             ? "Backdated booking recorded"
             : "Booking confirmed"
         } · ${result.quote.chargedDays} day(s) · ${formatMoney(
           result.quote.baseRentalCents,
-        )}. Check the vehicle out to sign and issue the rental agreement.`;
+        )}${discountNote}. Check the vehicle out to sign and issue the rental agreement.`;
       },
     );
   }
@@ -2105,12 +2548,23 @@ export function ReservationComposer() {
 
     void run(
       async () => {
-        if (
-          checkoutDiscountCents > 0 &&
-          !checkoutDiscountReason.trim()
-        ) {
+        const rateDiscount =
+          dailyRateDiscountPayload(
+            checkoutRateDiscount,
+          );
+
+        if (rateDiscount && !rateDiscount.reason) {
           throw new Error(
             "Say why the discount is being offered.",
+          );
+        }
+
+        if (
+          rateDiscount &&
+          checkoutDiscountPreview.error
+        ) {
+          throw new Error(
+            checkoutDiscountPreview.error,
           );
         }
 
@@ -2119,7 +2573,7 @@ export function ReservationComposer() {
           !paymentMethod
         ) {
           throw new Error(
-            "Choose how the renter is paying — cash, check or credit card — before recording the amount paid now.",
+            "Choose how the renter is paying — cash, check, credit card, credit or ATH — before recording the amount paid now.",
           );
         }
 
@@ -2162,8 +2616,9 @@ export function ReservationComposer() {
                 | null;
               extraHours: number;
               damageMarks: DamageMark[];
-              discount: {
-                amountCents: number;
+              dailyRateDiscount: {
+                type: "amount" | "percent";
+                value: number;
                 reason: string;
               } | null;
               paidNowCents: number;
@@ -2270,15 +2725,7 @@ export function ReservationComposer() {
               damageMarks:
                 checkoutDamageMarks,
 
-              discount:
-                checkoutDiscountCents > 0
-                  ? {
-                      amountCents:
-                        checkoutDiscountCents,
-                      reason:
-                        checkoutDiscountReason.trim(),
-                    }
-                  : null,
+              dailyRateDiscount: rateDiscount,
 
               paidNowCents:
                 checkoutPaidNowCents,
@@ -2290,8 +2737,9 @@ export function ReservationComposer() {
         setCheckoutReservationId("");
         setCheckoutMedia([]);
         setCheckoutDamage(null);
-        setCheckoutDiscount("");
-        setCheckoutDiscountReason("");
+        setCheckoutRateDiscount(
+          EMPTY_DAILY_RATE_DISCOUNT,
+        );
         setCheckoutPaidNow("");
         setCustomerSignature(null);
         setSignatureName("");
@@ -2441,8 +2889,24 @@ export function ReservationComposer() {
       form.get("rentalId") ?? "",
     );
 
+    const returnIsBackdated =
+      isBackdatedReturn(
+        String(
+          form.get("actualReturnAt") ?? "",
+        ),
+      );
+
     void run(
       async () => {
+        if (
+          returnIsBackdated &&
+          !backdatedReason.trim()
+        ) {
+          throw new Error(
+            "Say why the return is being recorded at an earlier time.",
+          );
+        }
+
         /*
          * Every charge raised at return in one submission:
          * an extension, the cleaning and a tank of fuel are
@@ -2504,7 +2968,7 @@ export function ReservationComposer() {
                 unit:
                   | "km"
                   | "mi";
-              };
+              } | null;
               adjustments: Array<{
                 type: string;
                 amountCents: number;
@@ -2520,9 +2984,11 @@ export function ReservationComposer() {
                 | null;
               returnMedia: CloudinaryMedia[];
               damageMarks: DamageMark[];
+              reason: string | null;
             },
             {
               outstandingCents: number;
+              status: "returned" | "pending";
             }
           >(
             "returnRental",
@@ -2543,21 +3009,28 @@ export function ReservationComposer() {
                   ),
                 ),
 
-              returnOdometer: {
-                value: Number(
-                  form.get(
-                    "returnOdometerValue",
-                  ),
-                ),
-                unit:
-                  String(
-                    form.get(
-                      "returnOdometerUnit",
+              /* Optional: a blank is sent as no reading. */
+              returnOdometer: String(
+                form.get(
+                  "returnOdometerValue",
+                ) ?? "",
+              ).trim()
+                ? {
+                    value: Number(
+                      form.get(
+                        "returnOdometerValue",
+                      ),
                     ),
-                  ) as
-                    | "km"
-                    | "mi",
-              },
+                    unit:
+                      String(
+                        form.get(
+                          "returnOdometerUnit",
+                        ),
+                      ) as
+                        | "km"
+                        | "mi",
+                  }
+                : null,
 
               adjustments,
 
@@ -2579,6 +3052,10 @@ export function ReservationComposer() {
 
               damageMarks:
                 returnDamageMarks,
+
+              reason: returnIsBackdated
+                ? backdatedReason.trim()
+                : null,
             },
           );
 
@@ -2603,6 +3080,8 @@ export function ReservationComposer() {
         setReturnAdjustments({});
         setReturnAdjustmentNotes({});
         setReturnExtraHours("0");
+        setReturnTimeEdited(null);
+        setBackdatedReason("");
 
         setWaivers({
           liabilityWaiver: false,
@@ -2623,6 +3102,14 @@ export function ReservationComposer() {
               )}.`
             : "";
 
+        /*
+         * Held for an administrator: the rental stays open and
+         * the vehicle stays rented until it is decided.
+         */
+        if (result.status === "pending") {
+          return "Backdated return sent to an administrator for approval. The rental stays open until it is decided.";
+        }
+
         if (result.outstandingCents > 0) {
           setPaymentRentalId(returnedRentalId);
 
@@ -2637,6 +3124,83 @@ export function ReservationComposer() {
       },
     );
   }
+
+  function decideReturn(
+    request: ReturnRequest,
+    decision: "approve" | "reject",
+  ) {
+    void run(async () => {
+      const result =
+        await callFirestoreOperation<
+          {
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+          {
+            status: string;
+            rentalId: string;
+            outstandingCents: number | null;
+          }
+        >("reviewReturnRequest", {
+          requestId: request.id,
+          decision,
+          note:
+            returnRequestNotes[request.id]?.trim() ||
+            null,
+        });
+
+      setReturnRequestNotes((current) => {
+        const next = { ...current };
+
+        delete next[request.id];
+
+        return next;
+      });
+
+      if (result.status !== "approved") {
+        return `Backdated return for ${request.vehicleRegistration} rejected · the rental stays open.`;
+      }
+
+      /*
+       * Exactly as a return at the counter: a balance left
+       * over goes straight to the payment tab.
+       */
+      if ((result.outstandingCents ?? 0) > 0) {
+        setPaymentRentalId(result.rentalId);
+
+        setTab("payment");
+
+        return `Backdated return approved · ${formatMoney(
+          result.outstandingCents ?? 0,
+        )} outstanding. Take the payment below.`;
+      }
+
+      return "Backdated return approved · nothing left to pay.";
+    });
+  }
+
+  const waitingReturns = returnRequests.filter(
+    (request) => request.status === "pending",
+  );
+
+  /* The latest refusal of a backdated return, while the rental is still out. */
+  const rejectedReturn =
+    returnRental?.returnRequestStatus ===
+    "rejected"
+      ? returnRequests.find(
+          (request) =>
+            request.rentalId === returnRental.id &&
+            request.status === "rejected",
+        )
+      : undefined;
+
+  const returnWaiting =
+    returnRental?.returnRequestStatus ===
+    "pending";
+
+  const returnTimeBackdated =
+    isBackdatedReturn(returnTimeEdited);
 
   function recordPayment(
     event: React.FormEvent<HTMLFormElement>,
@@ -2890,89 +3454,6 @@ export function ReservationComposer() {
     );
   }
 
-  function offerDiscount() {
-    void run(async () => {
-      const amountCents = Math.round(
-        Number(discountAmount) * 100,
-      );
-
-      if (
-        !paymentRentalId ||
-        !Number.isFinite(amountCents) ||
-        amountCents <= 0
-      ) {
-        throw new Error(
-          "Select the rental and enter the discount amount.",
-        );
-      }
-
-      /*
-       * A long hire that was paid up owes nothing until the
-       * rent since then is charged, so there would be nothing
-       * for the discount to come off. The rent on screen is
-       * charged first, under the same key the payment uses,
-       * so taking the payment afterwards does not charge it
-       * again.
-       */
-      const rentKey = `rent-${paymentRentalId}-${chargeThrough}`;
-
-      if (chargeThrough && rentChargeCents > 0) {
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            expectedReturnAt: string;
-            note: string;
-            idempotencyKey: string;
-          },
-          {
-            extensionCents: number;
-            outstandingCents: number;
-          }
-        >("extendRental", {
-          rentalId: paymentRentalId,
-          expectedReturnAt:
-            localToIso(chargeThrough),
-          note: "Rent charged with payment",
-          idempotencyKey: operationKey(rentKey),
-        });
-
-        releaseOperationKey(rentKey);
-
-        setChargeThrough("");
-      }
-
-      const result =
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            amountCents: number;
-            reason: string;
-            idempotencyKey: string;
-          },
-          {
-            status: string;
-            outstandingCents: number;
-          }
-        >("requestRentalDiscount", {
-          rentalId: paymentRentalId,
-          amountCents,
-          reason: discountReason.trim(),
-          idempotencyKey: operationKey("discount"),
-        });
-
-      releaseOperationKey("discount");
-
-      setDiscountAmount("");
-      setDiscountReason("");
-
-      return result.status === "approved"
-        ? `Discount applied · ${formatMoney(
-            result.outstandingCents,
-          )} now outstanding.`
-        : "Discount sent to an administrator for approval.";
-    });
-  }
-
   function decideDiscount(
     discount: RentalDiscount,
     decision: "approve" | "reject",
@@ -3006,9 +3487,11 @@ export function ReservationComposer() {
       });
 
       return result.status === "approved"
-        ? `Discount approved for ${discount.vehicleRegistration} · ${formatMoney(
-            result.outstandingCents ?? 0,
-          )} now outstanding.`
+        ? result.outstandingCents === null
+          ? `Discount approved for ${discount.vehicleRegistration} · the booking is now priced at the discounted daily rate.`
+          : `Discount approved for ${discount.vehicleRegistration} · ${formatMoney(
+              result.outstandingCents,
+            )} now outstanding.`
         : `Discount for ${discount.vehicleRegistration} rejected.`;
     });
   }
@@ -3114,6 +3597,14 @@ export function ReservationComposer() {
                       </span>
                     )}
 
+                    {waitingCancellation(
+                      reservation.id,
+                    ) && (
+                      <span className="status-pill cleaning">
+                        Cancellation waiting for approval
+                      </span>
+                    )}
+
                     <span className="booking-list-detail">
                       <strong>
                         {
@@ -3133,9 +3624,30 @@ export function ReservationComposer() {
                             )}`
                           : ""}
                       </small>
+
+                      {(() => {
+                        const rejected =
+                          rejectedCancellation(
+                            reservation,
+                          );
+
+                        return rejected ? (
+                          <small>
+                            Cancellation rejected
+                            {rejected.reviewedByName
+                              ? ` by ${rejected.reviewedByName}`
+                              : ""}
+                            {rejected.reviewNote
+                              ? ` · “${rejected.reviewNote}”`
+                              : ""}
+                          </small>
+                        ) : null;
+                      })()}
                     </span>
 
-                    {cancellingId ===
+                    {waitingCancellation(
+                      reservation.id,
+                    ) ? null : cancellingId ===
                     reservation.id ? (
                       <span className="booking-list-confirm">
                         <input
@@ -3170,7 +3682,9 @@ export function ReservationComposer() {
                         >
                           {cancelBusy
                             ? "Cancelling…"
-                            : "Yes, cancel"}
+                            : isAdmin
+                              ? "Yes, cancel"
+                              : "Ask to cancel"}
                         </button>
 
                         <button
@@ -3216,6 +3730,114 @@ export function ReservationComposer() {
                         Cancel booking
                       </button>
                     )}
+                  </li>
+                ),
+              )}
+            </ul>
+          </section>
+        )}
+
+      {/*
+        * Cancellations asked for by staff, waiting for an
+        * administrator. Nothing about the booking changes until
+        * one is approved here.
+        */}
+      {tab === "booking" &&
+        isAdmin &&
+        waitingCancellations.length > 0 && (
+          <section className="surface booking-list">
+            <p className="section-kicker">
+              Cancellations waiting for your
+              approval
+            </p>
+
+            <ul>
+              {waitingCancellations.map(
+                (request) => (
+                  <li key={request.id}>
+                    <span className="booking-list-detail">
+                      <strong>
+                        {request.vehicleRegistration}
+                        {" · "}
+                        {request.customerName}
+                      </strong>
+
+                      <small>
+                        {request.pickupAt
+                          ? `${bookingMoment(
+                              request.pickupAt,
+                            )} → ${bookingMoment(
+                              request.expectedReturnAt,
+                            )} · `
+                          : ""}
+                        “{request.reason}”
+                      </small>
+
+                      <small>
+                        Asked by{" "}
+                        {request.requestedByName ||
+                          "staff"}
+                        {" · "}
+                        {bookingMoment(
+                          request.requestedAt,
+                        )}
+                      </small>
+                    </span>
+
+                    <span className="booking-list-confirm">
+                      <input
+                        aria-label="Decision note"
+                        placeholder="Note (required to reject)"
+                        maxLength={1000}
+                        value={
+                          cancellationNotes[
+                            request.id
+                          ] ?? ""
+                        }
+                        onChange={(event) =>
+                          setCancellationNotes(
+                            (current) => ({
+                              ...current,
+                              [request.id]:
+                                event.target.value,
+                            }),
+                          )
+                        }
+                      />
+
+                      <button
+                        className="button button-danger compact"
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          decideCancellation(
+                            request,
+                            "approve",
+                          )
+                        }
+                      >
+                        Approve
+                      </button>
+
+                      <button
+                        className="button button-secondary compact"
+                        type="button"
+                        disabled={
+                          busy ||
+                          !cancellationNotes[
+                            request.id
+                          ]?.trim()
+                        }
+                        onClick={() =>
+                          decideCancellation(
+                            request,
+                            "reject",
+                          )
+                        }
+                      >
+                        Reject
+                      </button>
+                    </span>
                   </li>
                 ),
               )}
@@ -4254,6 +4876,11 @@ export function ReservationComposer() {
                 name="vehicleId"
                 required
                 defaultValue=""
+                onChange={(event) =>
+                  setBookingVehicleId(
+                    event.target.value,
+                  )
+                }
               >
                 <option
                   value=""
@@ -4365,6 +4992,11 @@ export function ReservationComposer() {
                     ? todayDateTime()
                     : undefined
                 }
+                onChange={(event) =>
+                  setBookingPickupAt(
+                    event.target.value,
+                  )
+                }
                 required
               />
             </div>
@@ -4389,9 +5021,23 @@ export function ReservationComposer() {
                     ? undefined
                     : todayDateTime()
                 }
+                onChange={(event) =>
+                  setBookingReturnAt(
+                    event.target.value,
+                  )
+                }
                 required
               />
             </div>
+
+            <DailyRateDiscountField
+              idPrefix="booking-rate-discount"
+              draft={bookingRateDiscount}
+              onChange={setBookingRateDiscount}
+              rates={bookingRates}
+              period={bookingPeriod}
+              isAdmin={isAdmin}
+            />
 
             <div className="field">
               <label htmlFor="pickup-location">
@@ -4524,6 +5170,17 @@ export function ReservationComposer() {
                   ),
                 )}
               </select>
+
+              {checkoutReservationId &&
+                waitingCancellation(
+                  checkoutReservationId,
+                ) && (
+                  <p className="form-help">
+                    A cancellation of this booking is
+                    waiting for approval. Checking it out
+                    withdraws the request.
+                  </p>
+                )}
             </div>
 
             <div className="field">
@@ -4677,63 +5334,57 @@ export function ReservationComposer() {
 
             </fieldset>
 
-            {/* ------------------------------ discount */}
-            <fieldset className="field full checkout-block">
-              <legend>
-                Discount (optional)
-              </legend>
-
-              <p className="form-help">
-                {isAdmin
-                  ? "Comes straight off what the renter owes."
-                  : "Sent to an administrator to approve. It comes off the balance once approved; until then the renter is charged the full amount."}
-              </p>
-
-              <div className="checkout-charges">
-                <div className="field">
-                  <label htmlFor="checkout-discount">
-                    Discount (USD)
-                  </label>
-
-                  <input
-                    id="checkout-discount"
-                    type="number"
-                    min={0}
-                    step="0.01"
-                    value={checkoutDiscount}
-                    onChange={(event) =>
-                      setCheckoutDiscount(
-                        event.target.value,
-                      )
+            {/* ---------------- discount on the daily rate */}
+            {checkoutBookingDiscount ? (
+              <div className="field full">
+                <p className="form-help">
+                  <span
+                    className={
+                      checkoutBookingDiscount ===
+                      "pending"
+                        ? "status-pill cleaning"
+                        : "status-pill available"
                     }
-                  />
-                </div>
+                  >
+                    {checkoutBookingDiscount ===
+                    "pending"
+                      ? "Daily-rate discount waiting for approval"
+                      : "Daily-rate discount applied"}
+                  </span>{" "}
+                  {(() => {
+                    const asked =
+                      pendingDiscounts.find(
+                        (discount) =>
+                          discount.id ===
+                          checkoutReservationQuote?.dailyRateDiscountId,
+                      );
 
-                <div className="field">
-                  <label htmlFor="checkout-discount-reason">
-                    Reason
-                    {checkoutDiscountCents > 0
-                      ? " (required)"
-                      : ""}
-                  </label>
-
-                  <input
-                    id="checkout-discount-reason"
-                    maxLength={500}
-                    required={
-                      checkoutDiscountCents > 0
-                    }
-                    placeholder="e.g. Returning customer"
-                    value={checkoutDiscountReason}
-                    onChange={(event) =>
-                      setCheckoutDiscountReason(
-                        event.target.value,
-                      )
-                    }
-                  />
-                </div>
+                    return asked
+                      ? `${describeDailyRateDiscount(
+                          asked,
+                        )} — ${asked.reason}. `
+                      : "";
+                  })()}
+                  {checkoutBookingDiscount ===
+                  "pending"
+                    ? "Asked for on the booking; it carries through checkout and the hire is charged the full rate until it is approved."
+                    : "The rental days below are already at the discounted daily rate."}
+                </p>
               </div>
-            </fieldset>
+            ) : (
+              <DailyRateDiscountField
+                idPrefix="checkout-rate-discount"
+                draft={checkoutRateDiscount}
+                onChange={setCheckoutRateDiscount}
+                rates={
+                  checkoutReservationQuote?.rates ??
+                  null
+                }
+                period={checkoutPeriod}
+                isAdmin={isAdmin}
+                disabled={!checkoutReservationQuote}
+              />
+            )}
 
             {checkoutReservationQuote && (
               <div className="field full payment-due">
@@ -4774,8 +5425,8 @@ export function ReservationComposer() {
                     <div>
                       <dt>
                         {isAdmin
-                          ? "Discount"
-                          : "Discount (waiting for approval)"}
+                          ? "Daily-rate discount"
+                          : "Daily-rate discount (waiting for approval)"}
                       </dt>
                       <dd>
                         −
@@ -5233,6 +5884,112 @@ export function ReservationComposer() {
           </form>
         )}
 
+        {tab === "return" &&
+          isAdmin &&
+          waitingReturns.length > 0 && (
+            <fieldset className="field full checkout-block">
+              <legend>
+                Backdated returns waiting for your
+                approval
+              </legend>
+
+              {waitingReturns.map((request) => (
+                <div
+                  className="discount-request"
+                  key={request.id}
+                >
+                  <p>
+                    <strong>
+                      {request.vehicleRegistration}
+                    </strong>
+                    {" · "}
+                    {request.customerName}
+                  </p>
+
+                  <p className="form-help">
+                    Returned{" "}
+                    <strong>
+                      {formatDate(
+                        request.requestedReturnAt,
+                        {
+                          hour: "numeric",
+                          minute: "2-digit",
+                        },
+                      )}
+                    </strong>
+                    {" · entered "}
+                    {formatDate(request.enteredAt, {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })}
+                    {" by "}
+                    {request.requestedByName ||
+                      "staff"}
+                  </p>
+
+                  <p className="form-help">
+                    “{request.reason}”
+                  </p>
+
+                  <input
+                    aria-label="Decision note"
+                    placeholder="Note (required to reject)"
+                    maxLength={1000}
+                    value={
+                      returnRequestNotes[
+                        request.id
+                      ] ?? ""
+                    }
+                    onChange={(event) =>
+                      setReturnRequestNotes(
+                        (current) => ({
+                          ...current,
+                          [request.id]:
+                            event.target.value,
+                        }),
+                      )
+                    }
+                  />
+
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      disabled={busy}
+                      onClick={() =>
+                        decideReturn(
+                          request,
+                          "approve",
+                        )
+                      }
+                    >
+                      Approve
+                    </button>
+
+                    <button
+                      type="button"
+                      className="button"
+                      disabled={
+                        busy ||
+                        !returnRequestNotes[
+                          request.id
+                        ]?.trim()
+                      }
+                      onClick={() =>
+                        decideReturn(
+                          request,
+                          "reject",
+                        )
+                      }
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </fieldset>
+          )}
+
         {tab ===
           "return" && (
           <form
@@ -5304,10 +6061,38 @@ export function ReservationComposer() {
                       "overdue"
                         ? " · OVERDUE"
                         : ""}
+                      {rental.returnRequestStatus ===
+                      "pending"
+                        ? " · BACKDATED RETURN WAITING"
+                        : ""}
                     </option>
                   ),
                 )}
               </select>
+
+              {returnWaiting && (
+                <p className="form-help">
+                  <span className="status-pill cleaning">
+                    Backdated return waiting for
+                    approval
+                  </span>{" "}
+                  The rental stays open until an
+                  administrator decides it, and it
+                  cannot be returned again meanwhile.
+                </p>
+              )}
+
+              {!returnWaiting && rejectedReturn && (
+                <p className="form-help">
+                  Backdated return rejected
+                  {rejectedReturn.reviewedByName
+                    ? ` by ${rejectedReturn.reviewedByName}`
+                    : ""}
+                  {rejectedReturn.reviewNote
+                    ? ` · “${rejectedReturn.reviewNote}”`
+                    : ""}
+                </p>
+              )}
             </div>
 
             <div className="field">
@@ -5315,18 +6100,63 @@ export function ReservationComposer() {
                 Return time
               </label>
 
+              {/*
+                * Any time from when the vehicle went out up to
+                * now. More than fifteen minutes back is a
+                * backdated return, which needs a reason.
+                */}
               <input
                 id="return-time"
                 name="actualReturnAt"
                 type="datetime-local"
                 defaultValue={todayDateTime()}
+                min={localInputValue(
+                  returnRental?.returnFloorAt ??
+                    null,
+                )}
+                max={todayDateTime()}
+                onChange={(event) =>
+                  setReturnTimeEdited(
+                    event.target.value,
+                  )
+                }
                 required
               />
+
+              {returnTimeBackdated && (
+                <p className="form-help">
+                  {isAdmin
+                    ? "Backdated return: recorded at once, with the reason below."
+                    : "Backdated return: it is sent to an administrator for approval, and the rental stays open until then."}
+                </p>
+              )}
             </div>
+
+            {returnTimeBackdated && (
+              <div className="field full">
+                <label htmlFor="backdated-reason">
+                  Reason for the earlier return
+                  time (required)
+                </label>
+
+                <input
+                  id="backdated-reason"
+                  maxLength={500}
+                  required
+                  placeholder="e.g. Returned after hours, keys left in the drop box"
+                  value={backdatedReason}
+                  onChange={(event) =>
+                    setBackdatedReason(
+                      event.target.value,
+                    )
+                  }
+                />
+              </div>
+            )}
 
             <div className="field">
               <label htmlFor="return-odometer">
-                Return odometer
+                Return odometer (optional)
               </label>
 
               <div
@@ -5345,7 +6175,6 @@ export function ReservationComposer() {
                   min="0"
                   step="0.1"
                   inputMode="decimal"
-                  required
                 />
 
                 <select
@@ -5372,7 +6201,13 @@ export function ReservationComposer() {
               <select
                 id="return-fuel"
                 name="returnFuelLevel"
+                required
+                defaultValue=""
               >
+                <option value="">
+                  Select fuel level
+                </option>
+
                 {fuelLevels.map(
                   (level) => (
                     <option
@@ -5470,25 +6305,11 @@ export function ReservationComposer() {
 
 
               {/*
-                * A discount needs an administrator. Anyone
-                * else asks for one on the Payment tab once
-                * the return is done.
+                * Discounts are given on the daily rate at
+                * booking or checkout, never at the end.
                 */}
-              {!isAdmin && (
-                <p className="form-help">
-                  To offer a discount, complete the
-                  return and request it on the Payment
-                  tab. An administrator approves it.
-                </p>
-              )}
-
               <div className="checkout-charges">
                 {returnAdjustmentOptions
-                  .filter(
-                    (option) =>
-                      isAdmin ||
-                      option.type !== "discount",
-                  )
                   .map(
                   (option) => (
                     <div
@@ -5626,10 +6447,13 @@ export function ReservationComposer() {
                 className="button button-primary"
                 disabled={
                   busy ||
-                  !rentals.length
+                  !rentals.length ||
+                  returnWaiting
                 }
               >
-                Complete return
+                {returnTimeBackdated && !isAdmin
+                  ? "Send for approval"
+                  : "Complete return"}
               </button>
             </div>
           </form>
@@ -5684,11 +6508,17 @@ export function ReservationComposer() {
                       >
                         <p>
                           <strong>
-                            {formatMoney(
-                              discount.amountCents,
-                            )}
+                            {discount.dailyRate
+                              ? describeDailyRateDiscount(
+                                  discount,
+                                )
+                              : formatMoney(
+                                  discount.amountCents,
+                                )}
                           </strong>
-                          {" off "}
+                          {discount.dailyRate
+                            ? " · "
+                            : " off "}
                           {
                             discount.vehicleRegistration
                           }
@@ -5701,6 +6531,11 @@ export function ReservationComposer() {
                           {" — asked by "}
                           {discount.requestedByName ||
                             "staff"}
+                          {discount.dailyRate
+                            ? discount.rentalId
+                              ? " at checkout"
+                              : " on the booking"
+                            : " at the end of the hire"}
                         </p>
 
                         <input
@@ -5920,6 +6755,14 @@ export function ReservationComposer() {
                 <option value="other">
                   Other
                 </option>
+
+                <option value="account_credit">
+                  Credit
+                </option>
+
+                <option value="ath">
+                  ATH
+                </option>
               </select>
             </div>
 
@@ -6021,21 +6864,24 @@ export function ReservationComposer() {
               * after the payment has been taken.
               */}
             {/*
-              * A discount comes off at the end, when the
-              * balance is settled. An administrator's applies
-              * at once; anyone else's waits for approval and
-              * the balance does not change until then.
+              * Discounts are no longer offered at the end of a
+              * hire. One asked for here before that changed
+              * still waits for an administrator, so it is shown.
               */}
-            {selectedPayableRental && (
-              <fieldset className="field full checkout-block">
-                <legend>Discount</legend>
+            {selectedPayableRental &&
+              pendingDiscountForRental && (
+                <fieldset className="field full checkout-block">
+                  <legend>Discount</legend>
 
-                {pendingDiscountForRental ? (
                   <p className="form-help">
                     <strong>
-                      {formatMoney(
-                        pendingDiscountForRental.amountCents,
-                      )}
+                      {pendingDiscountForRental.dailyRate
+                        ? describeDailyRateDiscount(
+                            pendingDiscountForRental,
+                          )
+                        : formatMoney(
+                            pendingDiscountForRental.amountCents,
+                          )}
                     </strong>{" "}
                     discount waiting for an
                     administrator&apos;s approval
@@ -6044,75 +6890,8 @@ export function ReservationComposer() {
                     The balance changes once it is
                     approved.
                   </p>
-                ) : (
-                  <>
-                    <p className="form-help">
-                      {isAdmin
-                        ? "Comes off the balance straight away."
-                        : "Sent to an administrator. It comes off the balance once approved."}
-                      {rentChargeCents > 0
-                        ? " The rent above is charged first, so the discount has something to come off."
-                        : ""}
-                    </p>
-
-                    <div className="field">
-                      <label htmlFor="discount-amount">
-                        Discount (USD)
-                      </label>
-
-                      <input
-                        id="discount-amount"
-                        type="number"
-                        min="0.01"
-                        max="100000"
-                        step="0.01"
-                        inputMode="decimal"
-                        value={discountAmount}
-                        onChange={(event) =>
-                          setDiscountAmount(
-                            event.target.value,
-                          )
-                        }
-                      />
-                    </div>
-
-                    <div className="field">
-                      <label htmlFor="discount-reason">
-                        Reason
-                      </label>
-
-                      <input
-                        id="discount-reason"
-                        maxLength={500}
-                        value={discountReason}
-                        onChange={(event) =>
-                          setDiscountReason(
-                            event.target.value,
-                          )
-                        }
-                      />
-                    </div>
-
-                    <div className="form-actions">
-                      <button
-                        type="button"
-                        className="button"
-                        disabled={
-                          busy ||
-                          !discountAmount ||
-                          !discountReason.trim()
-                        }
-                        onClick={offerDiscount}
-                      >
-                        {isAdmin
-                          ? "Apply discount"
-                          : "Request approval"}
-                      </button>
-                    </div>
-                  </>
-                )}
-              </fieldset>
-            )}
+                </fieldset>
+              )}
 
             {selectedPayableRental && (
               <div className="field full payment-due">

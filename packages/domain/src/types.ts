@@ -21,7 +21,7 @@ export type FuelLevel =
   | "seven_eighths"
   | "full";
 export type OdometerUnit = "km" | "mi";
-export type PaymentMethod = "cash" | "card" | "bank_transfer" | "other";
+export type PaymentMethod = "cash" | "card" | "bank_transfer" | "other" | "account_credit" | "ath";
 
 export interface VehicleRates {
   currency: "USD";

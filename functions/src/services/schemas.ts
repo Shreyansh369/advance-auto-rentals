@@ -265,6 +265,7 @@ export const returnSchema =
     returnFuelLevel:
       fuelLevel,
 
+    /* Optional at return: null when no reading was taken. */
     returnOdometer:
       z.object({
         value:
@@ -279,7 +280,8 @@ export const returnSchema =
             "mi",
           ]),
       })
-      .strict(),
+      .strict()
+      .nullable(),
 
     adjustments:
       z.array(
@@ -371,6 +373,8 @@ export const paymentSchema =
         "card",
         "bank_transfer",
         "other",
+        "account_credit",
+        "ath",
       ]),
 
     externalReference:

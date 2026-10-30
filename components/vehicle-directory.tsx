@@ -43,6 +43,7 @@ import {
 } from "@/lib/services/firestore-client";
 
 import { AppShell } from "./app-shell";
+import { useFirebaseAuth } from "./firebase-provider";
 import { DamageDiagram } from "./damage-diagram";
 import { MediaCapture } from "./media-capture";
 
@@ -288,6 +289,11 @@ export function VehicleDirectory({
 }: {
   initialView?: string | null;
 } = {}) {
+  /* Rates price every hire, so only an administrator sets them. */
+  const { role } = useFirebaseAuth();
+
+  const isAdmin = role === "admin";
+
   const [vehicles, setVehicles] =
     useState<Vehicle[]>([]);
 
@@ -880,15 +886,17 @@ export function VehicleDirectory({
             />
           </div>
 
-          <button
-            className="button button-primary compact"
-            type="button"
-            onClick={openCreator}
-            disabled={saving}
-          >
-            <Plus size={16} />
-            Add vehicle
-          </button>
+          {isAdmin && (
+            <button
+              className="button button-primary compact"
+              type="button"
+              onClick={openCreator}
+              disabled={saving}
+            >
+              <Plus size={16} />
+              Add vehicle
+            </button>
+          )}
 
           <div
             className="filter-scroll"
@@ -1628,11 +1636,15 @@ export function VehicleDirectory({
                 <div className="field">
                   <label htmlFor="daily-rate">
                     Daily rate
+                    {isAdmin
+                      ? ""
+                      : " (set by an administrator)"}
                   </label>
 
                   <input
                     id="daily-rate"
                     type="number"
+                    readOnly={!isAdmin}
                     min="0"
                     step="0.01"
                     value={
@@ -1655,6 +1667,7 @@ export function VehicleDirectory({
                   <input
                     id="weekly-rate"
                     type="number"
+                    readOnly={!isAdmin}
                     min="0"
                     step="0.01"
                     value={
@@ -1677,6 +1690,7 @@ export function VehicleDirectory({
                   <input
                     id="monthly-rate"
                     type="number"
+                    readOnly={!isAdmin}
                     min="0"
                     step="0.01"
                     value={

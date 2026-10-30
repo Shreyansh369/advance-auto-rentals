@@ -5,6 +5,17 @@ overrides:
   # GHSA-m9gg-hp2v-232j: keep each grpc-js line on its patched release.
   "@grpc/grpc-js@<1.13.6": "~1.13.6"
   "@grpc/grpc-js@>=1.14.0 <1.14.5": "^1.14.5"
+  # Advisories published after 16.3.8 shipped, each held at its patched
+  # release: GHSA-68fv-2mgg-jv7q (source-map-js), GHSA-wq5f-xc86-pv6w
+  # (sharp), GHSA-gg6h-894w-4m9c (re2js), and in the unbuilt functions/
+  # reference express, body-parser, proxy-addr, qs and @fastify/busboy.
+  "source-map-js@<1.2.2": "^1.2.2"
+  "sharp@<0.35.5": "^0.35.5"
+  "re2js@<2.8.7": "^2.8.7"
+  "body-parser@<1.20.9": "~1.20.9"
+  "proxy-addr@<2.0.8": "^2.0.8"
+  "qs@<6.16.1": "^6.16.1"
+  "@fastify/busboy@<3.2.2": "^3.2.2"
 allowBuilds:
   '@firebase/util': true
   esbuild: true

@@ -19,7 +19,9 @@ import { getFirebaseClient } from "@/lib/firebase/client";
 import {
   calculateBalance,
   chargedRentalDays,
+  discountedDailyCents,
   quoteRental,
+  withDailyRate,
 } from "@/packages/domain/src/pricing";
 import type {
   VehicleDocument,
@@ -660,6 +662,29 @@ async function actorNameSnapshot(
     signedInAccountName(actorUid)
   );
 }
+
+/*
+ * The caller's role, read from their own profile. The rules
+ * make the same check; this is so the desk is told why in a
+ * sentence rather than with a permission error.
+ */
+async function callerRole(): Promise<string | null> {
+  const { db } = getFirebaseClient();
+
+  const profile = await getDoc(
+    doc(db, "users", getActorUid()),
+  );
+
+  return trimmedOrNull(profile.get("role"));
+}
+
+/* Statuses staff set by hand, outside a booking or a hire. */
+const MANUAL_VEHICLE_STATUSES = [
+  "available",
+  "cleaning",
+  "maintenance",
+  "out_of_service",
+];
 
 /* =========================================================
    Dashboard
@@ -2036,7 +2061,64 @@ export type RentalAgreementView = {
   damageMarks: DamageMark[];
   /* As it came back; null until the vehicle is returned. */
   returnDamageMarks: DamageMark[] | null;
+  /*
+   * The discount on the daily rate, applied or waiting: the
+   * rate it came off, how much, the rate it left, and who
+   * asked and who approved. Null when there is none.
+   */
+  dailyRateDiscount: {
+    status: DiscountStatus;
+    type: "amount" | "percent";
+    value: number;
+    originalDailyCents: number;
+    discountedDailyCents: number;
+    requestedByName: string;
+    reviewedByName: string | null;
+  } | null;
 };
+
+/*
+ * The discount on a booking's daily rate the agreement prints:
+ * the applied one if there is one, else one still waiting.
+ */
+async function bookingDailyRateDiscount(
+  reservationId: string | null,
+): Promise<RentalDiscount | null> {
+  if (!reservationId) {
+    return null;
+  }
+
+  const { db } = getFirebaseClient();
+
+  try {
+    const snapshot = await getDocs(
+      query(
+        collection(db, "rentalDiscounts"),
+        where("reservationId", "==", reservationId),
+        limit(20),
+      ),
+    );
+
+    const discounts = snapshot.docs
+      .map((entry) =>
+        rentalDiscountFrom(entry.id, entry.data()),
+      )
+      .filter((discount) => discount.dailyRate);
+
+    return (
+      discounts.find(
+        (discount) => discount.status === "approved",
+      ) ??
+      discounts.find(
+        (discount) => discount.status === "pending",
+      ) ??
+      null
+    );
+  } catch {
+    /* Rules not deployed yet: the agreement still prints. */
+    return null;
+  }
+}
 
 function fuelToGas(
   value: unknown,
@@ -2145,6 +2227,11 @@ async function getRentalAgreement(
     rental.returnOdometerValue == null
       ? null
       : Number(rental.returnOdometerValue);
+
+  const rateDiscount =
+    await bookingDailyRateDiscount(
+      trimmedOrNull(rental.reservationId),
+    );
 
   return {
     rentalId: rentalSnapshot.id,
@@ -2357,7 +2444,248 @@ async function getRentalAgreement(
           rental.returnDamageMarks,
         )
       : null,
+
+    dailyRateDiscount:
+      rateDiscount?.dailyRate
+        ? {
+            status: rateDiscount.status,
+            type: rateDiscount.dailyRate.type,
+            value: rateDiscount.dailyRate.value,
+            originalDailyCents:
+              rateDiscount.dailyRate
+                .originalDailyCents,
+            discountedDailyCents:
+              rateDiscount.dailyRate
+                .discountedDailyCents,
+            requestedByName:
+              rateDiscount.requestedByName,
+            reviewedByName:
+              rateDiscount.reviewedByName,
+          }
+        : null,
   };
+}
+
+/* =========================================================
+   Daily-rate discount
+   ========================================================= */
+
+/*
+ * A discount on the daily rate is agreed at the start of a
+ * hire — on the booking or at checkout — never at the end. It
+ * is entered as dollars off the daily rate (in cents here) or
+ * as a percentage of it, always with a reason.
+ */
+export type DailyRateDiscountInput = {
+  type: "amount" | "percent";
+  /* Whole cents for "amount"; a percentage for "percent". */
+  value: number;
+  reason: string;
+};
+
+function dailyRateDiscountInput(
+  value: unknown,
+): DailyRateDiscountInput | null {
+  if (value == null) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+
+  if (
+    source.type !== "amount" &&
+    source.type !== "percent"
+  ) {
+    throw new Error(
+      "Choose a dollar or a percentage discount.",
+    );
+  }
+
+  const amount = Number(source.value);
+
+  if (
+    source.type === "amount" &&
+    !Number.isSafeInteger(amount)
+  ) {
+    throw new Error(
+      "Enter the discount as a dollar amount.",
+    );
+  }
+
+  const reason = trimmedOrNull(source.reason);
+
+  if (!reason) {
+    throw new Error(
+      "Say why the discount is being offered.",
+    );
+  }
+
+  if (reason.length > 500) {
+    throw new Error(
+      "Keep the discount reason under 500 characters.",
+    );
+  }
+
+  return {
+    type: source.type,
+    value: amount,
+    reason,
+  };
+}
+
+/*
+ * The agreement's daily, weekly and monthly rows for a quote:
+ * the bundles it was priced at, each at its rate.
+ */
+function quotedChargeRows(
+  quote: Record<string, unknown>,
+  rates: Record<string, unknown>,
+): { daily: number; weekly: number; monthly: number } {
+  const row = (
+    units: string,
+    rate: string,
+  ) => {
+    const value =
+      Number(quote[units] ?? 0) *
+      Number(rates[rate] ?? 0);
+
+    return Number.isFinite(value)
+      ? Math.round(value)
+      : 0;
+  };
+
+  return {
+    daily: row("dailyUnits", "dailyCents"),
+    weekly: row("weeklyUnits", "weeklyCents"),
+    monthly: row("monthlyUnits", "monthlyCents"),
+  };
+}
+
+/* The stored agreement with its rental rows re-priced. */
+function repricedAgreement(
+  agreement: Record<string, unknown>,
+  quote: Record<string, unknown>,
+  rates: Record<string, unknown>,
+): Record<string, unknown> {
+  const charges: Record<string, unknown> = {
+    ...((agreement.charges ?? {}) as Record<
+      string,
+      unknown
+    >),
+    ...quotedChargeRows(quote, rates),
+  };
+
+  return {
+    ...agreement,
+    charges,
+    chargeTotalCents: CHARGE_KEYS.reduce(
+      (sum, key) =>
+        sum + (Number(charges[key] ?? 0) || 0),
+      0,
+    ),
+  };
+}
+
+/*
+ * Writes the discount record and its audit entry. An
+ * administrator's own discount is its own approval; anyone
+ * else's waits, and the hire is charged the full daily rate
+ * until it is approved.
+ */
+function writeDailyRateDiscount(
+  transaction: {
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    discountRef: ReturnType<typeof doc>;
+    discount: DailyRateDiscountInput;
+    status: DiscountStatus;
+    reservationId: string;
+    rentalId: string | null;
+    offeredAt: "booking" | "checkout";
+    customerName: string;
+    vehicleRegistration: string;
+    originalDailyCents: number;
+    discountedDailyCents: number;
+    actorUid: string;
+    actorName: string;
+  },
+): void {
+  const { db } = getFirebaseClient();
+
+  const approved = input.status === "approved";
+
+  transaction.set(input.discountRef, {
+    kind: "daily_rate",
+    reservationId: input.reservationId,
+    rentalId: input.rentalId,
+    customerNameSnapshot: input.customerName,
+    vehicleRegistrationSnapshot:
+      input.vehicleRegistration,
+    discountType: input.discount.type,
+    discountValue: input.discount.value,
+    originalDailyCents:
+      input.originalDailyCents,
+    discountedDailyCents:
+      input.discountedDailyCents,
+
+    /* What comes off each day, as the rules require. */
+    amountCents:
+      input.originalDailyCents -
+      input.discountedDailyCents,
+
+    reason: input.discount.reason,
+    status: input.status,
+    offeredAt: input.offeredAt,
+    requestedBy: input.actorUid,
+    requestedByNameSnapshot: input.actorName,
+    requestedAt: nowTimestamp(),
+    reviewedBy: approved
+      ? input.actorUid
+      : null,
+    reviewedByNameSnapshot: approved
+      ? input.actorName
+      : null,
+    reviewedAt: approved
+      ? nowTimestamp()
+      : null,
+    reviewNote: null,
+    updatedAt: nowTimestamp(),
+  });
+
+  transaction.set(
+    doc(collection(db, "auditLogs")),
+    {
+      actorUid: input.actorUid,
+      action: approved
+        ? "discount.daily_rate_applied"
+        : "discount.daily_rate_requested",
+      resource: {
+        collection: "rentalDiscounts",
+        id: input.discountRef.id,
+      },
+      details: {
+        actorName: input.actorName,
+        reservationId: input.reservationId,
+        rentalId: input.rentalId,
+        offeredAt: input.offeredAt,
+        discountType: input.discount.type,
+        discountValue: input.discount.value,
+        originalDailyCents:
+          input.originalDailyCents,
+        discountedDailyCents:
+          input.discountedDailyCents,
+        reason: input.discount.reason,
+        decision: approved
+          ? "approved (administrator's own)"
+          : "pending",
+      },
+      createdAt: nowTimestamp(),
+    },
+  );
 }
 
 /* =========================================================
@@ -2380,6 +2708,8 @@ async function createReservation(
      * ahead. Everything else about it is an ordinary booking.
      */
     backdated?: boolean;
+    /* A discount on the daily rate, asked for at booking. */
+    dailyRateDiscount?: DailyRateDiscountInput | null;
   },
 ): Promise<{
   reservationId: string;
@@ -2387,6 +2717,7 @@ async function createReservation(
     baseRentalCents: number;
     chargedDays: number;
   };
+  discountStatus: DiscountStatus | null;
 }> {
   const { db } =
     getFirebaseClient();
@@ -2424,6 +2755,18 @@ async function createReservation(
     sanitizeMediaList(
       input.bookingMedia,
     );
+
+  const rateDiscount =
+    dailyRateDiscountInput(
+      input.dailyRateDiscount,
+    );
+
+  const discountRef = doc(
+    collection(db, "rentalDiscounts"),
+  );
+
+  let discountStatus: DiscountStatus | null =
+    null;
 
   const reservationRef =
     doc(
@@ -2474,6 +2817,13 @@ async function createReservation(
           transaction,
           actorUid,
         );
+
+      const actor = rateDiscount
+        ? await actorProfileSnapshot(
+            transaction,
+            actorUid,
+          )
+        : null;
 
       if (!vehicleSnapshot.exists()) {
         throw new Error(
@@ -2591,6 +2941,34 @@ async function createReservation(
         );
       }
 
+      /*
+       * The vehicle's own rates never change. An approved
+       * discount becomes this booking's daily rate in its own
+       * snapshot; a waiting one leaves the full rate in place
+       * until an administrator approves it.
+       */
+      const discountedDaily = rateDiscount
+        ? discountedDailyCents(
+            Number(vehicle.rates.dailyCents ?? 0),
+            rateDiscount,
+          )
+        : null;
+
+      discountStatus = rateDiscount
+        ? actor?.role === "admin"
+          ? "approved"
+          : "pending"
+        : null;
+
+      const bookingRates =
+        discountStatus === "approved" &&
+        discountedDaily !== null
+          ? withDailyRate(
+              vehicle.rates,
+              discountedDaily,
+            )
+          : vehicle.rates;
+
       quote = quoteRental(
         {
           pickupAt:
@@ -2600,7 +2978,7 @@ async function createReservation(
             input.expectedReturnAt,
         },
 
-        vehicle.rates,
+        bookingRates,
       );
 
       transaction.set(
@@ -2654,7 +3032,7 @@ async function createReservation(
           backdated,
 
           rateSnapshot: {
-            ...vehicle.rates,
+            ...bookingRates,
 
             quotedAt:
               new Date().toISOString(),
@@ -2667,6 +3045,15 @@ async function createReservation(
           },
 
           quote,
+
+          ...(discountStatus
+            ? {
+                dailyRateDiscountId:
+                  discountRef.id,
+                dailyRateDiscountStatus:
+                  discountStatus,
+              }
+            : {}),
 
           notes:
             trimmedOrNull(
@@ -2692,6 +3079,10 @@ async function createReservation(
         {
           status:
             "reserved",
+
+          /* The booking that holds it, for the rules. */
+          statusReservationId:
+            reservationRef.id,
 
           updatedAt:
             nowTimestamp(),
@@ -2736,6 +3127,34 @@ async function createReservation(
             nowTimestamp(),
         },
       );
+
+      if (
+        rateDiscount &&
+        discountStatus &&
+        actor &&
+        discountedDaily !== null
+      ) {
+        writeDailyRateDiscount(transaction, {
+          discountRef,
+          discount: rateDiscount,
+          status: discountStatus,
+          reservationId: reservationRef.id,
+          rentalId: null,
+          offeredAt: "booking",
+          customerName: String(
+            customerSnapshot.get("fullName") ??
+              "",
+          ),
+          vehicleRegistration:
+            vehicle.registrationNumber,
+          originalDailyCents: Number(
+            vehicle.rates.dailyCents,
+          ),
+          discountedDailyCents: discountedDaily,
+          actorUid,
+          actorName: actor.name,
+        });
+      }
     },
   );
 
@@ -2744,6 +3163,8 @@ async function createReservation(
       reservationRef.id,
 
     quote: quote!,
+
+    discountStatus,
   };
 }
 
@@ -2767,6 +3188,12 @@ async function cancelReservation(
 ): Promise<{
   reservationId: string;
   vehicleReleased: boolean;
+  /*
+   * "cancelled" when it took effect; "pending" when it was
+   * sent to an administrator, which is what a cancellation
+   * by anyone else now is.
+   */
+  status: "cancelled" | "pending";
 }> {
   const { db } = getFirebaseClient();
 
@@ -2806,7 +3233,14 @@ async function cancelReservation(
     reservationId,
   );
 
+  const requestRef = doc(
+    collection(db, "cancellationRequests"),
+  );
+
   let vehicleReleased = false;
+
+  let status: "cancelled" | "pending" =
+    "cancelled";
 
   await runTransaction(
     db,
@@ -2822,28 +3256,7 @@ async function cancelReservation(
         );
       }
 
-      const status = String(
-        snapshot.get("status"),
-      );
-
-      if (status === "cancelled") {
-        throw new Error(
-          "This booking has already been cancelled.",
-        );
-      }
-
-      /*
-       * Once the car has gone out the booking is no longer
-       * the thing holding it — the rental is — so it is
-       * returned, not cancelled.
-       */
-      if (status !== "confirmed") {
-        throw new Error(
-          status === "checked_out"
-            ? "This booking has already been checked out. Complete the return instead."
-            : "Only a confirmed booking can be cancelled.",
-        );
-      }
+      assertCancellable(snapshot.get("status"));
 
       const vehicleId = trimmedOrNull(
         snapshot.get("vehicleId"),
@@ -2857,45 +3270,608 @@ async function cancelReservation(
         ? await transaction.get(vehicleRef)
         : null;
 
-      const actorName =
-        await actorNameSnapshot(
+      const actor =
+        await actorProfileSnapshot(
           transaction,
           actorUid,
         );
 
-      transaction.update(reservationRef, {
-        status: "cancelled",
-
-        cancelledBy: actorUid,
-
-        cancelledByNameSnapshot: actorName,
-
-        cancelledAt: nowTimestamp(),
-
-        cancellationReason: reason,
-
-        updatedAt: nowTimestamp(),
-      });
+      const waiting =
+        snapshot.get(
+          "cancellationRequestStatus",
+        ) === "pending";
 
       /*
-       * The vehicle only goes back on offer if this booking is
-       * what took it off. A car already out on another rental,
-       * in for maintenance or waiting to be cleaned keeps the
-       * status it has.
+       * An administrator's cancellation applies at once, as it
+       * always has. Anyone else's is a request: the booking
+       * stays listed and the vehicle stays held until an
+       * administrator decides it.
        */
-      if (
-        vehicleRef &&
-        vehicleSnapshot?.exists() &&
-        String(vehicleSnapshot.get("status")) ===
-          "reserved"
-      ) {
-        vehicleReleased = true;
+      if (actor.role !== "admin") {
+        if (waiting) {
+          throw new Error(
+            "A cancellation for this booking is already waiting for an administrator.",
+          );
+        }
 
-        transaction.update(vehicleRef, {
-          status: "available",
+        status = "pending";
 
-          statusNote: null,
+        transaction.set(requestRef, {
+          reservationId,
+          vehicleId,
+          customerNameSnapshot: String(
+            snapshot.get(
+              "customerNameSnapshot",
+            ) ?? "",
+          ),
+          vehicleRegistrationSnapshot: String(
+            snapshot.get(
+              "vehicleRegistrationSnapshot",
+            ) ?? "",
+          ),
+          pickupAt:
+            snapshot.get("pickupAt") ?? null,
+          expectedReturnAt:
+            snapshot.get("expectedReturnAt") ??
+            null,
+          reason,
+          status: "pending",
+          requestedBy: actorUid,
+          requestedByNameSnapshot: actor.name,
+          requestedAt: nowTimestamp(),
+          reviewedBy: null,
+          reviewedByNameSnapshot: null,
+          reviewedAt: null,
+          reviewNote: null,
+          updatedAt: nowTimestamp(),
+        });
 
+        /*
+         * The booking carries the request it is waiting on.
+         * Two requests at once both write it, so one of them
+         * is retried and then sees the other.
+         */
+        transaction.update(reservationRef, {
+          cancellationRequestId: requestRef.id,
+          cancellationRequestStatus: "pending",
+          updatedAt: nowTimestamp(),
+        });
+
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action:
+              "reservation.cancellation_requested",
+            resource: {
+              collection: "cancellationRequests",
+              id: requestRef.id,
+            },
+            details: {
+              actorName: actor.name,
+              reservationId,
+              reason,
+              vehicleId,
+              customerNameSnapshot: String(
+                snapshot.get(
+                  "customerNameSnapshot",
+                ) ?? "",
+              ),
+              vehicleRegistrationSnapshot: String(
+                snapshot.get(
+                  "vehicleRegistrationSnapshot",
+                ) ?? "",
+              ),
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
+
+        return;
+      }
+
+      if (waiting) {
+        throw new Error(
+          "A cancellation for this booking is waiting for a decision. Approve or reject it instead.",
+        );
+      }
+
+      vehicleReleased = writeCancellation(
+        transaction,
+        {
+          reservationId,
+          snapshot,
+          vehicleRef,
+          vehicleSnapshot,
+          reason,
+          cancelledBy: actorUid,
+          cancelledByName: actor.name,
+          request: null,
+        },
+      );
+    },
+  );
+
+  return {
+    reservationId,
+    vehicleReleased,
+    status,
+  };
+}
+
+/*
+ * Once the car has gone out the booking is no longer the thing
+ * holding it — the rental is — so it is returned, not
+ * cancelled.
+ */
+function assertCancellable(value: unknown): void {
+  const status = String(value);
+
+  if (status === "cancelled") {
+    throw new Error(
+      "This booking has already been cancelled.",
+    );
+  }
+
+  if (status !== "confirmed") {
+    throw new Error(
+      status === "checked_out"
+        ? "This booking has already been checked out. Complete the return instead."
+        : "Only a confirmed booking can be cancelled.",
+    );
+  }
+}
+
+/*
+ * Cancels a booking: the same writes whether an administrator
+ * cancels it directly or approves somebody else's request, so
+ * an approved request lands exactly as a cancellation always
+ * has. Returns whether the vehicle was released.
+ */
+function writeCancellation(
+  transaction: {
+    update: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    reservationId: string;
+    snapshot: { get: (field: string) => unknown };
+    vehicleRef: ReturnType<typeof doc> | null;
+    vehicleSnapshot: {
+      exists: () => boolean;
+      get: (field: string) => unknown;
+    } | null;
+    reason: string;
+    cancelledBy: string;
+    cancelledByName: string;
+    /* Set when this approves somebody's request. */
+    request: {
+      id: string;
+      requestedBy: string;
+      requestedByName: string;
+      reviewNote: string | null;
+    } | null;
+  },
+): boolean {
+  const { db } = getFirebaseClient();
+
+  const { snapshot } = input;
+
+  transaction.update(
+    doc(db, "reservations", input.reservationId),
+    {
+      status: "cancelled",
+
+      cancelledBy: input.cancelledBy,
+
+      cancelledByNameSnapshot:
+        input.cancelledByName,
+
+      cancelledAt: nowTimestamp(),
+
+      cancellationReason: input.reason,
+
+      ...(input.request
+        ? {
+            cancellationRequestStatus:
+              "approved",
+            cancellationRequestedBy:
+              input.request.requestedBy,
+            cancellationRequestedByNameSnapshot:
+              input.request.requestedByName,
+          }
+        : {}),
+
+      updatedAt: nowTimestamp(),
+    },
+  );
+
+  /*
+   * The vehicle only goes back on offer if this booking is
+   * what took it off. A car already out on another rental,
+   * in for maintenance or waiting to be cleaned keeps the
+   * status it has.
+   */
+  const vehicleReleased = Boolean(
+    input.vehicleRef &&
+      input.vehicleSnapshot?.exists() &&
+      String(
+        input.vehicleSnapshot.get("status"),
+      ) === "reserved",
+  );
+
+  if (vehicleReleased && input.vehicleRef) {
+    transaction.update(input.vehicleRef, {
+      status: "available",
+
+      statusNote: null,
+
+      updatedAt: nowTimestamp(),
+    });
+  }
+
+  transaction.set(
+    doc(collection(db, "auditLogs")),
+    {
+      actorUid: input.cancelledBy,
+
+      action: input.request
+        ? "reservation.cancellation_approved"
+        : "reservation.cancelled",
+
+      resource: {
+        collection: "reservations",
+        id: input.reservationId,
+      },
+
+      details: {
+        actorName: input.cancelledByName,
+        reason: input.reason,
+        vehicleId: input.vehicleRef?.id ?? null,
+        vehicleReleased,
+
+        ...(input.request
+          ? {
+              requestId: input.request.id,
+              requestedBy:
+                input.request.requestedBy,
+              requestedByName:
+                input.request.requestedByName,
+              decision: "approved",
+              reviewNote:
+                input.request.reviewNote,
+            }
+          : {}),
+
+        customerNameSnapshot: String(
+          snapshot.get(
+            "customerNameSnapshot",
+          ) ?? "",
+        ),
+
+        vehicleRegistrationSnapshot: String(
+          snapshot.get(
+            "vehicleRegistrationSnapshot",
+          ) ?? "",
+        ),
+      },
+
+      createdAt: nowTimestamp(),
+    },
+  );
+
+  return vehicleReleased;
+}
+
+export type RequestStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "withdrawn";
+
+function requestStatusOf(
+  value: unknown,
+): RequestStatus {
+  return value === "approved" ||
+    value === "rejected" ||
+    value === "withdrawn"
+    ? value
+    : "pending";
+}
+
+export type CancellationRequest = {
+  id: string;
+  reservationId: string;
+  customerName: string;
+  vehicleRegistration: string;
+  pickupAt: string | null;
+  expectedReturnAt: string | null;
+  reason: string;
+  status: RequestStatus;
+  requestedBy: string;
+  requestedByName: string;
+  requestedAt: string | null;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+function cancellationRequestFrom(
+  id: string,
+  data: Record<string, unknown>,
+): CancellationRequest {
+  return {
+    id,
+    reservationId: String(
+      data.reservationId ?? "",
+    ),
+    customerName: String(
+      data.customerNameSnapshot ?? "",
+    ),
+    vehicleRegistration: String(
+      data.vehicleRegistrationSnapshot ?? "",
+    ),
+    pickupAt: data.pickupAt
+      ? toIso(data.pickupAt)
+      : null,
+    expectedReturnAt: data.expectedReturnAt
+      ? toIso(data.expectedReturnAt)
+      : null,
+    reason: String(data.reason ?? ""),
+    status: requestStatusOf(data.status),
+    requestedBy: String(data.requestedBy ?? ""),
+    requestedByName: String(
+      data.requestedByNameSnapshot ?? "",
+    ),
+    requestedAt: data.requestedAt
+      ? toIso(data.requestedAt)
+      : null,
+    reviewedByName: trimmedOrNull(
+      data.reviewedByNameSnapshot,
+    ),
+    reviewedAt: data.reviewedAt
+      ? toIso(data.reviewedAt)
+      : null,
+    reviewNote: trimmedOrNull(data.reviewNote),
+  };
+}
+
+/*
+ * Every request still waiting, and the caller's own requests
+ * whatever became of them, so whoever asked can see a
+ * rejection and why. Two single-field queries: no composite
+ * index to deploy.
+ */
+async function listCancellationRequests(): Promise<
+  CancellationRequest[]
+> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const [pending, mine] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "cancellationRequests"),
+        where("status", "==", "pending"),
+        limit(200),
+      ),
+    ),
+
+    getDocs(
+      query(
+        collection(db, "cancellationRequests"),
+        where("requestedBy", "==", actorUid),
+        limit(100),
+      ),
+    ),
+  ]);
+
+  const byId = new Map<
+    string,
+    CancellationRequest
+  >();
+
+  for (const entry of [
+    ...pending.docs,
+    ...mine.docs,
+  ]) {
+    byId.set(
+      entry.id,
+      cancellationRequestFrom(
+        entry.id,
+        entry.data(),
+      ),
+    );
+  }
+
+  return [...byId.values()].sort((a, b) =>
+    String(b.requestedAt).localeCompare(
+      String(a.requestedAt),
+    ),
+  );
+}
+
+/*
+ * An administrator decides a waiting cancellation. The request
+ * is re-read inside the transaction, so of two administrators
+ * deciding at once only the first can win; the second sees it
+ * already decided. Approval cancels the booking exactly as a
+ * direct cancellation does, in the same transaction.
+ */
+async function reviewCancellationRequest(
+  input: {
+    requestId: string;
+    decision: "approve" | "reject";
+    note: string | null;
+  },
+): Promise<{
+  status: RequestStatus;
+  vehicleReleased: boolean;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const requestId = trimmedOrNull(
+    input.requestId,
+  );
+
+  if (!requestId) {
+    throw new Error(
+      "Select the cancellation to review.",
+    );
+  }
+
+  if (
+    input.decision !== "approve" &&
+    input.decision !== "reject"
+  ) {
+    throw new Error(
+      "Choose whether to approve or reject the cancellation.",
+    );
+  }
+
+  const note = trimmedOrNull(input.note);
+
+  if (input.decision === "reject" && !note) {
+    throw new Error(
+      "Say why the cancellation is rejected.",
+    );
+  }
+
+  if (note && note.length > 1000) {
+    throw new Error(
+      "Keep the review note under 1000 characters.",
+    );
+  }
+
+  const requestRef = doc(
+    db,
+    "cancellationRequests",
+    requestId,
+  );
+
+  let result: {
+    status: RequestStatus;
+    vehicleReleased: boolean;
+  } = { status: "pending", vehicleReleased: false };
+
+  await runTransaction(db, async (transaction) => {
+    const requestSnapshot =
+      await transaction.get(requestRef);
+
+    if (!requestSnapshot.exists()) {
+      throw new Error(
+        "Cancellation request was not found.",
+      );
+    }
+
+    const request = requestSnapshot.data();
+
+    if (
+      requestStatusOf(request.status) !==
+      "pending"
+    ) {
+      throw new Error(
+        "This cancellation has already been decided.",
+      );
+    }
+
+    const reservationId = String(
+      request.reservationId ?? "",
+    );
+
+    const reservationRef = doc(
+      db,
+      "reservations",
+      reservationId,
+    );
+
+    const reservationSnapshot =
+      await transaction.get(reservationRef);
+
+    const vehicleId = trimmedOrNull(
+      reservationSnapshot.get("vehicleId"),
+    );
+
+    const vehicleRef = vehicleId
+      ? doc(db, "vehicles", vehicleId)
+      : null;
+
+    const vehicleSnapshot = vehicleRef
+      ? await transaction.get(vehicleRef)
+      : null;
+
+    const actor = await actorProfileSnapshot(
+      transaction,
+      actorUid,
+    );
+
+    if (actor.role !== "admin") {
+      throw new Error(
+        "Only an administrator can decide a cancellation.",
+      );
+    }
+
+    if (request.requestedBy === actorUid) {
+      throw new Error(
+        "A request has to be decided by another administrator.",
+      );
+    }
+
+    const status: RequestStatus =
+      input.decision === "approve"
+        ? "approved"
+        : "rejected";
+
+    let vehicleReleased = false;
+
+    if (status === "approved") {
+      if (!reservationSnapshot.exists()) {
+        throw new Error(
+          "Booking was not found.",
+        );
+      }
+
+      assertCancellable(
+        reservationSnapshot.get("status"),
+      );
+
+      vehicleReleased = writeCancellation(
+        transaction,
+        {
+          reservationId,
+          snapshot: reservationSnapshot,
+          vehicleRef,
+          vehicleSnapshot,
+          reason: String(request.reason ?? ""),
+          cancelledBy: actorUid,
+          cancelledByName: actor.name,
+          request: {
+            id: requestId,
+            requestedBy: String(
+              request.requestedBy ?? "",
+            ),
+            requestedByName: String(
+              request.requestedByNameSnapshot ??
+                "",
+            ),
+            reviewNote: note,
+          },
+        },
+      );
+    } else {
+      if (reservationSnapshot.exists()) {
+        transaction.update(reservationRef, {
+          cancellationRequestStatus:
+            "rejected",
           updatedAt: nowTimestamp(),
         });
       }
@@ -2904,40 +3880,44 @@ async function cancelReservation(
         doc(collection(db, "auditLogs")),
         {
           actorUid,
-
-          action: "reservation.cancelled",
-
+          action:
+            "reservation.cancellation_rejected",
           resource: {
-            collection: "reservations",
-            id: reservationId,
+            collection: "cancellationRequests",
+            id: requestId,
           },
-
           details: {
-            actorName,
-            reason,
-            vehicleId,
-            vehicleReleased,
-
-            customerNameSnapshot: String(
-              snapshot.get(
-                "customerNameSnapshot",
-              ) ?? "",
+            actorName: actor.name,
+            reservationId,
+            reason: String(request.reason ?? ""),
+            requestedBy: String(
+              request.requestedBy ?? "",
             ),
-
-            vehicleRegistrationSnapshot: String(
-              snapshot.get(
-                "vehicleRegistrationSnapshot",
-              ) ?? "",
+            requestedByName: String(
+              request.requestedByNameSnapshot ??
+                "",
             ),
+            decision: "rejected",
+            reviewNote: note,
           },
-
           createdAt: nowTimestamp(),
         },
       );
-    },
-  );
+    }
 
-  return { reservationId, vehicleReleased };
+    transaction.update(requestRef, {
+      status,
+      reviewedBy: actorUid,
+      reviewedByNameSnapshot: actor.name,
+      reviewedAt: nowTimestamp(),
+      reviewNote: note,
+      updatedAt: nowTimestamp(),
+    });
+
+    result = { status, vehicleReleased };
+  });
+
+  return result;
 }
 
 /* =========================================================
@@ -2988,6 +3968,8 @@ const PAYMENT_METHODS = [
   "cash",
   "check",
   "credit",
+  "account_credit",
+  "ath",
 ] as const;
 
 /*
@@ -3357,14 +4339,12 @@ async function checkoutReservation(
     /* Scratches, dents and the rest, marked on the drawings. */
     damageMarks?: unknown;
     /*
-     * A discount offered at the counter. An administrator's
-     * comes off the balance at once; anyone else's waits for
-     * an administrator, exactly as it does on the Payment tab.
+     * A discount on the daily rate offered at the counter. An
+     * administrator's re-prices the hire at once; anyone
+     * else's waits for an administrator, and the hire is
+     * charged the full rate until it is approved.
      */
-    discount?: {
-      amountCents: number;
-      reason: string;
-    } | null;
+    dailyRateDiscount?: DailyRateDiscountInput | null;
     /*
      * Money taken at the counter towards the rental, by the
      * method chosen on the agreement. Whatever is not taken
@@ -3428,29 +4408,10 @@ async function checkoutReservation(
     { strict: true },
   );
 
-  const discountCents = assertMoneyCents(
-    input.discount?.amountCents ?? 0,
-    "Discount amount",
-  );
-
-  const discountReason = trimmedOrNull(
-    input.discount?.reason,
-  );
-
-  if (discountCents > 0 && !discountReason) {
-    throw new Error(
-      "Say why the discount is being offered.",
+  const rateDiscount =
+    dailyRateDiscountInput(
+      input.dailyRateDiscount,
     );
-  }
-
-  if (
-    discountReason &&
-    discountReason.length > 500
-  ) {
-    throw new Error(
-      "Keep the discount reason under 500 characters.",
-    );
-  }
 
   const paidNowCents = assertMoneyCents(
     input.paidNowCents ?? 0,
@@ -3469,6 +4430,10 @@ async function checkoutReservation(
         return "check";
       case "credit":
         return "card";
+      case "account_credit":
+        return "account_credit";
+      case "ath":
+        return "ath";
       default:
         return null;
     }
@@ -3476,7 +4441,7 @@ async function checkoutReservation(
 
   if (paidNowCents > 0 && !paidNowMethod) {
     throw new Error(
-      "Choose how the renter is paying — cash, check or credit card — before recording the amount paid now.",
+      "Choose how the renter is paying — cash, check, credit card, credit or ATH — before recording the amount paid now.",
     );
   }
 
@@ -3556,6 +4521,47 @@ async function checkoutReservation(
         );
       }
 
+      /*
+       * A booking waiting on a cancellation can still be
+       * checked out — the renter turned up after all — and
+       * doing so withdraws the request. Read before any write.
+       */
+      const waitingCancellationId =
+        reservation.cancellationRequestStatus ===
+        "pending"
+          ? trimmedOrNull(
+              reservation.cancellationRequestId,
+            )
+          : null;
+
+      const waitingCancellationRef =
+        waitingCancellationId
+          ? doc(
+              db,
+              "cancellationRequests",
+              waitingCancellationId,
+            )
+          : null;
+
+      const waitingCancellation =
+        waitingCancellationRef
+          ? await transaction.get(
+              waitingCancellationRef,
+            )
+          : null;
+
+      /*
+       * The request bookkeeping belongs to the booking, not
+       * to the rental made from it.
+       */
+      const {
+        cancellationRequestId:
+          _cancellationRequestId,
+        cancellationRequestStatus:
+          _cancellationRequestStatus,
+        ...bookingFields
+      } = reservation;
+
       const vehicleRef =
         doc(
           db,
@@ -3577,7 +4583,7 @@ async function checkoutReservation(
         );
 
       const actor =
-        discountCents > 0
+        rateDiscount
           ? await actorProfileSnapshot(
               transaction,
               actorUid,
@@ -3630,62 +4636,147 @@ async function checkoutReservation(
         agreementAdjustmentCents;
 
       /*
-       * A discount can only forgive what is owed, and the
-       * money taken now cannot be more than is left once it
-       * is applied — a waiting discount included, or its
-       * approval would find nothing left to forgive.
+       * One daily-rate discount per booking: one asked for at
+       * booking carries through checkout, waiting or applied,
+       * and is not asked for twice.
        */
       if (
-        discountCents >
-        owedBeforeDiscountCents
+        rateDiscount &&
+        (reservation.dailyRateDiscountStatus ===
+          "pending" ||
+          reservation.dailyRateDiscountStatus ===
+            "approved")
       ) {
         throw new Error(
-          `The discount is more than the ${formatCents(
-            owedBeforeDiscountCents,
-          )} owed on this rental.`,
+          reservation.dailyRateDiscountStatus ===
+            "pending"
+            ? "A daily-rate discount on this booking is already waiting for an administrator."
+            : "This booking already has a daily-rate discount.",
         );
       }
 
+      const bookingRates = (reservation.rateSnapshot ??
+        {}) as Record<string, any>;
+
+      const discountedDaily = rateDiscount
+        ? discountedDailyCents(
+            Number(bookingRates.dailyCents ?? 0),
+            rateDiscount,
+          )
+        : null;
+
+      const discountedRates =
+        discountedDaily !== null
+          ? withDailyRate(
+              {
+                ...bookingRates,
+                currency: "USD" as const,
+                dailyCents: bookingRates.dailyCents ?? null,
+                weeklyCents: bookingRates.weeklyCents ?? null,
+                monthlyCents: bookingRates.monthlyCents ?? null,
+              },
+              discountedDaily,
+            )
+          : null;
+
+      const discountedQuote = discountedRates
+        ? quoteRental(
+            {
+              pickupAt: toIso(reservation.pickupAt),
+              expectedReturnAt: toIso(
+                reservation.expectedReturnAt,
+              ),
+            },
+            discountedRates,
+          )
+        : null;
+
+      /* What the discount takes off the rental days. */
+      const discountReductionCents =
+        discountedQuote
+          ? Math.max(
+              0,
+              baseRentalCents -
+                discountedQuote.baseRentalCents,
+            )
+          : 0;
+
+      /*
+       * The money taken now cannot be more than is left once
+       * the discount is applied — a waiting discount included,
+       * or its approval would find nothing left to forgive.
+       */
       if (
         paidNowCents >
         owedBeforeDiscountCents -
-          discountCents
+          discountReductionCents
       ) {
         throw new Error(
           `The amount paid now is more than the ${formatCents(
             owedBeforeDiscountCents -
-              discountCents,
+              discountReductionCents,
           )} owed on this rental. The deposit is recorded separately.`,
         );
       }
 
-      discountStatus =
-        discountCents > 0
-          ? actor?.role === "admin"
-            ? "approved"
-            : "pending"
-          : null;
+      discountStatus = rateDiscount
+        ? actor?.role === "admin"
+          ? "approved"
+          : "pending"
+        : null;
 
-      const appliedDiscountCents =
-        discountStatus === "approved"
-          ? discountCents
-          : 0;
+      const discountApplied =
+        discountStatus === "approved" &&
+        discountedRates !== null &&
+        discountedQuote !== null;
+
+      const openingBaseCents = discountApplied
+        ? baseRentalCents - discountReductionCents
+        : baseRentalCents;
 
       const openingAdjustmentCents =
-        agreementAdjustmentCents -
-        appliedDiscountCents;
+        agreementAdjustmentCents;
 
       const openingTotalCents =
-        baseRentalCents +
+        openingBaseCents +
         openingAdjustmentCents;
 
       outstandingAfterCheckout =
         openingTotalCents - paidNowCents;
 
+      /*
+       * An applied discount becomes this rental's daily rate
+       * in its own snapshot, and the agreement's rental rows
+       * are priced from it.
+       */
+      const repricing =
+        discountApplied
+          ? {
+              rateSnapshot: discountedRates,
+              quote: discountedQuote,
+            }
+          : {};
+
+      const rentalAgreement = discountApplied
+        ? repricedAgreement(
+            agreement,
+            discountedQuote as unknown as Record<string, unknown>,
+            discountedRates as unknown as Record<string, unknown>,
+          )
+        : agreement;
+
+      const discountLock = discountStatus
+        ? {
+            dailyRateDiscountId: discountRef.id,
+            dailyRateDiscountStatus:
+              discountStatus,
+          }
+        : {};
+
       transaction.set(
         rentalRef,
         {
-          ...reservation,
+          ...bookingFields,
 
           reservationId:
             reservationRef.id,
@@ -3708,7 +4799,11 @@ async function checkoutReservation(
               input.notes,
             ),
 
-          agreement,
+          agreement: rentalAgreement,
+
+          ...repricing,
+
+          ...discountLock,
 
           checkoutMedia,
 
@@ -3761,7 +4856,7 @@ async function checkoutReservation(
           pickupAt:
             reservation.pickupAt,
 
-          baseRentalCents,
+          baseRentalCents: openingBaseCents,
 
           /*
            * The agreement's charge rows — waivers, insurance,
@@ -3822,10 +4917,65 @@ async function checkoutReservation(
           rentalId:
             rentalRef.id,
 
+          ...(waitingCancellationRef
+            ? {
+                cancellationRequestStatus:
+                  "withdrawn",
+              }
+            : {}),
+
+          ...repricing,
+
+          ...discountLock,
+
           updatedAt:
             nowTimestamp(),
         },
       );
+
+      if (
+        waitingCancellationRef &&
+        waitingCancellation?.exists() &&
+        waitingCancellation.get("status") ===
+          "pending"
+      ) {
+        transaction.update(
+          waitingCancellationRef,
+          {
+            status: "withdrawn",
+            withdrawnBy: actorUid,
+            withdrawnAt: nowTimestamp(),
+            updatedAt: nowTimestamp(),
+          },
+        );
+
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action:
+              "reservation.cancellation_withdrawn",
+            resource: {
+              collection:
+                "cancellationRequests",
+              id: waitingCancellationRef.id,
+            },
+            details: {
+              reservationId:
+                reservationRef.id,
+              rentalId: rentalRef.id,
+              reason: String(
+                waitingCancellation.get(
+                  "reason",
+                ) ?? "",
+              ),
+              decision: "withdrawn",
+              note: "The booking was checked out while the cancellation waited.",
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
+      }
 
       /*
        * The vehicle carries its damage from one hire to the
@@ -3837,6 +4987,10 @@ async function checkoutReservation(
         {
           status:
             "rented",
+
+          /* The hire that has it, for the rules. */
+          statusRentalId:
+            rentalRef.id,
 
           damageMarks,
 
@@ -3938,41 +5092,41 @@ async function checkoutReservation(
         );
       }
 
-      if (discountStatus && actor) {
-        transaction.set(discountRef, {
+      if (
+        rateDiscount &&
+        discountStatus &&
+        actor &&
+        discountedDaily !== null
+      ) {
+        writeDailyRateDiscount(transaction, {
+          discountRef,
+          discount: rateDiscount,
+          status: discountStatus,
+          reservationId: reservationRef.id,
           rentalId: rentalRef.id,
-          customerNameSnapshot: String(
+          offeredAt: "checkout",
+          customerName: String(
             reservation.customerNameSnapshot ??
               "",
           ),
-          vehicleRegistrationSnapshot:
-            vehicleRegistration,
-          amountCents: discountCents,
-          reason: discountReason,
-          status: discountStatus,
-          offeredAt: "checkout",
-          requestedBy: actorUid,
-          requestedByNameSnapshot: actor.name,
-          requestedAt: nowTimestamp(),
-
-          /* An administrator's own discount is its own approval. */
-          reviewedBy:
-            discountStatus === "approved"
-              ? actorUid
-              : null,
-          reviewedByNameSnapshot:
-            discountStatus === "approved"
-              ? actor.name
-              : null,
-          reviewedAt:
-            discountStatus === "approved"
-              ? nowTimestamp()
-              : null,
-          reviewNote: null,
-          updatedAt: nowTimestamp(),
+          vehicleRegistration,
+          originalDailyCents: Number(
+            bookingRates.dailyCents,
+          ),
+          discountedDailyCents: discountedDaily,
+          actorUid,
+          actorName: actor.name,
         });
 
-        if (discountStatus === "approved") {
+        /*
+         * The rental days are on the books at the full rate
+         * above; an applied discount is the line that takes
+         * the difference off, so Finance and the bill show it.
+         */
+        if (
+          discountApplied &&
+          discountReductionCents > 0
+        ) {
           transaction.set(
             doc(
               collection(
@@ -3991,35 +5145,14 @@ async function checkoutReservation(
               ),
               entryType: "rental_discount",
               adjustmentType: "discount",
-              amountCents: -discountCents,
+              amountCents: -discountReductionCents,
               discountId: discountRef.id,
-              note: discountReason,
+              note: rateDiscount.reason,
               occurredAt: nowTimestamp(),
               recordedBy: actorUid,
             },
           );
         }
-
-        transaction.set(
-          doc(collection(db, "auditLogs")),
-          {
-            actorUid,
-            action:
-              discountStatus === "approved"
-                ? "discount.applied"
-                : "discount.requested",
-            resource: {
-              collection: "rentalDiscounts",
-              id: discountRef.id,
-            },
-            details: {
-              rentalId: rentalRef.id,
-              amountCents: discountCents,
-              offeredAt: "checkout",
-            },
-            createdAt: nowTimestamp(),
-          },
-        );
       }
 
       if (paidNowCents > 0) {
@@ -4465,55 +5598,101 @@ async function extendRental(
    Return
    ========================================================= */
 
-async function returnRental(
-  input: {
-    rentalId: string;
-    actualReturnAt: string;
-    returnFuelLevel: string;
-    returnOdometer: {
-      value: number;
-      unit: "km" | "mi";
-    };
-    adjustments: Array<{
-      type: string;
-      amountCents: number;
-      note: string;
-    }>;
-    /*
-     * The waivers taken and the hours run over are settled
-     * when the vehicle comes back, so they are recorded here
-     * and merged into the stored agreement rather than
-     * guessed at the counter.
-     */
-    waivers?: Record<string, unknown> | null;
-    extraHours?: number | null;
-    notes: string | null;
-    returnMedia: Array<Record<string, unknown>>;
-    /*
-     * The damage on the vehicle as it came back: what it went
-     * out with, less anything found to be wrong, plus anything
-     * new. Left out, the checkout's marks stand.
-     */
-    damageMarks?: unknown;
-  },
-): Promise<{
-  outstandingCents: number;
-}> {
-  const { db } =
-    getFirebaseClient();
+/*
+ * A return entered more than this long after the time it
+ * records is a backdated return, and anyone but an
+ * administrator has to have it approved.
+ */
+const BACKDATED_RETURN_MS = 15 * 60_000;
 
-  const actorUid =
-    getActorUid();
+/* Clock drift tolerated before a return reads as future. */
+const RETURN_CLOCK_SKEW_MS = 60_000;
 
+export type ReturnInput = {
+  rentalId: string;
+  actualReturnAt: string;
+  returnFuelLevel: string;
+  /* Optional: left blank, no reading is recorded. */
+  returnOdometer: {
+    value: number;
+    unit: "km" | "mi";
+  } | null;
+  adjustments: Array<{
+    type: string;
+    amountCents: number;
+    note: string;
+  }>;
   /*
-   * Everything that can be judged without reading the rental
-   * is validated before the transaction opens, so a bad entry
-   * fails fast and never leaves a partially applied return.
+   * The waivers taken and the hours run over are settled
+   * when the vehicle comes back, so they are recorded here
+   * and merged into the stored agreement rather than
+   * guessed at the counter.
    */
+  waivers?: Record<string, unknown> | null;
+  extraHours?: number | null;
+  notes: string | null;
+  returnMedia: Array<Record<string, unknown>>;
+  /*
+   * The damage on the vehicle as it came back: what it went
+   * out with, less anything found to be wrong, plus anything
+   * new. Left out, the checkout's marks stand.
+   */
+  damageMarks?: unknown;
+  /* Required when the return time is backdated. */
+  reason?: string | null;
+};
+
+type NormalisedReturn = {
+  returnOdometer: {
+    km: number;
+    value: number;
+    unit: "km" | "mi";
+  } | null;
+  returnFuelLevel: (typeof FUEL_LEVELS)[number];
+  returnNotes: string | null;
+  returnMedia: Array<Record<string, unknown>>;
+  returnDamageMarks: DamageMark[] | null;
+  adjustments: Array<{
+    type: string;
+    amountCents: number;
+    note: string;
+  }>;
+  returnWaivers: Record<string, boolean>;
+  extraHours: number;
+};
+
+/*
+ * Everything that can be judged without reading the rental
+ * is validated before the transaction opens, so a bad entry
+ * fails fast and never leaves a partially applied return.
+ * A backdated return's stored entry is put through the same
+ * checks again when it is approved.
+ */
+function normaliseReturn(
+  input: Omit<
+    ReturnInput,
+    "rentalId" | "actualReturnAt" | "reason"
+  >,
+): NormalisedReturn {
+  /*
+   * The return odometer may be left blank. A blank is stored as
+   * null, never as 0: a zero would read as a real reading and
+   * give a negative distance on the agreement.
+   */
+  const returnOdometerInput =
+    (input.returnOdometer ?? null) as {
+      value?: unknown;
+      unit?: unknown;
+    } | null;
+
   const returnOdometer =
-    odometerToKm(
-      input.returnOdometer,
-    );
+    returnOdometerInput === null ||
+    returnOdometerInput.value == null ||
+    String(returnOdometerInput.value).trim() === ""
+      ? null
+      : odometerToKm(
+          returnOdometerInput,
+        );
 
   const returnFuelLevel =
     assertFuelLevel(
@@ -4531,7 +5710,8 @@ async function returnRental(
     );
 
   const returnDamageMarks =
-    input.damageMarks === undefined
+    input.damageMarks === undefined ||
+    input.damageMarks === null
       ? null
       : sanitizeDamageMarks(
           input.damageMarks,
@@ -4603,6 +5783,518 @@ async function returnRental(
     );
   }
 
+  return {
+    returnOdometer,
+    returnFuelLevel,
+    returnNotes,
+    returnMedia,
+    returnDamageMarks,
+    adjustments,
+    returnWaivers,
+    extraHours: Math.trunc(extraHours),
+  };
+}
+
+/*
+ * The earliest the vehicle can have come back: when it went
+ * out. That is the booked pickup, or the checkout if the renter
+ * collected it before the time they had booked — the rental
+ * keeps the booked pickup, so comparing with that alone refused
+ * any return earlier than a pickup that never happened.
+ */
+function earliestReturnMs(
+  rental: Record<string, unknown>,
+): number {
+  const pickupMs = asTimestamp(
+    toIso(rental.pickupAt),
+  ).toMillis();
+
+  return rental.createdAt instanceof Timestamp
+    ? Math.min(
+        pickupMs,
+        rental.createdAt.toMillis(),
+      )
+    : pickupMs;
+}
+
+/* The checks a return has to pass against the rental itself. */
+function assertReturnFits(
+  rental: Record<string, unknown>,
+  actualReturnAt: Timestamp,
+  normalised: NormalisedReturn,
+): void {
+  /*
+   * Re-reading the status inside the transaction is what
+   * makes a repeated submission safe: the second attempt
+   * sees "returned" and aborts instead of applying the
+   * adjustments twice.
+   */
+  if (
+    ![
+      "active",
+      "overdue",
+    ].includes(
+      String(
+        rental.status,
+      ),
+    )
+  ) {
+    throw new Error(
+      "Only active or overdue rentals can be returned.",
+    );
+  }
+
+  if (
+    actualReturnAt.toMillis() <
+    earliestReturnMs(rental)
+  ) {
+    throw new Error(
+      "Actual return cannot be before pickup.",
+    );
+  }
+
+  if (
+    normalised.returnOdometer &&
+    normalised.returnOdometer.km <
+    Number(
+      rental.pickupOdometerKm ??
+        0,
+    )
+  ) {
+    throw new Error(
+      "Return odometer cannot be lower than pickup odometer.",
+    );
+  }
+}
+
+/*
+ * Closes a rental. A return entered at the counter and a
+ * backdated return an administrator approves both land here,
+ * so an approved one completes exactly as a normal one does.
+ * Every read has already been made; this only writes.
+ */
+function applyReturn(
+  transaction: {
+    update: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    rentalRef: ReturnType<typeof doc>;
+    rental: Record<string, any>;
+    financialRef: ReturnType<typeof doc>;
+    financial: Record<string, any>;
+    reservationRef: ReturnType<typeof doc> | null;
+    reservationExists: boolean;
+    actualReturnAt: Timestamp;
+    normalised: NormalisedReturn;
+    /* Who took the vehicle back. */
+    returnedBy: { uid: string; name: string };
+    /* Who is writing it: the same, or the approver. */
+    actorUid: string;
+    /* Extra fields for the rental, such as the approval. */
+    rentalFields?: Record<string, unknown>;
+  },
+): number {
+  const { db } = getFirebaseClient();
+
+  const {
+    rental,
+    financial,
+    actualReturnAt,
+    normalised,
+    actorUid,
+  } = input;
+
+  const {
+    returnOdometer,
+    returnFuelLevel,
+    returnNotes,
+    returnMedia,
+    returnDamageMarks,
+    adjustments,
+    returnWaivers,
+    extraHours,
+  } = normalised;
+
+  const totalAdjustment =
+    adjustments.reduce(
+      (
+        total,
+        adjustment,
+      ) =>
+        adjustment.type ===
+        "discount"
+          ? total -
+            adjustment.amountCents
+          : total +
+            adjustment.amountCents,
+      0,
+    );
+
+  const adjustmentCents =
+    Number(
+      financial.adjustmentCents ??
+        0,
+    ) +
+    totalAdjustment;
+
+  const totalCents =
+    Number(
+      financial.baseRentalCents ??
+        0,
+    ) +
+    adjustmentCents;
+
+  if (
+    !Number.isFinite(
+      totalCents,
+    ) ||
+    totalCents < 0 ||
+    totalCents > MAX_MONEY_CENTS
+  ) {
+    throw new Error(
+      "Adjustments produce an invalid rental total.",
+    );
+  }
+
+  const outstandingCents =
+    calculateBalance(
+      Math.round(
+        totalCents,
+      ),
+      assertMoneyCents(
+        financial.paidCents ?? 0,
+        "Amount received",
+      ),
+      assertMoneyCents(
+        financial.refundedCents ??
+          0,
+        "Amount refunded",
+      ),
+    );
+
+  const vehicleId =
+    trimmedOrNull(
+      rental.vehicleId,
+    );
+
+  if (!vehicleId) {
+    throw new Error(
+      "This rental is not linked to a vehicle.",
+    );
+  }
+
+  const vehicleRegistration =
+    String(
+      rental.vehicleRegistrationSnapshot ??
+        financial.vehicleRegistration ??
+        "",
+    );
+
+  const customerId =
+    String(
+      rental.customerId ??
+        financial.customerId ??
+        "",
+    );
+
+  const checkoutDamage =
+    sanitizeDamageMarks(
+      rental.checkoutDamageMarks,
+    );
+
+  const checkoutDamageIds = new Set(
+    checkoutDamage.map(
+      (mark) => mark.id,
+    ),
+  );
+
+  const damageAtReturn: DamageMark[] =
+    returnDamageMarks ?? checkoutDamage;
+
+  /*
+   * Every value below is explicitly defined or null.
+   * Firestore rejects an undefined field outright, which
+   * previously aborted the whole return.
+   */
+  transaction.update(
+    input.rentalRef,
+    {
+      status:
+        "returned",
+
+      actualReturnAt,
+
+      returnFuelLevel,
+
+      returnOdometerKm:
+        returnOdometer?.km ?? null,
+
+      returnOdometerValue:
+        returnOdometer?.value ?? null,
+
+      returnOdometerUnit:
+        returnOdometer?.unit ?? null,
+
+      returnNotes,
+
+      returnMedia,
+
+      returnDamageMarks:
+        damageAtReturn,
+
+      newDamageCount:
+        damageAtReturn.filter(
+          (mark) =>
+            !checkoutDamageIds.has(
+              mark.id,
+            ),
+        ).length,
+
+      adjustments,
+
+      /*
+       * The agreement is rebuilt from the rental every
+       * time it is opened, so recording the waivers and
+       * the overrun here puts them on the printed copy.
+       * An approved contract snapshot is a separate,
+       * immutable document and is untouched.
+       */
+      agreement: {
+        ...((rental.agreement ??
+          {}) as Record<
+          string,
+          unknown
+        >),
+
+        waivers: returnWaivers,
+
+        extraHours,
+      },
+
+      returnedBy:
+        input.returnedBy.uid,
+
+      returnedByNameSnapshot:
+        input.returnedBy.name,
+
+      ...(input.rentalFields ?? {}),
+
+      updatedAt:
+        nowTimestamp(),
+    },
+  );
+
+  transaction.update(
+    input.financialRef,
+    {
+      adjustmentCents,
+
+      totalCents,
+
+      outstandingCents,
+
+      rentalStatus:
+        "returned",
+
+      actualReturnAt,
+
+      updatedAt:
+        nowTimestamp(),
+    },
+  );
+
+  if (
+    input.reservationRef &&
+    input.reservationExists
+  ) {
+    transaction.update(
+      input.reservationRef,
+      {
+        status: "completed",
+
+        completedAt: actualReturnAt,
+
+        updatedAt: nowTimestamp(),
+      },
+    );
+  }
+
+  /*
+   * A returned vehicle always goes to cleaning before it
+   * can be offered again, which is also the only valid
+   * transition out of rented or overdue.
+   */
+  transaction.update(
+    doc(
+      db,
+      "vehicles",
+      vehicleId,
+    ),
+    {
+      status:
+        "cleaning",
+
+      /* The hire it came back from, for the rules. */
+      statusRentalId:
+        input.rentalRef.id,
+
+      statusNote:
+        "Awaiting cleaning and detailing after return.",
+
+      damageMarks:
+        damageAtReturn,
+
+      damageUpdatedAt:
+        nowTimestamp(),
+
+      updatedAt:
+        nowTimestamp(),
+    },
+  );
+
+  for (
+    const adjustment of
+    adjustments
+  ) {
+    if (
+      adjustment.amountCents <=
+      0
+    ) {
+      continue;
+    }
+
+    const ledgerRef =
+      doc(
+        collection(
+          db,
+          "financialLedger",
+        ),
+      );
+
+    transaction.set(
+      ledgerRef,
+      {
+        rentalId:
+          input.rentalRef.id,
+
+        vehicleId,
+
+        vehicleRegistration,
+
+        customerId,
+
+        entryType:
+          adjustment.type ===
+          "discount"
+            ? "rental_discount"
+            : "rental_adjustment",
+
+        adjustmentType:
+          adjustment.type,
+
+        amountCents:
+          adjustment.type ===
+          "discount"
+            ? -adjustment.amountCents
+            : adjustment.amountCents,
+
+        note:
+          adjustment.note,
+
+        occurredAt:
+          nowTimestamp(),
+
+        recordedBy:
+          actorUid,
+      },
+    );
+  }
+
+  return outstandingCents;
+}
+
+/* The stored form of a return that waits for approval. */
+function storedReturn(
+  normalised: NormalisedReturn,
+): Record<string, unknown> {
+  return {
+    returnFuelLevel:
+      normalised.returnFuelLevel,
+    returnOdometer: normalised.returnOdometer
+      ? {
+          value: normalised.returnOdometer.value,
+          unit: normalised.returnOdometer.unit,
+        }
+      : null,
+    adjustments: normalised.adjustments,
+    waivers: normalised.returnWaivers,
+    extraHours: normalised.extraHours,
+    notes: normalised.returnNotes,
+    returnMedia: normalised.returnMedia,
+    damageMarks: normalised.returnDamageMarks,
+  };
+}
+
+async function returnRental(
+  input: ReturnInput,
+): Promise<{
+  outstandingCents: number;
+  /*
+   * "returned" when it took effect; "pending" when a
+   * backdated return was sent to an administrator.
+   */
+  status: "returned" | "pending";
+}> {
+  const { db } =
+    getFirebaseClient();
+
+  const actorUid =
+    getActorUid();
+
+  const normalised =
+    normaliseReturn(input);
+
+  const actualReturnAt =
+    asTimestamp(
+      input.actualReturnAt,
+    );
+
+  const enteredAtMs = Date.now();
+
+  if (
+    actualReturnAt.toMillis() >
+    enteredAtMs + RETURN_CLOCK_SKEW_MS
+  ) {
+    throw new Error(
+      "The return time cannot be in the future.",
+    );
+  }
+
+  const backdated =
+    actualReturnAt.toMillis() <
+    enteredAtMs - BACKDATED_RETURN_MS;
+
+  const reason = trimmedOrNull(input.reason);
+
+  if (backdated && !reason) {
+    throw new Error(
+      "Say why the return is being recorded at an earlier time.",
+    );
+  }
+
+  if (reason && reason.length > 500) {
+    throw new Error(
+      "Keep the reason under 500 characters.",
+    );
+  }
+
   const rentalRef =
     doc(
       db,
@@ -4621,7 +6313,14 @@ async function returnRental(
       ),
     );
 
+  const requestRef = doc(
+    collection(db, "returnRequests"),
+  );
+
   let outstandingCents = 0;
+
+  let status: "returned" | "pending" =
+    "returned";
 
   await runTransaction(
     db,
@@ -4683,27 +6382,6 @@ async function returnRental(
           : null;
 
       /*
-       * Re-reading the status inside the transaction is what
-       * makes a repeated submission safe: the second attempt
-       * sees "returned" and aborts instead of applying the
-       * adjustments twice.
-       */
-      if (
-        ![
-          "active",
-          "overdue",
-        ].includes(
-          String(
-            rental.status,
-          ),
-        )
-      ) {
-        throw new Error(
-          "Only active or overdue rentals can be returned.",
-        );
-      }
-
-      /*
        * Read before any write: a Firestore transaction
        * refuses a read once it has started writing, and the
        * rental update below is the first one.
@@ -4714,342 +6392,164 @@ async function returnRental(
           actorUid,
         );
 
-      const returnedByNameSnapshot =
-        returnedBy.name;
-
       /*
-       * A discount needs an administrator's say-so. Anyone
-       * else offers one from the payment screen, where it
-       * waits for approval instead of coming straight off.
+       * A backdated return waiting for an administrator is
+       * the return; a second one cannot be entered beside it.
        */
       if (
-        returnedBy.role !== "admin" &&
-        adjustments.some(
+        rental.returnRequestStatus ===
+        "pending"
+      ) {
+        throw new Error(
+          "A backdated return for this rental is waiting for an administrator. It cannot be returned again until that is decided.",
+        );
+      }
+
+      assertReturnFits(
+        rental,
+        actualReturnAt,
+        normalised,
+      );
+
+      /*
+       * Discounts are given on the daily rate at the start of
+       * the hire, never at the end of it.
+       */
+      if (
+        normalised.adjustments.some(
           (adjustment) =>
             adjustment.type === "discount" &&
             adjustment.amountCents > 0,
         )
       ) {
         throw new Error(
-          "A discount needs an administrator's approval. Complete the return, then request it on the Payment tab.",
-        );
-      }
-
-      const actualReturnAt =
-        asTimestamp(
-          input.actualReturnAt,
-        );
-
-      if (
-        actualReturnAt.toMillis() <
-        asTimestamp(
-          toIso(
-            rental.pickupAt,
-          ),
-        ).toMillis()
-      ) {
-        throw new Error(
-          "Actual return cannot be before pickup.",
-        );
-      }
-
-      if (
-        returnOdometer.km <
-        Number(
-          rental.pickupOdometerKm ??
-            0,
-        )
-      ) {
-        throw new Error(
-          "Return odometer cannot be lower than pickup odometer.",
-        );
-      }
-
-      const totalAdjustment =
-        adjustments.reduce(
-          (
-            total,
-            adjustment,
-          ) =>
-            adjustment.type ===
-            "discount"
-              ? total -
-                adjustment.amountCents
-              : total +
-                adjustment.amountCents,
-          0,
-        );
-
-      const adjustmentCents =
-        Number(
-          financial.adjustmentCents ??
-            0,
-        ) +
-        totalAdjustment;
-
-      const totalCents =
-        Number(
-          financial.baseRentalCents ??
-            0,
-        ) +
-        adjustmentCents;
-
-      if (
-        !Number.isFinite(
-          totalCents,
-        ) ||
-        totalCents < 0 ||
-        totalCents > MAX_MONEY_CENTS
-      ) {
-        throw new Error(
-          "Adjustments produce an invalid rental total.",
-        );
-      }
-
-      outstandingCents =
-        calculateBalance(
-          Math.round(
-            totalCents,
-          ),
-          assertMoneyCents(
-            financial.paidCents ?? 0,
-            "Amount received",
-          ),
-          assertMoneyCents(
-            financial.refundedCents ??
-              0,
-            "Amount refunded",
-          ),
-        );
-
-      const vehicleId =
-        trimmedOrNull(
-          rental.vehicleId,
-        );
-
-      if (!vehicleId) {
-        throw new Error(
-          "This rental is not linked to a vehicle.",
-        );
-      }
-
-      const vehicleRegistration =
-        String(
-          rental.vehicleRegistrationSnapshot ??
-            financial.vehicleRegistration ??
-            "",
-        );
-
-      const customerId =
-        String(
-          rental.customerId ??
-            financial.customerId ??
-            "",
-        );
-
-      const checkoutDamage =
-        sanitizeDamageMarks(
-          rental.checkoutDamageMarks,
-        );
-
-      const checkoutDamageIds = new Set(
-        checkoutDamage.map(
-          (mark) => mark.id,
-        ),
-      );
-
-      const damageAtReturn: DamageMark[] =
-        returnDamageMarks ?? checkoutDamage;
-
-      /*
-       * Every value below is explicitly defined or null.
-       * Firestore rejects an undefined field outright, which
-       * previously aborted the whole return.
-       */
-      transaction.update(
-        rentalRef,
-        {
-          status:
-            "returned",
-
-          actualReturnAt,
-
-          returnFuelLevel,
-
-          returnOdometerKm:
-            returnOdometer.km,
-
-          returnOdometerValue:
-            returnOdometer.value,
-
-          returnOdometerUnit:
-            returnOdometer.unit,
-
-          returnNotes,
-
-          returnMedia,
-
-          returnDamageMarks:
-            damageAtReturn,
-
-          newDamageCount:
-            damageAtReturn.filter(
-              (mark) =>
-                !checkoutDamageIds.has(
-                  mark.id,
-                ),
-            ).length,
-
-          adjustments,
-
-          /*
-           * The agreement is rebuilt from the rental every
-           * time it is opened, so recording the waivers and
-           * the overrun here puts them on the printed copy.
-           * An approved contract snapshot is a separate,
-           * immutable document and is untouched.
-           */
-          agreement: {
-            ...((rental.agreement ??
-              {}) as Record<
-              string,
-              unknown
-            >),
-
-            waivers: returnWaivers,
-
-            extraHours:
-              Math.trunc(extraHours),
-          },
-
-          returnedBy:
-            actorUid,
-
-          returnedByNameSnapshot,
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      transaction.update(
-        financialRef,
-        {
-          adjustmentCents,
-
-          totalCents,
-
-          outstandingCents,
-
-          rentalStatus:
-            "returned",
-
-          actualReturnAt,
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      if (
-        reservationRef &&
-        reservationSnapshot?.exists()
-      ) {
-        transaction.update(
-          reservationRef,
-          {
-            status: "completed",
-
-            completedAt: actualReturnAt,
-
-            updatedAt: nowTimestamp(),
-          },
+          "A discount is given on the daily rate at booking or checkout, not at return.",
         );
       }
 
       /*
-       * A returned vehicle always goes to cleaning before it
-       * can be offered again, which is also the only valid
-       * transition out of rented or overdue.
+       * A backdated return entered by anyone but an
+       * administrator is held as a request with everything
+       * entered on the Return tab. The rental stays open and
+       * the vehicle stays rented until it is decided.
        */
-      transaction.update(
-        doc(
-          db,
-          "vehicles",
-          vehicleId,
-        ),
-        {
-          status:
-            "cleaning",
-
-          statusNote:
-            "Awaiting cleaning and detailing after return.",
-
-          damageMarks:
-            damageAtReturn,
-
-          damageUpdatedAt:
-            nowTimestamp(),
-
-          updatedAt:
-            nowTimestamp(),
-        },
-      );
-
-      for (
-        const adjustment of
-        adjustments
+      if (
+        backdated &&
+        returnedBy.role !== "admin"
       ) {
-        if (
-          adjustment.amountCents <=
-          0
-        ) {
-          continue;
-        }
+        status = "pending";
 
-        const ledgerRef =
-          doc(
-            collection(
-              db,
-              "financialLedger",
-            ),
-          );
+        outstandingCents = Number(
+          financial.outstandingCents ?? 0,
+        );
+
+        transaction.set(requestRef, {
+          rentalId: rentalRef.id,
+          reservationId,
+          vehicleId: trimmedOrNull(
+            rental.vehicleId,
+          ),
+          customerNameSnapshot: String(
+            rental.customerNameSnapshot ?? "",
+          ),
+          vehicleRegistrationSnapshot: String(
+            rental.vehicleRegistrationSnapshot ??
+              "",
+          ),
+          requestedReturnAt: actualReturnAt,
+          enteredAt: nowTimestamp(),
+          reason,
+          returnInput: storedReturn(normalised),
+          status: "pending",
+          requestedBy: actorUid,
+          requestedByNameSnapshot:
+            returnedBy.name,
+          requestedAt: nowTimestamp(),
+          reviewedBy: null,
+          reviewedByNameSnapshot: null,
+          reviewedAt: null,
+          reviewNote: null,
+          updatedAt: nowTimestamp(),
+        });
+
+        transaction.update(rentalRef, {
+          returnRequestId: requestRef.id,
+          returnRequestStatus: "pending",
+          updatedAt: nowTimestamp(),
+        });
 
         transaction.set(
-          ledgerRef,
+          doc(collection(db, "auditLogs")),
           {
-            rentalId:
-              rentalRef.id,
+            actorUid,
+            action:
+              "rental.backdated_return_requested",
+            resource: {
+              collection: "returnRequests",
+              id: requestRef.id,
+            },
+            details: {
+              actorName: returnedBy.name,
+              rentalId: rentalRef.id,
+              requestedReturnAt:
+                input.actualReturnAt,
+              enteredAt: new Date(
+                enteredAtMs,
+              ).toISOString(),
+              reason,
+            },
+            createdAt: nowTimestamp(),
+          },
+        );
 
-            vehicleId,
+        return;
+      }
 
-            vehicleRegistration,
+      outstandingCents = applyReturn(
+        transaction,
+        {
+          rentalRef,
+          rental,
+          financialRef,
+          financial,
+          reservationRef,
+          reservationExists: Boolean(
+            reservationSnapshot?.exists(),
+          ),
+          actualReturnAt,
+          normalised,
+          returnedBy: {
+            uid: actorUid,
+            name: returnedBy.name,
+          },
+          actorUid,
+          rentalFields: backdated
+            ? { backdatedReturnReason: reason }
+            : undefined,
+        },
+      );
 
-            customerId,
-
-            entryType:
-              adjustment.type ===
-              "discount"
-                ? "rental_discount"
-                : "rental_adjustment",
-
-            adjustmentType:
-              adjustment.type,
-
-            amountCents:
-              adjustment.type ===
-              "discount"
-                ? -adjustment.amountCents
-                : adjustment.amountCents,
-
-            note:
-              adjustment.note,
-
-            occurredAt:
-              nowTimestamp(),
-
-            recordedBy:
-              actorUid,
+      if (backdated) {
+        transaction.set(
+          doc(collection(db, "auditLogs")),
+          {
+            actorUid,
+            action: "rental.backdated_return",
+            resource: {
+              collection: "rentals",
+              id: rentalRef.id,
+            },
+            details: {
+              actorName: returnedBy.name,
+              requestedReturnAt:
+                input.actualReturnAt,
+              enteredAt: new Date(
+                enteredAtMs,
+              ).toISOString(),
+              reason,
+              decision: "applied by an administrator",
+            },
+            createdAt: nowTimestamp(),
           },
         );
       }
@@ -5058,7 +6558,381 @@ async function returnRental(
 
   return {
     outstandingCents,
+    status,
   };
+}
+
+export type ReturnRequest = {
+  id: string;
+  rentalId: string;
+  customerName: string;
+  vehicleRegistration: string;
+  requestedReturnAt: string | null;
+  enteredAt: string | null;
+  reason: string;
+  status: RequestStatus;
+  requestedBy: string;
+  requestedByName: string;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+function returnRequestFrom(
+  id: string,
+  data: Record<string, unknown>,
+): ReturnRequest {
+  return {
+    id,
+    rentalId: String(data.rentalId ?? ""),
+    customerName: String(
+      data.customerNameSnapshot ?? "",
+    ),
+    vehicleRegistration: String(
+      data.vehicleRegistrationSnapshot ?? "",
+    ),
+    requestedReturnAt: data.requestedReturnAt
+      ? toIso(data.requestedReturnAt)
+      : null,
+    enteredAt: data.enteredAt
+      ? toIso(data.enteredAt)
+      : null,
+    reason: String(data.reason ?? ""),
+    status: requestStatusOf(data.status),
+    requestedBy: String(data.requestedBy ?? ""),
+    requestedByName: String(
+      data.requestedByNameSnapshot ?? "",
+    ),
+    reviewedByName: trimmedOrNull(
+      data.reviewedByNameSnapshot,
+    ),
+    reviewedAt: data.reviewedAt
+      ? toIso(data.reviewedAt)
+      : null,
+    reviewNote: trimmedOrNull(data.reviewNote),
+  };
+}
+
+/* Every waiting request, and the caller's own. */
+async function listReturnRequests(): Promise<
+  ReturnRequest[]
+> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const [pending, mine] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "returnRequests"),
+        where("status", "==", "pending"),
+        limit(200),
+      ),
+    ),
+
+    getDocs(
+      query(
+        collection(db, "returnRequests"),
+        where("requestedBy", "==", actorUid),
+        limit(100),
+      ),
+    ),
+  ]);
+
+  const byId = new Map<string, ReturnRequest>();
+
+  for (const entry of [
+    ...pending.docs,
+    ...mine.docs,
+  ]) {
+    byId.set(
+      entry.id,
+      returnRequestFrom(entry.id, entry.data()),
+    );
+  }
+
+  return [...byId.values()].sort((a, b) =>
+    String(b.enteredAt).localeCompare(
+      String(a.enteredAt),
+    ),
+  );
+}
+
+/*
+ * An administrator decides a backdated return. Approval
+ * completes the return exactly as a normal one, at the time
+ * that was entered, from what was entered; rejection leaves
+ * the rental open. The request is re-read in the transaction,
+ * so only one decision can land.
+ */
+async function reviewReturnRequest(
+  input: {
+    requestId: string;
+    decision: "approve" | "reject";
+    note: string | null;
+  },
+): Promise<{
+  status: RequestStatus;
+  rentalId: string;
+  outstandingCents: number | null;
+}> {
+  const { db } = getFirebaseClient();
+
+  const actorUid = getActorUid();
+
+  const requestId = trimmedOrNull(
+    input.requestId,
+  );
+
+  if (!requestId) {
+    throw new Error(
+      "Select the backdated return to review.",
+    );
+  }
+
+  if (
+    input.decision !== "approve" &&
+    input.decision !== "reject"
+  ) {
+    throw new Error(
+      "Choose whether to approve or reject the return.",
+    );
+  }
+
+  const note = trimmedOrNull(input.note);
+
+  if (input.decision === "reject" && !note) {
+    throw new Error(
+      "Say why the backdated return is rejected.",
+    );
+  }
+
+  if (note && note.length > 1000) {
+    throw new Error(
+      "Keep the review note under 1000 characters.",
+    );
+  }
+
+  const requestRef = doc(
+    db,
+    "returnRequests",
+    requestId,
+  );
+
+  let result: {
+    status: RequestStatus;
+    rentalId: string;
+    outstandingCents: number | null;
+  } = {
+    status: "pending",
+    rentalId: "",
+    outstandingCents: null,
+  };
+
+  await runTransaction(db, async (transaction) => {
+    const requestSnapshot =
+      await transaction.get(requestRef);
+
+    if (!requestSnapshot.exists()) {
+      throw new Error(
+        "Backdated return was not found.",
+      );
+    }
+
+    const request = requestSnapshot.data();
+
+    if (
+      requestStatusOf(request.status) !==
+      "pending"
+    ) {
+      throw new Error(
+        "This backdated return has already been decided.",
+      );
+    }
+
+    const rentalId = String(
+      request.rentalId ?? "",
+    );
+
+    const rentalRef = doc(
+      db,
+      "rentals",
+      rentalId,
+    );
+
+    const financialRef = doc(
+      db,
+      "rentalFinancials",
+      rentalId,
+    );
+
+    const [rentalSnapshot, financialSnapshot] =
+      await Promise.all([
+        transaction.get(rentalRef),
+        transaction.get(financialRef),
+      ]);
+
+    if (
+      !rentalSnapshot.exists() ||
+      !financialSnapshot.exists()
+    ) {
+      throw new Error(
+        "Rental was not found.",
+      );
+    }
+
+    const rental = rentalSnapshot.data();
+
+    const reservationId = trimmedOrNull(
+      rental.reservationId,
+    );
+
+    const reservationRef = reservationId
+      ? doc(db, "reservations", reservationId)
+      : null;
+
+    const reservationSnapshot = reservationRef
+      ? await transaction.get(reservationRef)
+      : null;
+
+    const actor = await actorProfileSnapshot(
+      transaction,
+      actorUid,
+    );
+
+    if (actor.role !== "admin") {
+      throw new Error(
+        "Only an administrator can decide a backdated return.",
+      );
+    }
+
+    if (request.requestedBy === actorUid) {
+      throw new Error(
+        "A request has to be decided by another administrator.",
+      );
+    }
+
+    const status: RequestStatus =
+      input.decision === "approve"
+        ? "approved"
+        : "rejected";
+
+    let outstandingCents: number | null = null;
+
+    if (status === "approved") {
+      const requestedReturnAt =
+        request.requestedReturnAt instanceof
+        Timestamp
+          ? request.requestedReturnAt
+          : asTimestamp(
+              toIso(request.requestedReturnAt),
+            );
+
+      const normalised = normaliseReturn(
+        (request.returnInput ?? {}) as Omit<
+          ReturnInput,
+          "rentalId" | "actualReturnAt" | "reason"
+        >,
+      );
+
+      assertReturnFits(
+        rental,
+        requestedReturnAt,
+        normalised,
+      );
+
+      outstandingCents = applyReturn(
+        transaction,
+        {
+          rentalRef,
+          rental,
+          financialRef,
+          financial: financialSnapshot.data(),
+          reservationRef,
+          reservationExists: Boolean(
+            reservationSnapshot?.exists(),
+          ),
+          actualReturnAt: requestedReturnAt,
+          normalised,
+          /* The employee who took the car back. */
+          returnedBy: {
+            uid: String(request.requestedBy ?? ""),
+            name: String(
+              request.requestedByNameSnapshot ??
+                "",
+            ),
+          },
+          actorUid,
+          rentalFields: {
+            returnRequestStatus: "approved",
+            backdatedReturnReason: String(
+              request.reason ?? "",
+            ),
+            returnApprovedBy: actorUid,
+            returnApprovedByNameSnapshot:
+              actor.name,
+          },
+        },
+      );
+    } else {
+      transaction.update(rentalRef, {
+        returnRequestStatus: "rejected",
+        updatedAt: nowTimestamp(),
+      });
+    }
+
+    transaction.update(requestRef, {
+      status,
+      reviewedBy: actorUid,
+      reviewedByNameSnapshot: actor.name,
+      reviewedAt: nowTimestamp(),
+      reviewNote: note,
+      updatedAt: nowTimestamp(),
+    });
+
+    transaction.set(
+      doc(collection(db, "auditLogs")),
+      {
+        actorUid,
+        action:
+          status === "approved"
+            ? "rental.backdated_return_approved"
+            : "rental.backdated_return_rejected",
+        resource: {
+          collection: "returnRequests",
+          id: requestId,
+        },
+        details: {
+          actorName: actor.name,
+          rentalId,
+          requestedReturnAt: request.requestedReturnAt
+            ? toIso(request.requestedReturnAt)
+            : null,
+          enteredAt: request.enteredAt
+            ? toIso(request.enteredAt)
+            : null,
+          reason: String(request.reason ?? ""),
+          requestedBy: String(
+            request.requestedBy ?? "",
+          ),
+          requestedByName: String(
+            request.requestedByNameSnapshot ?? "",
+          ),
+          decision: status,
+          reviewNote: note,
+        },
+        createdAt: nowTimestamp(),
+      },
+    );
+
+    result = {
+      status,
+      rentalId,
+      outstandingCents,
+    };
+  });
+
+  return result;
 }
 
 /* =========================================================
@@ -5519,6 +7393,7 @@ export type RentalDiscount = {
   rentalId: string;
   customerName: string;
   vehicleRegistration: string;
+  /* Off the balance; for a daily-rate discount, off each day. */
   amountCents: number;
   reason: string;
   status: DiscountStatus;
@@ -5527,6 +7402,18 @@ export type RentalDiscount = {
   reviewedByName: string | null;
   reviewedAt: string | null;
   reviewNote: string | null;
+  /*
+   * Set on a discount on the daily rate; null on one offered
+   * off the balance before that was replaced.
+   */
+  dailyRate: {
+    reservationId: string;
+    type: "amount" | "percent";
+    value: number;
+    originalDailyCents: number;
+    discountedDailyCents: number;
+    offeredAt: string | null;
+  } | null;
 };
 
 function discountStatusOf(
@@ -5567,6 +7454,28 @@ function rentalDiscountFrom(
       ? toIso(data.reviewedAt)
       : null,
     reviewNote: trimmedOrNull(data.reviewNote),
+    dailyRate:
+      data.kind === "daily_rate"
+        ? {
+            reservationId: String(
+              data.reservationId ?? "",
+            ),
+            type:
+              data.discountType === "percent"
+                ? "percent"
+                : "amount",
+            value: Number(data.discountValue ?? 0),
+            originalDailyCents: Number(
+              data.originalDailyCents ?? 0,
+            ),
+            discountedDailyCents: Number(
+              data.discountedDailyCents ?? 0,
+            ),
+            offeredAt: trimmedOrNull(
+              data.offeredAt,
+            ),
+          }
+        : null,
   };
 }
 
@@ -5672,234 +7581,33 @@ function applyDiscount(
   return outstandingCents;
 }
 
+/* "$10.00 off the daily rate ($75.00 → $65.00)". */
+export function describeDailyRateDiscount(
+  discount: Pick<RentalDiscount, "dailyRate" | "amountCents">,
+): string {
+  const rate = discount.dailyRate;
+
+  if (!rate) {
+    return `${formatCents(discount.amountCents)} off`;
+  }
+
+  const off =
+    rate.type === "percent"
+      ? `${rate.value}%`
+      : formatCents(rate.value);
+
+  return `${off} off the daily rate (${formatCents(
+    rate.originalDailyCents,
+  )} → ${formatCents(
+    rate.discountedDailyCents,
+  )} a day)`;
+}
+
 function formatCents(cents: number): string {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
   }).format(cents / 100);
-}
-
-async function requestRentalDiscount(
-  input: {
-    rentalId: string;
-    amountCents: number;
-    reason: string;
-    idempotencyKey: string;
-  },
-): Promise<{
-  discountId: string;
-  status: DiscountStatus;
-  outstandingCents: number;
-}> {
-  const { db } = getFirebaseClient();
-
-  const actorUid = getActorUid();
-
-  const rentalId = trimmedOrNull(input.rentalId);
-
-  if (!rentalId) {
-    throw new Error("Select the rental to discount.");
-  }
-
-  const amountCents = assertMoneyCents(
-    input.amountCents,
-    "Discount amount",
-  );
-
-  if (amountCents <= 0) {
-    throw new Error(
-      "Discount amount must be greater than zero.",
-    );
-  }
-
-  const reason = trimmedOrNull(input.reason);
-
-  if (!reason) {
-    throw new Error(
-      "Say why the discount is being offered.",
-    );
-  }
-
-  if (reason.length > 500) {
-    throw new Error(
-      "Keep the discount reason under 500 characters.",
-    );
-  }
-
-  /*
-   * One request at a time per rental, so an administrator
-   * never approves two versions of the same discount. The
-   * query cannot run inside a browser transaction; the
-   * idempotency key below is what stops a double submit.
-   */
-  const waiting = await getDocs(
-    query(
-      collection(db, "rentalDiscounts"),
-      where("rentalId", "==", rentalId),
-      where("status", "==", "pending"),
-      limit(1),
-    ),
-  );
-
-  if (!waiting.empty) {
-    throw new Error(
-      "A discount on this rental is already waiting for an administrator.",
-    );
-  }
-
-  const operationRef = doc(
-    db,
-    "idempotencyKeys",
-    `discount_${input.idempotencyKey}`,
-  );
-
-  const discountRef = doc(
-    collection(db, "rentalDiscounts"),
-  );
-
-  const financialRef = doc(
-    db,
-    "rentalFinancials",
-    rentalId,
-  );
-
-  const rentalRef = doc(db, "rentals", rentalId);
-
-  let response:
-    | {
-        discountId: string;
-        status: DiscountStatus;
-        outstandingCents: number;
-      }
-    | undefined;
-
-  await runTransaction(db, async (transaction) => {
-    const previous = await transaction.get(
-      operationRef,
-    );
-
-    if (previous.exists()) {
-      response = previous.get("response");
-
-      return;
-    }
-
-    const [financialSnapshot, rentalSnapshot] =
-      await Promise.all([
-        transaction.get(financialRef),
-        transaction.get(rentalRef),
-      ]);
-
-    if (
-      !financialSnapshot.exists() ||
-      !rentalSnapshot.exists()
-    ) {
-      throw new Error(
-        "Rental financial record was not found.",
-      );
-    }
-
-    const actor = await actorProfileSnapshot(
-      transaction,
-      actorUid,
-    );
-
-    const financial = financialSnapshot.data();
-
-    const rental = rentalSnapshot.data();
-
-    const status: DiscountStatus =
-      actor.role === "admin"
-        ? "approved"
-        : "pending";
-
-    let outstandingCents = Number(
-      financial.outstandingCents ?? 0,
-    );
-
-    if (status === "approved") {
-      outstandingCents = applyDiscount(
-        transaction,
-        {
-          rentalId,
-          discountId: discountRef.id,
-          financial,
-          amountCents,
-          reason,
-          actorUid,
-        },
-      );
-    } else if (amountCents > outstandingCents) {
-      throw new Error(
-        `The discount is more than the ${formatCents(
-          Math.max(outstandingCents, 0),
-        )} still owed on this rental.`,
-      );
-    }
-
-    transaction.set(discountRef, {
-      rentalId,
-      customerNameSnapshot: String(
-        financial.customerNameSnapshot ??
-          rental.customerNameSnapshot ??
-          "",
-      ),
-      vehicleRegistrationSnapshot: String(
-        financial.vehicleRegistration ??
-          rental.vehicleRegistrationSnapshot ??
-          "",
-      ),
-      amountCents,
-      reason,
-      status,
-      requestedBy: actorUid,
-      requestedByNameSnapshot: actor.name,
-      requestedAt: nowTimestamp(),
-
-      /* An administrator's own discount is its own approval. */
-      reviewedBy:
-        status === "approved" ? actorUid : null,
-      reviewedByNameSnapshot:
-        status === "approved" ? actor.name : null,
-      reviewedAt:
-        status === "approved"
-          ? nowTimestamp()
-          : null,
-      reviewNote: null,
-      updatedAt: nowTimestamp(),
-    });
-
-    transaction.set(
-      doc(collection(db, "auditLogs")),
-      {
-        actorUid,
-        action:
-          status === "approved"
-            ? "discount.applied"
-            : "discount.requested",
-        resource: {
-          collection: "rentalDiscounts",
-          id: discountRef.id,
-        },
-        details: { rentalId, amountCents },
-        createdAt: nowTimestamp(),
-      },
-    );
-
-    response = {
-      discountId: discountRef.id,
-      status,
-      outstandingCents,
-    };
-
-    transaction.set(operationRef, {
-      response,
-      actorUid,
-      createdAt: nowTimestamp(),
-    });
-  });
-
-  return response!;
 }
 
 async function reviewRentalDiscount(
@@ -5970,6 +7678,22 @@ async function reviewRentalDiscount(
       throw new Error(
         "This discount has already been decided.",
       );
+    }
+
+    /* A discount on the daily rate re-prices the hire. */
+    if (discount.kind === "daily_rate") {
+      result = await decideDailyRateDiscount(
+        transaction,
+        {
+          discountRef,
+          discount,
+          decision: input.decision,
+          note,
+          actorUid,
+        },
+      );
+
+      return;
     }
 
     const rentalId = String(discount.rentalId);
@@ -6057,6 +7781,333 @@ async function reviewRentalDiscount(
   return result;
 }
 
+/*
+ * Decides a discount on the daily rate, inside the caller's
+ * transaction. Approved before checkout, the booking is
+ * re-priced; after it, the rental, its booking and its balance
+ * are, and the difference is booked as a discount line. The
+ * approved rate becomes the hire's own daily rate, so the
+ * quote, extensions, rent on a long hire and the agreement all
+ * price from it. The vehicle's own rates never change.
+ */
+async function decideDailyRateDiscount(
+  transaction: Parameters<
+    Parameters<typeof runTransaction>[1]
+  >[0],
+  input: {
+    discountRef: ReturnType<typeof doc>;
+    discount: Record<string, any>;
+    decision: "approve" | "reject";
+    note: string | null;
+    actorUid: string;
+  },
+): Promise<{
+  status: DiscountStatus;
+  outstandingCents: number | null;
+}> {
+  const { db } = getFirebaseClient();
+
+  const { discount, actorUid, note } = input;
+
+  const reservationId = String(
+    discount.reservationId ?? "",
+  );
+
+  const reservationRef = doc(
+    db,
+    "reservations",
+    reservationId,
+  );
+
+  const reservationSnapshot =
+    await transaction.get(reservationRef);
+
+  if (!reservationSnapshot.exists()) {
+    throw new Error("Booking was not found.");
+  }
+
+  const reservation = reservationSnapshot.data();
+
+  /* Once checked out, the rental is what is priced. */
+  const rentalId =
+    reservation.status === "confirmed"
+      ? null
+      : trimmedOrNull(reservation.rentalId);
+
+  const rentalRef = rentalId
+    ? doc(db, "rentals", rentalId)
+    : null;
+
+  const financialRef = rentalId
+    ? doc(db, "rentalFinancials", rentalId)
+    : null;
+
+  const [rentalSnapshot, financialSnapshot] =
+    await Promise.all([
+      rentalRef
+        ? transaction.get(rentalRef)
+        : null,
+      financialRef
+        ? transaction.get(financialRef)
+        : null,
+    ]);
+
+  const actor = await actorProfileSnapshot(
+    transaction,
+    actorUid,
+  );
+
+  if (actor.role !== "admin") {
+    throw new Error(
+      "Only an administrator can approve a discount.",
+    );
+  }
+
+  if (discount.requestedBy === actorUid) {
+    throw new Error(
+      "A request has to be decided by another administrator.",
+    );
+  }
+
+  const status: DiscountStatus =
+    input.decision === "approve"
+      ? "approved"
+      : "rejected";
+
+  let outstandingCents: number | null = null;
+
+  const lock = {
+    dailyRateDiscountStatus: status,
+    updatedAt: nowTimestamp(),
+  };
+
+  if (status === "approved") {
+    if (reservation.status === "cancelled") {
+      throw new Error(
+        "This booking was cancelled. Reject the discount instead.",
+      );
+    }
+
+    const originalDailyCents = Number(
+      discount.originalDailyCents,
+    );
+
+    const discountedDaily = Number(
+      discount.discountedDailyCents,
+    );
+
+    const priced = (rentalId
+      ? rentalSnapshot?.data()
+      : reservation) as Record<string, any> | undefined;
+
+    if (!priced) {
+      throw new Error("Rental was not found.");
+    }
+
+    const rates = (priced.rateSnapshot ??
+      {}) as Record<string, any>;
+
+    /*
+     * The discount was worked out from this rate. Anything
+     * else means the hire was re-priced since it was asked
+     * for, and approving it would discount the wrong figure.
+     */
+    if (
+      Number(rates.dailyCents) !==
+      originalDailyCents
+    ) {
+      throw new Error(
+        "The daily rate on this hire has changed since the discount was asked for. Reject it and ask again.",
+      );
+    }
+
+    const discountedRates = withDailyRate(
+      {
+        ...rates,
+        currency: "USD" as const,
+        dailyCents: rates.dailyCents ?? null,
+        weeklyCents: rates.weeklyCents ?? null,
+        monthlyCents: rates.monthlyCents ?? null,
+      },
+      discountedDaily,
+    );
+
+    const discountedQuote = quoteRental(
+      {
+        pickupAt: toIso(priced.pickupAt),
+        expectedReturnAt: toIso(
+          priced.expectedReturnAt,
+        ),
+      },
+      discountedRates,
+    );
+
+    const repricing = {
+      rateSnapshot: discountedRates,
+      quote: discountedQuote,
+    };
+
+    if (rentalRef && financialRef) {
+      if (!financialSnapshot?.exists()) {
+        throw new Error(
+          "Rental financial record was not found.",
+        );
+      }
+
+      const financial = financialSnapshot.data();
+
+      const reductionCents = Math.max(
+        0,
+        Number(financial.baseRentalCents ?? 0) -
+          discountedQuote.baseRentalCents,
+      );
+
+      const currentOutstanding = calculateBalance(
+        Math.round(
+          Number(financial.totalCents ?? 0),
+        ),
+        assertMoneyCents(
+          financial.paidCents ?? 0,
+          "Amount received",
+        ),
+        assertMoneyCents(
+          financial.refundedCents ?? 0,
+          "Amount refunded",
+        ),
+      );
+
+      /*
+       * A discount only forgives what is still owed: money
+       * already taken is a refund, a separate decision.
+       */
+      if (reductionCents > currentOutstanding) {
+        throw new Error(
+          `The discount takes ${formatCents(
+            reductionCents,
+          )} off, more than the ${formatCents(
+            Math.max(currentOutstanding, 0),
+          )} still owed on this rental.`,
+        );
+      }
+
+      outstandingCents =
+        currentOutstanding - reductionCents;
+
+      transaction.update(financialRef, {
+        baseRentalCents:
+          discountedQuote.baseRentalCents,
+        totalCents:
+          Number(financial.totalCents ?? 0) -
+          reductionCents,
+        outstandingCents,
+        updatedAt: nowTimestamp(),
+      });
+
+      transaction.update(rentalRef, {
+        ...repricing,
+        agreement: repricedAgreement(
+          (priced.agreement ?? {}) as Record<
+            string,
+            unknown
+          >,
+          discountedQuote as unknown as Record<string, unknown>,
+          discountedRates as unknown as Record<string, unknown>,
+        ),
+        ...lock,
+      });
+
+      if (reductionCents > 0) {
+        transaction.set(
+          doc(collection(db, "financialLedger")),
+          {
+            rentalId,
+            vehicleId: String(
+              financial.vehicleId ??
+                priced.vehicleId ??
+                "",
+            ),
+            vehicleRegistration: String(
+              financial.vehicleRegistration ??
+                priced.vehicleRegistrationSnapshot ??
+                "",
+            ),
+            customerId: String(
+              financial.customerId ??
+                priced.customerId ??
+                "",
+            ),
+            entryType: "rental_discount",
+            adjustmentType: "discount",
+            amountCents: -reductionCents,
+            discountId: input.discountRef.id,
+            note: String(discount.reason ?? ""),
+            occurredAt: nowTimestamp(),
+            recordedBy: actorUid,
+          },
+        );
+      }
+    }
+
+    transaction.update(reservationRef, {
+      ...repricing,
+      ...lock,
+    });
+  } else {
+    transaction.update(reservationRef, lock);
+
+    if (rentalRef && rentalSnapshot?.exists()) {
+      transaction.update(rentalRef, lock);
+    }
+  }
+
+  transaction.update(input.discountRef, {
+    status,
+    reviewedBy: actorUid,
+    reviewedByNameSnapshot: actor.name,
+    reviewedAt: nowTimestamp(),
+    reviewNote: note,
+    updatedAt: nowTimestamp(),
+  });
+
+  transaction.set(
+    doc(collection(db, "auditLogs")),
+    {
+      actorUid,
+      action:
+        status === "approved"
+          ? "discount.daily_rate_approved"
+          : "discount.daily_rate_rejected",
+      resource: {
+        collection: "rentalDiscounts",
+        id: input.discountRef.id,
+      },
+      details: {
+        actorName: actor.name,
+        reservationId,
+        rentalId,
+        discountType: discount.discountType ?? null,
+        discountValue: discount.discountValue ?? null,
+        originalDailyCents:
+          discount.originalDailyCents ?? null,
+        discountedDailyCents:
+          discount.discountedDailyCents ?? null,
+        reason: String(discount.reason ?? ""),
+        requestedBy: String(
+          discount.requestedBy ?? "",
+        ),
+        requestedByName: String(
+          discount.requestedByNameSnapshot ?? "",
+        ),
+        decision: status,
+        note,
+      },
+      createdAt: nowTimestamp(),
+    },
+  );
+
+  return { status, outstandingCents };
+}
+
 /* Discounts still waiting for an administrator. */
 async function listPendingDiscounts(): Promise<
   RentalDiscount[]
@@ -6113,6 +8164,16 @@ async function createVehicle(
 
   const actorUid =
     getActorUid();
+
+  /*
+   * A vehicle's rates are what every hire is priced from, so
+   * only an administrator adds one.
+   */
+  if ((await callerRole()) !== "admin") {
+    throw new Error(
+      "Only an administrator can add a vehicle, because its rates are set by an administrator.",
+    );
+  }
 
   const registrationNumber =
     String(
@@ -6457,6 +8518,9 @@ async function updateVehicleDetails(
   const actorUid =
     getActorUid();
 
+  const isAdmin =
+    (await callerRole()) === "admin";
+
   const vehicleRef =
     doc(
       db,
@@ -6589,6 +8653,22 @@ async function updateVehicleDetails(
       ) {
         throw new Error(
           "At least one vehicle rate is required.",
+        );
+      }
+
+      /* Every hire is priced from these, so only an
+         administrator changes them. */
+      if (
+        !isAdmin &&
+        (rates.dailyCents !==
+          (current.rates?.dailyCents ?? null) ||
+          rates.weeklyCents !==
+            (current.rates?.weeklyCents ?? null) ||
+          rates.monthlyCents !==
+            (current.rates?.monthlyCents ?? null))
+      ) {
+        throw new Error(
+          "Only an administrator can change a vehicle's rates.",
         );
       }
 
@@ -6799,6 +8879,27 @@ async function changeVehicleStatus(
 
       const vehicle =
         snapshot.data() as VehicleDocument;
+
+      /*
+       * A vehicle that is booked or out moves with its booking
+       * or rental. Changing it by hand releases it from under
+       * them, so that is an administrator's decision.
+       */
+      if (
+        !(
+          MANUAL_VEHICLE_STATUSES.includes(
+            vehicle.status,
+          ) &&
+          MANUAL_VEHICLE_STATUSES.includes(
+            input.status,
+          )
+        ) &&
+        (await callerRole()) !== "admin"
+      ) {
+        throw new Error(
+          "Only an administrator can change the status of a vehicle that is booked or out on hire.",
+        );
+      }
 
       if (
         !isValidVehicleTransition(
@@ -8035,20 +10136,44 @@ async function getLedgerEntryDetail(
       a.occurredAt.localeCompare(b.occurredAt),
     );
 
-  const discounts = discountSnapshot
-    ? discountSnapshot.docs
-        .map((snapshot) =>
-          rentalDiscountFrom(
-            snapshot.id,
-            snapshot.data(),
-          ),
-        )
-        .sort((a, b) =>
-          String(a.requestedAt).localeCompare(
-            String(b.requestedAt),
-          ),
-        )
+  /*
+   * A discount on the daily rate asked for at booking was filed
+   * before the rental existed, so it is found by the booking.
+   */
+  const bookingId = trimmedOrNull(
+    rental?.reservationId,
+  );
+
+  const bookingDiscounts = bookingId
+    ? await getDocs(
+        query(
+          collection(db, "rentalDiscounts"),
+          where("reservationId", "==", bookingId),
+          limit(50),
+        ),
+      )
+        .then((snapshot) => snapshot.docs)
+        .catch(() => [])
     : [];
+
+  const discounts = [
+    ...new Map(
+      [
+        ...(discountSnapshot?.docs ?? []),
+        ...bookingDiscounts,
+      ].map((snapshot) => [
+        snapshot.id,
+        rentalDiscountFrom(
+          snapshot.id,
+          snapshot.data(),
+        ),
+      ]),
+    ).values(),
+  ].sort((a, b) =>
+    String(a.requestedAt).localeCompare(
+      String(b.requestedAt),
+    ),
+  );
 
   const discountId = trimmedOrNull(entry.discountId);
 
@@ -9498,6 +11623,8 @@ const RENTAL_PAYMENT_METHODS = [
   "card",
   "bank_transfer",
   "other",
+  "account_credit",
+  "ath",
 ] as const;
 
 export type PastRentalInput = {
@@ -10297,7 +12424,146 @@ export type RentalDocuments = {
   bookingMedia: RentalMediaItem[];
   checkoutMedia: RentalMediaItem[];
   returnMedia: RentalMediaItem[];
+  /* Every approval asked for on this hire, and how it ended. */
+  requests: RentalRequestEntry[];
 };
+
+export type RentalRequestEntry = {
+  id: string;
+  kind:
+    | "cancellation"
+    | "backdated_return"
+    | "daily_rate_discount";
+  summary: string;
+  reason: string;
+  status: string;
+  requestedByName: string;
+  requestedAt: string | null;
+  reviewedByName: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+};
+
+/*
+ * The approval requests filed against one hire. Each is its
+ * own single-field query, and a collection the deployed rules
+ * do not cover yet costs its own entries and nothing else.
+ */
+async function rentalRequests(
+  rentalId: string,
+  reservationId: string | null,
+): Promise<RentalRequestEntry[]> {
+  const { db } = getFirebaseClient();
+
+  const read = (
+    name: string,
+    field: string,
+    value: string | null,
+  ) =>
+    value
+      ? getDocs(
+          query(
+            collection(db, name),
+            where(field, "==", value),
+            limit(50),
+          ),
+        )
+          .then((snapshot) => snapshot.docs)
+          .catch(() => [])
+      : Promise.resolve([]);
+
+  const [cancellations, returns, discounts] =
+    await Promise.all([
+      read(
+        "cancellationRequests",
+        "reservationId",
+        reservationId,
+      ),
+      read("returnRequests", "rentalId", rentalId),
+      read(
+        "rentalDiscounts",
+        "reservationId",
+        reservationId,
+      ),
+    ]);
+
+  const entries: RentalRequestEntry[] = [
+    ...cancellations.map((entry) => {
+      const request = cancellationRequestFrom(
+        entry.id,
+        entry.data(),
+      );
+
+      return {
+        id: request.id,
+        kind: "cancellation" as const,
+        summary: "Cancel the booking",
+        reason: request.reason,
+        status: request.status,
+        requestedByName: request.requestedByName,
+        requestedAt: request.requestedAt,
+        reviewedByName: request.reviewedByName,
+        reviewedAt: request.reviewedAt,
+        reviewNote: request.reviewNote,
+      };
+    }),
+
+    ...returns.map((entry) => {
+      const request = returnRequestFrom(
+        entry.id,
+        entry.data(),
+      );
+
+      return {
+        id: request.id,
+        kind: "backdated_return" as const,
+        summary: `Backdated return to ${
+          request.requestedReturnAt
+            ? new Date(
+                request.requestedReturnAt,
+              ).toLocaleString("en-US", {
+                month: "short",
+                day: "numeric",
+                hour: "numeric",
+                minute: "2-digit",
+              })
+            : "an earlier time"
+        }`,
+        reason: request.reason,
+        status: request.status,
+        requestedByName: request.requestedByName,
+        requestedAt: request.enteredAt,
+        reviewedByName: request.reviewedByName,
+        reviewedAt: request.reviewedAt,
+        reviewNote: request.reviewNote,
+      };
+    }),
+
+    ...discounts
+      .map((entry) =>
+        rentalDiscountFrom(entry.id, entry.data()),
+      )
+      .filter((discount) => discount.dailyRate)
+      .map((discount) => ({
+        id: discount.id,
+        kind: "daily_rate_discount" as const,
+        summary: describeDailyRateDiscount(discount),
+        reason: discount.reason,
+        status: discount.status,
+        requestedByName: discount.requestedByName,
+        requestedAt: discount.requestedAt,
+        reviewedByName: discount.reviewedByName,
+        reviewedAt: discount.reviewedAt,
+        reviewNote: discount.reviewNote,
+      })),
+  ];
+
+  return entries.sort((a, b) =>
+    String(a.requestedAt).localeCompare(
+      String(b.requestedAt),
+    ),
+  );
+}
 
 /*
  * Only what is needed to show a picture: the stored media
@@ -10408,6 +12674,13 @@ async function getRentalDocuments(
 
     returnMedia: mediaItems(
       rental.get("returnMedia"),
+    ),
+
+    requests: await rentalRequests(
+      rental.id,
+      trimmedOrNull(
+        rental.get("reservationId"),
+      ),
     ),
   };
 }
@@ -10613,6 +12886,22 @@ export async function callFirestoreOperation<
         )) as TResult
       );
 
+    case "listCancellationRequests":
+      return (
+        (await listCancellationRequests()) as TResult
+      );
+
+    case "reviewCancellationRequest":
+      return (
+        (await reviewCancellationRequest(
+          data as {
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
+          },
+        )) as TResult
+      );
+
     case "checkoutReservation":
       return (
         (await checkoutReservation(
@@ -10643,28 +12932,22 @@ export async function callFirestoreOperation<
     case "returnRental":
       return (
         (await returnRental(
+          data as ReturnInput,
+        )) as TResult
+      );
+
+    case "listReturnRequests":
+      return (
+        (await listReturnRequests()) as TResult
+      );
+
+    case "reviewReturnRequest":
+      return (
+        (await reviewReturnRequest(
           data as {
-            rentalId: string;
-            actualReturnAt: string;
-            returnFuelLevel: string;
-            returnOdometer: {
-              value: number;
-              unit: "km" | "mi";
-            };
-            adjustments: Array<{
-              type: string;
-              amountCents: number;
-              note: string;
-            }>;
-            waivers?: Record<
-              string,
-              unknown
-            > | null;
-            extraHours?: number | null;
-            notes: string | null;
-            returnMedia: Array<
-              Record<string, unknown>
-            >;
+            requestId: string;
+            decision: "approve" | "reject";
+            note: string | null;
           },
         )) as TResult
       );
@@ -10683,18 +12966,6 @@ export async function callFirestoreOperation<
               type: string;
               amountCents: number;
             }>;
-            idempotencyKey: string;
-          },
-        )) as TResult
-      );
-
-    case "requestRentalDiscount":
-      return (
-        (await requestRentalDiscount(
-          data as {
-            rentalId: string;
-            amountCents: number;
-            reason: string;
             idempotencyKey: string;
           },
         )) as TResult

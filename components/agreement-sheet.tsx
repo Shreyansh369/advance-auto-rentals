@@ -574,6 +574,47 @@ export function AgreementSheet({
               </tbody>
             </table>
 
+            {/*
+              * A discount on the daily rate, agreed at the
+              * start of the hire: the rate it came off, how
+              * much, the rate charged and who agreed it.
+              */}
+            {agreement.dailyRateDiscount && (
+              <p className="sheet-instructions">
+                <span className="sheet-field-label">
+                  Daily-rate discount
+                  {agreement.dailyRateDiscount
+                    .status === "pending"
+                    ? " (waiting for approval — full rate charged)"
+                    : ""}
+                </span>
+                {"Original daily rate "}
+                {formatMoney(
+                  agreement.dailyRateDiscount
+                    .originalDailyCents,
+                )}
+                {" · discount "}
+                {agreement.dailyRateDiscount.type ===
+                "percent"
+                  ? `${agreement.dailyRateDiscount.value}%`
+                  : formatMoney(
+                      agreement.dailyRateDiscount
+                        .value,
+                    )}
+                {" · discounted daily rate "}
+                {formatMoney(
+                  agreement.dailyRateDiscount
+                    .discountedDailyCents,
+                )}
+                {" · requested by "}
+                {agreement.dailyRateDiscount
+                  .requestedByName || "—"}
+                {" · approved by "}
+                {agreement.dailyRateDiscount
+                  .reviewedByName ?? "—"}
+              </p>
+            )}
+
             <p className="sheet-notice">
               {AGREEMENT_NOTICES.property}
             </p>

@@ -12,10 +12,13 @@ import {
   getDocs,
   limit,
   query,
+  serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
   deleteDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
 import { afterAll, beforeAll, describe, it } from "vitest";
 
@@ -88,6 +91,61 @@ beforeAll(async () => {
     await setDoc(doc(db, "idempotencyKeys", "payment_001"), { response: { outstandingCents: 0 } });
     await setDoc(doc(db, "vehicleRegistry", "reg_RT-001"), { vehicleId: "vehicle_001", value: "RT-001" });
     await setDoc(doc(db, "rentals", "rental_001", "extensions", "ext_001"), { extensionCents: 1000 });
+    await setDoc(doc(db, "rentals", "rental_open"), { status: "active", pickupOdometerKm: 1000 });
+
+    /* Backdated returns: rentals out since three days ago, and
+       rentals already waiting on a backdated return. */
+    const outSince = Timestamp.fromMillis(Date.now() - 3 * 86_400_000);
+    for (const rentalId of ["rental_out", "rental_out_2", "rental_out_3"]) {
+      await setDoc(doc(db, "rentals", rentalId), { status: "active", pickupAt: outSince, pickupOdometerKm: 1000 });
+    }
+    for (const [requestId, rentalId, requestedBy] of [
+      ["return_pending", "rental_req", OPS],
+      ["return_pending_2", "rental_req_2", OPS],
+      ["return_admin_own", "rental_req_admin", ADMIN],
+    ]) {
+      await setDoc(doc(db, "rentals", rentalId), {
+        status: "active",
+        pickupAt: outSince,
+        pickupOdometerKm: 1000,
+        returnRequestId: requestId,
+        returnRequestStatus: "pending",
+      });
+      await setDoc(doc(db, "returnRequests", requestId), {
+        rentalId,
+        reason: "Car came back last night, desk was closed",
+        requestedReturnAt: Timestamp.fromMillis(Date.now() - 12 * 3_600_000),
+        returnInput: { returnFuelLevel: "full", returnOdometer: null },
+        status: "pending",
+        requestedBy,
+        reviewedBy: null,
+        reviewNote: null,
+      });
+    }
+
+    /* Cancellation requests: one booking free to ask about, and
+       bookings already waiting on a request. */
+    await setDoc(doc(db, "reservations", "res_free"), { status: "confirmed", vehicleId: "vehicle_001" });
+    for (const [requestId, reservationId, requestedBy] of [
+      ["cancel_pending", "res_waiting", OPS],
+      ["cancel_pending_2", "res_waiting_2", OPS],
+      ["cancel_pending_3", "res_waiting_3", OPS],
+      ["cancel_admin_own", "res_waiting_admin", ADMIN],
+    ]) {
+      await setDoc(doc(db, "reservations", reservationId), {
+        status: "confirmed",
+        cancellationRequestId: requestId,
+        cancellationRequestStatus: "pending",
+      });
+      await setDoc(doc(db, "cancellationRequests", requestId), {
+        reservationId,
+        reason: "Customer changed plans",
+        status: "pending",
+        requestedBy,
+        reviewedBy: null,
+        reviewNote: null,
+      });
+    }
 
     await setDoc(doc(db, "reservationContracts", "contract_review"), {
       status: "in_review",
@@ -125,6 +183,40 @@ beforeAll(async () => {
       version: 1,
     });
 
+    /* Daily-rate discounts: a vehicle with rates, bookings at
+       those rates, and discounts already waiting. */
+    const rates = { currency: "USD", dailyCents: 7500, weeklyCents: 45000, monthlyCents: 150000 };
+    await setDoc(doc(db, "vehicles", "vehicle_rated"), { registrationNumber: "RT-777", rates });
+    await setDoc(doc(db, "reservations", "res_rate"), { status: "confirmed", vehicleId: "vehicle_rated", rateSnapshot: rates });
+    await setDoc(doc(db, "rentals", "rental_rate"), { status: "active", reservationId: "res_rate_out", rateSnapshot: rates });
+    for (const [discountId, reservationId] of [
+      ["rate_pending", "res_rate_waiting"],
+      ["rate_pending_2", "res_rate_waiting_2"],
+    ]) {
+      await setDoc(doc(db, "reservations", reservationId), {
+        status: "confirmed",
+        vehicleId: "vehicle_rated",
+        rateSnapshot: rates,
+        dailyRateDiscountId: discountId,
+        dailyRateDiscountStatus: "pending",
+      });
+      await setDoc(doc(db, "rentalDiscounts", discountId), {
+        kind: "daily_rate",
+        reservationId,
+        rentalId: null,
+        discountType: "amount",
+        discountValue: 1000,
+        originalDailyCents: 7500,
+        discountedDailyCents: 6500,
+        amountCents: 1000,
+        reason: "Returning customer",
+        status: "pending",
+        requestedBy: OPS,
+        reviewedBy: null,
+        reviewNote: null,
+      });
+    }
+
     await setDoc(doc(db, "rentalDiscounts", "discount_pending"), {
       rentalId: "rental_001",
       amountCents: 2500,
@@ -149,6 +241,33 @@ function asUser(uid: string) {
   return testEnv.authenticatedContext(uid).firestore();
 }
 
+/* A booking as the application writes one: priced at the
+   rated vehicle's own rates, three days from pickup. */
+const RATES = { currency: "USD", dailyCents: 7500, weeklyCents: 45000, monthlyCents: 150000 };
+const PICKUP = Timestamp.fromMillis(Date.UTC(2026, 9, 1, 8));
+const THREE_DAYS_LATER = Timestamp.fromMillis(Date.UTC(2026, 9, 4, 8));
+function bookingFields(extra: Record<string, unknown> = {}) {
+  return {
+    status: "confirmed",
+    vehicleId: "vehicle_rated",
+    customerId: "customer_001",
+    rateSnapshot: RATES,
+    pickupAt: PICKUP,
+    expectedReturnAt: THREE_DAYS_LATER,
+    quote: { chargedDays: 3, dailyUnits: 3, weeklyUnits: 0, monthlyUnits: 0, baseRentalCents: 22500, currency: "USD" },
+    ...extra,
+  };
+}
+
+/* Books, then checks out, as staff: the rental carries the booking. */
+async function bookAndCheckOut(db: ReturnType<typeof asUser>, reservationId: string, rentalId: string, extra: Record<string, unknown> = {}) {
+  await assertSucceeds(setDoc(doc(db, "reservations", reservationId), bookingFields()));
+  const checkout = writeBatch(db);
+  checkout.set(doc(db, "rentals", rentalId), { ...bookingFields(), status: "active", reservationId, ...extra });
+  checkout.update(doc(db, "reservations", reservationId), { status: "checked_out", rentalId });
+  await assertSucceeds(checkout.commit());
+}
+
 describe("Firestore access policy", () => {
   it("denies unauthenticated access to every collection", async () => {
     const db = testEnv.unauthenticatedContext().firestore();
@@ -169,14 +288,26 @@ describe("Firestore access policy", () => {
     const db = asUser(OPS);
 
     await assertSucceeds(getDoc(doc(db, "vehicles", "vehicle_001")));
-    await assertSucceeds(setDoc(doc(db, "vehicles", "vehicle_002"), { registrationNumber: "RT-002" }));
+    await assertSucceeds(setDoc(doc(db, "vehicles", "vehicle_002"), { registrationNumber: "RT-002", status: "out_of_service", rates: { dailyCents: null, weeklyCents: null, monthlyCents: null } }));
     await assertSucceeds(setDoc(doc(db, "customers", "customer_002"), { fullName: "New Customer" }));
-    await assertSucceeds(setDoc(doc(db, "reservations", "reservation_001"), { status: "confirmed" }));
-    await assertSucceeds(setDoc(doc(db, "rentals", "rental_001"), { status: "active" }));
+    await bookAndCheckOut(db, "reservation_001", "rental_001");
+  });
+
+  it("only closes a rental with a valid return fuel level and a sensible odometer", async () => {
+    const db = asUser(OPS);
+    const ref = doc(db, "rentals", "rental_open");
+    const closing = { status: "returned", actualReturnAt: serverTimestamp(), returnedBy: OPS };
+
+    await assertFails(updateDoc(ref, { ...closing, returnOdometerKm: null }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "", returnOdometerKm: null }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "brimming", returnOdometerKm: null }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "full", returnOdometerKm: 900 }));
+    await assertFails(updateDoc(ref, { ...closing, returnFuelLevel: "full", returnOdometerKm: "1100" }));
+    await assertSucceeds(updateDoc(ref, { ...closing, returnFuelLevel: "half", returnOdometerKm: null, returnOdometerValue: null, returnOdometerUnit: null }));
   });
 
   it("only cancels a booking that says why", async () => {
-    const db = asUser(OPS);
+    const db = asUser(ADMIN);
 
     await assertSucceeds(setDoc(doc(db, "reservations", "reservation_cancel"), { status: "confirmed" }));
     await assertFails(
@@ -197,6 +328,405 @@ describe("Firestore access policy", () => {
         cancellationReason: "Customer changed their travel dates",
       }),
     );
+  });
+
+  it("stops operations staff cancelling a booking directly", async () => {
+    await assertSucceeds(setDoc(doc(asUser(OPS), "reservations", "reservation_ops_cancel"), bookingFields()));
+    await assertFails(
+      updateDoc(doc(asUser(OPS), "reservations", "reservation_ops_cancel"), {
+        status: "cancelled",
+        cancellationReason: "Customer changed their travel dates",
+      }),
+    );
+  });
+
+  it("stops staff releasing a booking under another status name", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(setDoc(doc(db, "reservations", "res_side_door"), bookingFields()));
+    for (const status of ["completed", "checked_out", "no_show", "expired"]) {
+      await assertFails(updateDoc(doc(db, "reservations", "res_side_door"), { status }));
+    }
+
+    /* A real checkout and a real return still move it on. */
+    const checkout = writeBatch(db);
+    checkout.set(doc(db, "rentals", "rental_side_door"), { ...bookingFields(), status: "active", reservationId: "res_side_door", pickupOdometerKm: 10 });
+    checkout.update(doc(db, "reservations", "res_side_door"), { status: "checked_out", rentalId: "rental_side_door" });
+    await assertSucceeds(checkout.commit());
+
+    await assertFails(updateDoc(doc(db, "reservations", "res_side_door"), { status: "completed" }));
+
+    const closing = writeBatch(db);
+    closing.update(doc(db, "rentals", "rental_side_door"), {
+      status: "returned",
+      returnFuelLevel: "full",
+      returnOdometerKm: null,
+      actualReturnAt: serverTimestamp(),
+      returnedBy: OPS,
+    });
+    closing.update(doc(db, "reservations", "res_side_door"), { status: "completed" });
+    await assertSucceeds(closing.commit());
+  });
+
+  it("lets staff ask for a cancellation only as their own pending request, locked to the booking", async () => {
+    const db = asUser(OPS);
+    const request = (id: string, data: Record<string, unknown>) => {
+      const batch = writeBatch(db);
+      batch.set(doc(db, "cancellationRequests", id), data);
+      batch.update(doc(db, "reservations", "res_free"), {
+        cancellationRequestId: id,
+        cancellationRequestStatus: "pending",
+      });
+      return batch.commit();
+    };
+    const asked = { reservationId: "res_free", reason: "Flight cancelled", status: "pending", requestedBy: OPS };
+
+    await assertFails(request("cr_other_name", { ...asked, requestedBy: ADMIN }));
+    await assertFails(request("cr_self_approved", { ...asked, status: "approved" }));
+    await assertFails(request("cr_no_reason", { ...asked, reason: "  " }));
+    await assertFails(setDoc(doc(db, "cancellationRequests", "cr_unlocked"), asked));
+    await assertSucceeds(request("cr_ok", asked));
+
+    /* Nothing else can be asked while that one waits. */
+    await assertFails(request("cr_second", asked));
+
+    /* The booking is still confirmed, and staff cannot fake the decision on it. */
+    await assertFails(updateDoc(doc(db, "reservations", "res_free"), { cancellationRequestStatus: "approved" }));
+    await assertSucceeds(getDoc(doc(db, "cancellationRequests", "cr_ok")));
+  });
+
+  it("keeps the cancellation decision with an administrator, once, and as asked", async () => {
+    const admin = asUser(ADMIN);
+    const ops = asUser(OPS);
+    const decided = { status: "approved", reviewedBy: ADMIN, reviewedAt: serverTimestamp(), reviewNote: null };
+
+    /* Staff cannot approve, even with the booking cancelled alongside. */
+    const opsBatch = writeBatch(ops);
+    opsBatch.update(doc(ops, "cancellationRequests", "cancel_pending"), { ...decided, reviewedBy: OPS });
+    await assertFails(opsBatch.commit());
+
+    /* An approval that does not cancel the booking is refused. */
+    await assertFails(updateDoc(doc(admin, "cancellationRequests", "cancel_pending"), decided));
+
+    /* The reason asked for cannot be rewritten while deciding. */
+    const rewrite = writeBatch(admin);
+    rewrite.update(doc(admin, "reservations", "res_waiting"), { status: "cancelled", cancellationReason: "x" });
+    rewrite.update(doc(admin, "cancellationRequests", "cancel_pending"), { ...decided, reason: "Something else" });
+    await assertFails(rewrite.commit());
+
+    /* Recorded in somebody else's name. */
+    const otherName = writeBatch(admin);
+    otherName.update(doc(admin, "reservations", "res_waiting"), { status: "cancelled", cancellationReason: "x" });
+    otherName.update(doc(admin, "cancellationRequests", "cancel_pending"), { ...decided, reviewedBy: OPS });
+    await assertFails(otherName.commit());
+
+    const approve = writeBatch(admin);
+    approve.update(doc(admin, "reservations", "res_waiting"), {
+      status: "cancelled",
+      cancellationReason: "Customer changed plans",
+      cancellationRequestStatus: "approved",
+    });
+    approve.update(doc(admin, "cancellationRequests", "cancel_pending"), decided);
+    await assertSucceeds(approve.commit());
+
+    /* Only once. */
+    await assertFails(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_pending"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "Changed my mind",
+      }),
+    );
+
+    /* A rejection needs a note. */
+    await assertFails(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_pending_2"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: " ",
+      }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_pending_2"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "The customer confirmed the booking by phone",
+      }),
+    );
+
+    /* Never one's own request. */
+    await assertFails(
+      updateDoc(doc(admin, "cancellationRequests", "cancel_admin_own"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "Mine",
+      }),
+    );
+
+    /* Never deleted. */
+    await assertFails(deleteDoc(doc(admin, "cancellationRequests", "cancel_pending")));
+    await assertFails(deleteDoc(doc(ops, "cancellationRequests", "cancel_pending_3")));
+  });
+
+  it("withdraws a waiting cancellation only by checking the booking out", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(
+      updateDoc(doc(db, "cancellationRequests", "cancel_pending_3"), {
+        status: "withdrawn",
+        withdrawnBy: OPS,
+      }),
+    );
+
+    /* Marking the booking checked out without a rental is not a checkout. */
+    const fake = writeBatch(db);
+    fake.update(doc(db, "reservations", "res_waiting_3"), {
+      status: "checked_out",
+      rentalId: "rental_missing",
+      cancellationRequestStatus: "withdrawn",
+    });
+    fake.update(doc(db, "cancellationRequests", "cancel_pending_3"), { status: "withdrawn", withdrawnBy: OPS });
+    await assertFails(fake.commit());
+
+    const checkout = writeBatch(db);
+    checkout.set(doc(db, "rentals", "rental_x"), { status: "active", reservationId: "res_waiting_3" });
+    checkout.update(doc(db, "reservations", "res_waiting_3"), {
+      status: "checked_out",
+      rentalId: "rental_x",
+      cancellationRequestStatus: "withdrawn",
+    });
+    checkout.update(doc(db, "cancellationRequests", "cancel_pending_3"), {
+      status: "withdrawn",
+      withdrawnBy: OPS,
+      withdrawnAt: serverTimestamp(),
+    });
+    await assertSucceeds(checkout.commit());
+  });
+
+  it("lets only an administrator record a backdated return directly", async () => {
+    const hoursAgo = (hours: number) => Timestamp.fromMillis(Date.now() - hours * 3_600_000);
+    const closing = { status: "returned", returnFuelLevel: "full", returnOdometerKm: null, returnedBy: OPS };
+    const ops = asUser(OPS);
+    const admin = asUser(ADMIN);
+
+    await assertFails(updateDoc(doc(ops, "rentals", "rental_out"), { ...closing, actualReturnAt: hoursAgo(2) }));
+    await assertFails(updateDoc(doc(ops, "rentals", "rental_out"), { ...closing, actualReturnAt: hoursAgo(-1) }));
+    await assertSucceeds(updateDoc(doc(ops, "rentals", "rental_out"), { ...closing, actualReturnAt: hoursAgo(0.1) }));
+
+    /* Not moved back afterwards, either. */
+    await assertFails(updateDoc(doc(ops, "rentals", "rental_out"), { actualReturnAt: hoursAgo(5) }));
+
+    /* Never before the vehicle went out, never in the future, even for an administrator. */
+    await assertFails(updateDoc(doc(admin, "rentals", "rental_out_2"), { ...closing, actualReturnAt: hoursAgo(24 * 4) }));
+    await assertFails(updateDoc(doc(admin, "rentals", "rental_out_2"), { ...closing, actualReturnAt: hoursAgo(-1) }));
+    await assertSucceeds(updateDoc(doc(admin, "rentals", "rental_out_2"), { ...closing, actualReturnAt: hoursAgo(5) }));
+  });
+
+  it("lets staff ask for a backdated return only as their own pending request, locked to the rental", async () => {
+    const db = asUser(OPS);
+    const asked = {
+      rentalId: "rental_out_3",
+      reason: "Returned overnight",
+      requestedReturnAt: Timestamp.fromMillis(Date.now() - 10 * 3_600_000),
+      returnInput: { returnFuelLevel: "half", returnOdometer: null },
+      status: "pending",
+      requestedBy: OPS,
+    };
+    const request = (id: string, data: Record<string, unknown>) => {
+      const batch = writeBatch(db);
+      batch.set(doc(db, "returnRequests", id), data);
+      batch.update(doc(db, "rentals", "rental_out_3"), { returnRequestId: id, returnRequestStatus: "pending" });
+      return batch.commit();
+    };
+
+    await assertFails(request("rr_other_name", { ...asked, requestedBy: ADMIN }));
+    await assertFails(request("rr_approved", { ...asked, status: "approved" }));
+    await assertFails(request("rr_no_reason", { ...asked, reason: "" }));
+    await assertFails(setDoc(doc(db, "returnRequests", "rr_unlocked"), asked));
+    await assertSucceeds(request("rr_ok", asked));
+    await assertFails(request("rr_second", asked));
+
+    /* While it waits, no second return can be written. */
+    await assertFails(
+      updateDoc(doc(db, "rentals", "rental_out_3"), {
+        status: "returned",
+        returnFuelLevel: "full",
+        returnOdometerKm: null,
+        actualReturnAt: serverTimestamp(),
+      }),
+    );
+  });
+
+  it("keeps the backdated-return decision with an administrator, once, and as asked", async () => {
+    const admin = asUser(ADMIN);
+    const ops = asUser(OPS);
+    let requested = Timestamp.now();
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      requested = (await getDoc(doc(context.firestore(), "returnRequests", "return_pending"))).get("requestedReturnAt");
+    });
+    const decided = { status: "approved", reviewedBy: ADMIN, reviewNote: null };
+    const close = (at: Timestamp) => ({ status: "returned", returnFuelLevel: "full", returnOdometerKm: null, actualReturnAt: at, returnRequestStatus: "approved" });
+
+    const opsBatch = writeBatch(ops);
+    opsBatch.update(doc(ops, "returnRequests", "return_pending"), { ...decided, reviewedBy: OPS });
+    await assertFails(opsBatch.commit());
+
+    /* Approving without closing the rental, or closing it at another time, is refused. */
+    await assertFails(updateDoc(doc(admin, "returnRequests", "return_pending"), decided));
+    const wrongTime = writeBatch(admin);
+    wrongTime.update(doc(admin, "rentals", "rental_req"), close(Timestamp.fromMillis(requested.toMillis() + 3_600_000)));
+    wrongTime.update(doc(admin, "returnRequests", "return_pending"), decided);
+    await assertFails(wrongTime.commit());
+
+    /* Nothing asked for changes while deciding. */
+    const rewrite = writeBatch(admin);
+    rewrite.update(doc(admin, "rentals", "rental_req"), close(requested));
+    rewrite.update(doc(admin, "returnRequests", "return_pending"), { ...decided, reason: "edited" });
+    await assertFails(rewrite.commit());
+
+    const approve = writeBatch(admin);
+    approve.update(doc(admin, "rentals", "rental_req"), close(requested));
+    approve.update(doc(admin, "returnRequests", "return_pending"), decided);
+    await assertSucceeds(approve.commit());
+
+    await assertFails(
+      updateDoc(doc(admin, "returnRequests", "return_pending"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "No" }),
+    );
+
+    await assertFails(
+      updateDoc(doc(admin, "returnRequests", "return_pending_2"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "" }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(admin, "returnRequests", "return_pending_2"), {
+        status: "rejected",
+        reviewedBy: ADMIN,
+        reviewNote: "The car was seen on the road that evening",
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(admin, "returnRequests", "return_admin_own"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "Mine" }),
+    );
+
+    await assertFails(deleteDoc(doc(admin, "returnRequests", "return_pending")));
+    await assertFails(deleteDoc(doc(ops, "returnRequests", "return_pending_2")));
+  });
+
+  it("stops staff pricing a booking below its rates or moving its dates by hand (finding 2)", async () => {
+    const db = asUser(OPS);
+    const days = (count: number) => Timestamp.fromMillis(PICKUP.toMillis() + count * 86_400_000);
+
+    /* A booking priced at $1, or one whose bundle does not cover the hire. */
+    await assertFails(setDoc(doc(db, "reservations", "res_one_dollar"), bookingFields({ quote: { chargedDays: 3, dailyUnits: 3, weeklyUnits: 0, monthlyUnits: 0, baseRentalCents: 100 } })));
+    await assertFails(setDoc(doc(db, "reservations", "res_short"), bookingFields({ quote: { chargedDays: 3, dailyUnits: 1, weeklyUnits: 0, monthlyUnits: 0, baseRentalCents: 7500 } })));
+    await assertFails(setDoc(doc(db, "reservations", "res_wrong_days"), bookingFields({ expectedReturnAt: days(10) })));
+    /* A dearer valid bundle is not refused; it cannot undercharge. */
+    await assertSucceeds(setDoc(doc(db, "reservations", "res_week"), bookingFields({ quote: { chargedDays: 3, dailyUnits: 0, weeklyUnits: 1, monthlyUnits: 0, baseRentalCents: 45000 } })));
+
+    await bookAndCheckOut(db, "res_extend", "rental_extend");
+
+    /* Dates and price cannot be edited on their own. */
+    await assertFails(updateDoc(doc(db, "reservations", "res_extend"), { expectedReturnAt: days(10) }));
+    await assertFails(updateDoc(doc(db, "reservations", "res_week"), { quote: bookingFields().quote, pickupAt: days(1) }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_extend"), { expectedReturnAt: days(2), quote: { chargedDays: 2, dailyUnits: 2, weeklyUnits: 0, monthlyUnits: 0, baseRentalCents: 15000 } }));
+
+    /* An extension moves both, later, at a quote that covers it. */
+    const fourDays = { chargedDays: 4, dailyUnits: 4, weeklyUnits: 0, monthlyUnits: 0, baseRentalCents: 30000, currency: "USD" };
+    const cheapExtension = writeBatch(db);
+    cheapExtension.update(doc(db, "rentals", "rental_extend"), { expectedReturnAt: days(4), quote: { ...fourDays, baseRentalCents: 22500 } });
+    cheapExtension.update(doc(db, "reservations", "res_extend"), { expectedReturnAt: days(4), quote: { ...fourDays, baseRentalCents: 22500 } });
+    await assertFails(cheapExtension.commit());
+
+    const extension = writeBatch(db);
+    extension.update(doc(db, "rentals", "rental_extend"), { expectedReturnAt: days(4), quote: fourDays });
+    extension.update(doc(db, "reservations", "res_extend"), { expectedReturnAt: days(4), quote: fourDays });
+    await assertSucceeds(extension.commit());
+  });
+
+  it("only takes payments and ledger lines that match what was written (finding 3)", async () => {
+    const db = asUser(OPS);
+    await bookAndCheckOut(db, "res_paying", "rental_paying");
+    await assertSucceeds(setDoc(doc(db, "rentalFinancials", "rental_paying"), { totalCents: 22500, paidCents: 0, baseRentalCents: 22500 }));
+
+    const payment = { rentalId: "rental_paying", amountCents: 5000, method: "ath", recordedBy: OPS };
+
+    /* A payment the rental's paid total does not reflect, or in another name. */
+    await assertFails(setDoc(doc(db, "payments", "pay_unrecorded"), payment));
+    const otherName = writeBatch(db);
+    otherName.set(doc(db, "payments", "pay_other"), { ...payment, recordedBy: ADMIN });
+    otherName.update(doc(db, "rentalFinancials", "rental_paying"), { paidCents: 5000 });
+    await assertFails(otherName.commit());
+    const badMethod = writeBatch(db);
+    badMethod.set(doc(db, "payments", "pay_bitcoin"), { ...payment, method: "bitcoin" });
+    badMethod.update(doc(db, "rentalFinancials", "rental_paying"), { paidCents: 5000 });
+    await assertFails(badMethod.commit());
+
+    /* Forged lines: a payment that was never taken, a discount, a line in someone else's name. */
+    await assertFails(setDoc(doc(db, "financialLedger", "forged_payment"), { rentalId: "rental_paying", entryType: "payment", amountCents: 9000, paymentId: "nope", recordedBy: OPS }));
+    await assertFails(setDoc(doc(db, "financialLedger", "forged_discount"), { rentalId: "rental_paying", entryType: "rental_discount", amountCents: -9000, recordedBy: OPS }));
+    await assertFails(setDoc(doc(db, "financialLedger", "forged_name"), { rentalId: "rental_paying", entryType: "deposit_held", amountCents: 0, recordedBy: ADMIN }));
+    await assertFails(setDoc(doc(db, "financialLedger", "late_checkout"), { rentalId: "rental_paying", entryType: "rental_checkout", amountCents: 22500, recordedBy: OPS }));
+
+    /* A real payment, its ledger line agreeing with it. */
+    const wrongLine = writeBatch(db);
+    wrongLine.set(doc(db, "payments", "pay_mismatch"), payment);
+    wrongLine.update(doc(db, "rentalFinancials", "rental_paying"), { paidCents: 5000 });
+    wrongLine.set(doc(db, "financialLedger", "line_mismatch"), { rentalId: "rental_paying", entryType: "payment", amountCents: 50000, paymentId: "pay_mismatch", recordedBy: OPS });
+    await assertFails(wrongLine.commit());
+
+    const taken = writeBatch(db);
+    taken.set(doc(db, "payments", "pay_ok"), payment);
+    taken.update(doc(db, "rentalFinancials", "rental_paying"), { paidCents: 5000 });
+    taken.set(doc(db, "financialLedger", "line_ok"), { rentalId: "rental_paying", entryType: "payment", amountCents: 5000, paymentId: "pay_ok", recordedBy: OPS });
+    await assertSucceeds(taken.commit());
+  });
+
+  it("keeps a vehicle's rates and its booked or rented status out of staff hands (finding 4)", async () => {
+    const db = asUser(OPS);
+
+    await assertFails(updateDoc(doc(db, "vehicles", "vehicle_rated"), { rates: { ...RATES, dailyCents: 100 } }));
+    await assertFails(setDoc(doc(db, "vehicles", "vehicle_cheap"), { registrationNumber: "RT-CHEAP", status: "available", rates: { ...RATES, dailyCents: 100 } }));
+    await assertSucceeds(updateDoc(doc(db, "vehicles", "vehicle_rated"), { notes: "Wiper replaced" }));
+
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      const admin = context.firestore();
+      await setDoc(doc(admin, "vehicles", "vehicle_out"), { registrationNumber: "RT-OUT", status: "rented", rates: RATES });
+      await setDoc(doc(admin, "vehicles", "vehicle_held"), { registrationNumber: "RT-HELD", status: "reserved", rates: RATES });
+      await setDoc(doc(admin, "vehicles", "vehicle_dirty"), { registrationNumber: "RT-DIRTY", status: "cleaning", rates: RATES });
+      await setDoc(doc(admin, "vehicles", "vehicle_free"), { registrationNumber: "RT-FREE", status: "available", rates: RATES });
+    });
+
+    /* Released from under a hire or a booking: an administrator's call. */
+    await assertFails(updateDoc(doc(db, "vehicles", "vehicle_out"), { status: "available" }));
+    await assertFails(updateDoc(doc(db, "vehicles", "vehicle_held"), { status: "available" }));
+    await assertFails(updateDoc(doc(db, "vehicles", "vehicle_held"), { status: "rented" }));
+    await assertSucceeds(updateDoc(doc(asUser(ADMIN), "vehicles", "vehicle_out"), { status: "maintenance" }));
+
+    /* The day-to-day moves stay with staff. */
+    await assertSucceeds(updateDoc(doc(db, "vehicles", "vehicle_dirty"), { status: "available" }));
+
+    /* Reserved only by a real booking of that vehicle. */
+    await assertFails(updateDoc(doc(db, "vehicles", "vehicle_free"), { status: "reserved", statusReservationId: "res_full_rate" }));
+    const booking = writeBatch(db);
+    booking.set(doc(db, "reservations", "res_free_car"), bookingFields({ vehicleId: "vehicle_free" }));
+    booking.update(doc(db, "vehicles", "vehicle_free"), { status: "reserved", statusReservationId: "res_free_car" });
+    await assertSucceeds(booking.commit());
+  });
+
+  it("lets staff write a rental only as a return, an extension or a backdated-return request (finding 5)", async () => {
+    const db = asUser(OPS);
+    await bookAndCheckOut(db, "res_edit", "rental_edit", { agreement: { charges: { daily: 22500 }, paymentMethod: "cash" }, pickupOdometerKm: 100 });
+
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { "agreement.charges.daily": 100 }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { "agreement.paymentMethod": "ath" }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { checkedOutByNameSnapshot: "Someone else" }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { status: "overdue" }));
+
+    const closing = { status: "returned", returnFuelLevel: "full", returnOdometerKm: null, actualReturnAt: serverTimestamp(), returnedBy: OPS };
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { ...closing, returnedBy: ADMIN }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { ...closing, "agreement.charges.daily": 100 }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_edit"), { ...closing, quote: { baseRentalCents: 1 } }));
+    await assertSucceeds(updateDoc(doc(db, "rentals", "rental_edit"), { ...closing, "agreement.extraHours": 2, "agreement.waivers": { liabilityWaiver: true } }));
   });
 
   it("keeps profit reporting away from operations staff", async () => {
@@ -342,25 +872,41 @@ describe("Firestore access policy", () => {
    */
   it("lets staff enter a historical rental record", async () => {
     const db = asUser(OPS);
+    const batch = writeBatch(db);
 
-    await assertSucceeds(
-      setDoc(doc(db, "rentals", "rental_history_001"), {
-        status: "returned",
-        isHistorical: true,
-      }),
-    );
+    batch.set(doc(db, "rentals", "rental_history_001"), { status: "returned", isHistorical: true });
+    batch.set(doc(db, "rentalFinancials", "rental_history_001"), { totalCents: 20000, paidCents: 20000, isHistorical: true });
+    batch.set(doc(db, "payments", "payment_history_001"), {
+      rentalId: "rental_history_001",
+      amountCents: 20000,
+      method: "bank_transfer",
+      recordedBy: OPS,
+      isHistorical: true,
+    });
+    batch.set(doc(db, "financialLedger", "ledger_history_001"), {
+      rentalId: "rental_history_001",
+      entryType: "historical_rental",
+      amountCents: 20000,
+      recordedBy: OPS,
+    });
+    /* As the past-booking form writes it: no payment id. */
+    batch.set(doc(db, "financialLedger", "ledger_history_pay_001"), {
+      rentalId: "rental_history_001",
+      entryType: "payment",
+      amountCents: 20000,
+      isHistorical: true,
+      recordedBy: OPS,
+    });
+    await assertSucceeds(batch.commit());
 
-    await assertSucceeds(
-      setDoc(doc(db, "rentalFinancials", "rental_history_001"), {
-        totalCents: 20000,
-        isHistorical: true,
-      }),
-    );
-
-    await assertSucceeds(
-      setDoc(doc(db, "payments", "payment_history_001"), {
+    /* The same shape on a live rental is a forged payment. */
+    await assertFails(
+      setDoc(doc(db, "financialLedger", "ledger_history_forged"), {
+        rentalId: "rental_history_001",
+        entryType: "payment",
         amountCents: 20000,
         isHistorical: true,
+        recordedBy: OPS,
       }),
     );
 
@@ -374,7 +920,6 @@ describe("Firestore access policy", () => {
   it("keeps the ledger and audit trail append-only for operations staff", async () => {
     const db = asUser(OPS);
 
-    await assertSucceeds(setDoc(doc(db, "financialLedger", "entry_002"), { amountCents: 100 }));
     await assertFails(updateDoc(doc(db, "financialLedger", "entry_001"), { amountCents: 1 }));
     await assertFails(deleteDoc(doc(db, "financialLedger", "entry_001")));
     await assertFails(updateDoc(doc(db, "auditLogs", "audit_001"), { action: "tampered" }));
@@ -480,86 +1025,144 @@ describe("Firestore access policy", () => {
     );
   });
 
-  it("lets staff offer a discount only as a request waiting for approval", async () => {
+  it("lets staff ask for a daily-rate discount only as their own pending request, locked to the booking", async () => {
     const db = asUser(OPS);
+    const asked = {
+      kind: "daily_rate",
+      reservationId: "res_rate",
+      rentalId: null,
+      discountType: "amount",
+      discountValue: 1000,
+      originalDailyCents: 7500,
+      discountedDailyCents: 6500,
+      amountCents: 1000,
+      reason: "Long-standing customer",
+      status: "pending",
+      requestedBy: OPS,
+    };
+    const request = (id: string, data: Record<string, unknown>) => {
+      const batch = writeBatch(db);
+      batch.set(doc(db, "rentalDiscounts", id), data);
+      batch.update(doc(db, "reservations", "res_rate"), { dailyRateDiscountId: id, dailyRateDiscountStatus: "pending" });
+      return batch.commit();
+    };
+
+    /* A discount off the balance can no longer be offered. */
+    await assertFails(
+      setDoc(doc(db, "rentalDiscounts", "flat_discount"), { rentalId: "rental_001", amountCents: 1500, status: "pending", requestedBy: OPS }),
+    );
+    await assertFails(request("rd_self_approved", { ...asked, status: "approved", reviewedBy: OPS }));
+    await assertFails(request("rd_other_name", { ...asked, requestedBy: ADMIN }));
+    await assertFails(request("rd_no_reason", { ...asked, reason: " " }));
+    await assertFails(request("rd_amounts_disagree", { ...asked, amountCents: 900 }));
+    await assertFails(request("rd_value_disagrees", { ...asked, discountValue: 2000 }));
+    await assertFails(request("rd_whole_rate", { ...asked, discountValue: 7500, discountedDailyCents: 0, amountCents: 7500 }));
+    await assertFails(request("rd_wrong_original", { ...asked, originalDailyCents: 9000, amountCents: 2500, discountValue: 2500 }));
+    await assertFails(
+      request("rd_percent_wrong", { ...asked, discountType: "percent", discountValue: 20, discountedDailyCents: 5000, amountCents: 2500 }),
+    );
+    await assertFails(setDoc(doc(db, "rentalDiscounts", "rd_unlocked"), asked));
+    await assertSucceeds(
+      request("rd_percent", { ...asked, discountType: "percent", discountValue: 12.5, discountedDailyCents: 6563, amountCents: 937 }),
+    );
+
+    /* One at a time. */
+    await assertFails(request("rd_second", asked));
 
     await assertSucceeds(
-      setDoc(doc(db, "rentalDiscounts", "discount_ops_request"), {
-        rentalId: "rental_001",
-        amountCents: 1500,
-        status: "pending",
-        requestedBy: OPS,
-      }),
-    );
-
-    await assertFails(
-      setDoc(doc(db, "rentalDiscounts", "discount_ops_self_approved"), {
-        rentalId: "rental_001",
-        amountCents: 1500,
-        status: "approved",
-        requestedBy: OPS,
-      }),
-    );
-
-    await assertFails(
-      setDoc(doc(db, "rentalDiscounts", "discount_in_another_name"), {
-        rentalId: "rental_001",
-        amountCents: 1500,
-        status: "pending",
-        requestedBy: ADMIN,
-      }),
-    );
-
-    await assertSucceeds(
-      getDocs(
-        query(
-          collection(db, "rentalDiscounts"),
-          where("rentalId", "==", "rental_001"),
-          where("status", "==", "pending"),
-          limit(1),
-        ),
-      ),
+      getDocs(query(collection(db, "rentalDiscounts"), where("rentalId", "==", "rental_001"), where("status", "==", "pending"), limit(1))),
     );
   });
 
+  it("stops staff applying a discounted daily rate themselves", async () => {
+    const db = asUser(OPS);
+    const cheaper = { currency: "USD", dailyCents: 5000, weeklyCents: 45000, monthlyCents: 150000 };
+
+    await assertFails(updateDoc(doc(db, "reservations", "res_rate"), { rateSnapshot: cheaper }));
+    await assertFails(updateDoc(doc(db, "rentals", "rental_rate"), { rateSnapshot: cheaper }));
+    await assertFails(
+      setDoc(doc(db, "reservations", "res_cheap"), { status: "confirmed", vehicleId: "vehicle_rated", rateSnapshot: cheaper }),
+    );
+    await assertFails(
+      setDoc(doc(db, "reservations", "res_self_approved"), {
+        status: "confirmed",
+        vehicleId: "vehicle_rated",
+        rateSnapshot: { ...cheaper, dailyCents: 7500 },
+        dailyRateDiscountStatus: "approved",
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(db, "reservations", "res_rate_waiting_2"), { dailyRateDiscountStatus: "approved" }),
+    );
+    /* A rental checked out by staff carries its booking's rates. */
+    await assertFails(
+      setDoc(doc(db, "rentals", "rental_cheap"), { status: "active", reservationId: "res_rate", rateSnapshot: cheaper }),
+    );
+    await assertSucceeds(setDoc(doc(db, "reservations", "res_full_rate"), bookingFields()));
+  });
+
   it("keeps the discount decision with an administrator, once, as asked", async () => {
-    await assertFails(
-      updateDoc(doc(asUser(OPS), "rentalDiscounts", "discount_pending"), {
-        status: "approved",
-      }),
-    );
+    const admin = asUser(ADMIN);
+    const ops = asUser(OPS);
+    const discounted = { currency: "USD", dailyCents: 6500, weeklyCents: 45000, monthlyCents: 150000 };
+    const decided = { status: "approved", reviewedBy: ADMIN };
 
-    await assertFails(
-      updateDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_pending"), {
-        status: "approved",
-        amountCents: 9000,
-      }),
-    );
+    await assertFails(updateDoc(doc(ops, "rentalDiscounts", "rate_pending"), { ...decided, reviewedBy: OPS }));
 
+    /* Approval re-prices the booking in the same write. */
+    await assertFails(updateDoc(doc(admin, "rentalDiscounts", "rate_pending"), decided));
+
+    const changed = writeBatch(admin);
+    changed.update(doc(admin, "reservations", "res_rate_waiting"), { rateSnapshot: discounted, dailyRateDiscountStatus: "approved" });
+    changed.update(doc(admin, "rentalDiscounts", "rate_pending"), { ...decided, discountedDailyCents: 6000 });
+    await assertFails(changed.commit());
+
+    const approve = writeBatch(admin);
+    approve.update(doc(admin, "reservations", "res_rate_waiting"), { rateSnapshot: discounted, dailyRateDiscountStatus: "approved" });
+    approve.update(doc(admin, "rentalDiscounts", "rate_pending"), decided);
+    await assertSucceeds(approve.commit());
+
+    await assertFails(updateDoc(doc(admin, "rentalDiscounts", "rate_pending"), { status: "rejected", reviewedBy: ADMIN }));
     await assertSucceeds(
-      updateDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_pending"), {
-        status: "approved",
-      }),
+      updateDoc(doc(admin, "rentalDiscounts", "rate_pending_2"), { status: "rejected", reviewedBy: ADMIN, reviewNote: "Not this time" }),
     );
 
+    /* A discount off the balance still waiting from before is still decided here. */
     await assertFails(
-      updateDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_decided"), {
-        status: "approved",
-      }),
+      updateDoc(doc(admin, "rentalDiscounts", "discount_pending"), { status: "approved", reviewedBy: ADMIN, amountCents: 9000 }),
     );
-
     await assertSucceeds(
-      setDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_admin_own"), {
-        rentalId: "rental_001",
-        amountCents: 500,
-        status: "approved",
-        requestedBy: ADMIN,
-      }),
+      updateDoc(doc(admin, "rentalDiscounts", "discount_pending"), { status: "approved", reviewedBy: ADMIN }),
+    );
+    await assertFails(
+      updateDoc(doc(admin, "rentalDiscounts", "discount_decided"), { status: "approved", reviewedBy: ADMIN }),
     );
 
-    await assertFails(
-      deleteDoc(doc(asUser(ADMIN), "rentalDiscounts", "discount_decided")),
-    );
+    /* An administrator's own discount applies as it is written. */
+    const own = writeBatch(admin);
+    own.set(doc(admin, "rentalDiscounts", "rate_admin_own"), {
+      kind: "daily_rate",
+      reservationId: "res_rate",
+      rentalId: null,
+      discountType: "percent",
+      discountValue: 20,
+      originalDailyCents: 7500,
+      discountedDailyCents: 6000,
+      amountCents: 1500,
+      reason: "Fleet partner",
+      status: "approved",
+      requestedBy: ADMIN,
+      reviewedBy: ADMIN,
+    });
+    own.update(doc(admin, "reservations", "res_rate"), {
+      rateSnapshot: { ...discounted, dailyCents: 6000 },
+      dailyRateDiscountId: "rate_admin_own",
+      dailyRateDiscountStatus: "approved",
+    });
+    await assertSucceeds(own.commit());
+
+    await assertFails(deleteDoc(doc(admin, "rentalDiscounts", "discount_decided")));
+    await assertFails(deleteDoc(doc(ops, "rentalDiscounts", "rate_pending_2")));
   });
 
   it("treats an approved contract as final, even for an administrator", async () => {
@@ -689,6 +1292,8 @@ describe("Firestore access policy", () => {
     ["auditLogs", "audit_001"],
     ["idempotencyKeys", "payment_001"],
     ["rentalDiscounts", "discount_decided"],
+    ["cancellationRequests", "cancel_pending_3"],
+    ["returnRequests", "return_pending_2"],
   ];
 
   it("matches every collection the application reads with a rule", async () => {

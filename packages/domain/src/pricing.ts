@@ -89,3 +89,46 @@ export function rentOwedThrough(
   const quote = quoteRental({ pickupAt: input.pickupAt, expectedReturnAt: input.throughAt }, rates);
   return Math.max(0, quote.baseRentalCents - input.baseRentalCents);
 }
+
+/**
+ * A discount on the daily rate, agreed at the start of a hire.
+ * An "amount" is whole cents off the daily rate; a "percent" is
+ * a percentage of it. Weekly and monthly rates are untouched.
+ */
+export interface DailyRateDiscount {
+  type: "amount" | "percent";
+  value: number;
+}
+
+/**
+ * The daily rate after the discount, rounded to whole cents. A
+ * dollar discount has to be more than nothing and less than the
+ * rate; a percentage more than 0 and less than 100.
+ */
+export function discountedDailyCents(originalDailyCents: number, discount: DailyRateDiscount): number {
+  if (!Number.isSafeInteger(originalDailyCents) || originalDailyCents <= 0) {
+    throw new Error("This vehicle has no daily rate to discount");
+  }
+  const { type, value } = discount;
+  if (type === "amount") {
+    if (!Number.isSafeInteger(value) || value <= 0 || value >= originalDailyCents) {
+      throw new Error("A dollar discount must be more than $0 and less than the daily rate");
+    }
+    return originalDailyCents - value;
+  }
+  if (type === "percent") {
+    if (!Number.isFinite(value) || value <= 0 || value >= 100) {
+      throw new Error("A percentage discount must be more than 0% and less than 100%");
+    }
+    const discounted = Math.round((originalDailyCents * (100 - value)) / 100);
+    if (discounted < 1) throw new Error("The discount leaves nothing of the daily rate");
+    return discounted;
+  }
+  throw new Error("Choose a dollar or a percentage discount");
+}
+
+/** The same rates with a different daily rate; weekly and monthly unchanged. */
+export function withDailyRate<T extends VehicleRates>(rates: T, dailyCents: number): T {
+  assertSafeCurrency(dailyCents, "Daily rate");
+  return { ...rates, dailyCents };
+}
