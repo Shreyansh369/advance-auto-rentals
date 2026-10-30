@@ -41,6 +41,13 @@ import { MediaCapture } from "./media-capture";
 import { CustomerSignaturePad } from "./customer-signature-pad";
 import { DamageDiagram } from "./damage-diagram";
 import { RentalAgreement } from "./rental-agreement";
+import {
+  DailyRateDiscountField,
+  EMPTY_DAILY_RATE_DISCOUNT,
+  dailyRateDiscountPayload,
+  previewDailyRateDiscount,
+  type DailyRateDiscountDraft,
+} from "./daily-rate-discount";
 
 import { getFirebaseClient } from "@/lib/firebase/client";
 
@@ -74,9 +81,12 @@ import {
   type PayableRental,
   type RentalDiscount,
   type ReturnRequest,
+  describeDailyRateDiscount,
 } from "@/lib/services/firestore-client";
 
 import { rentOwedThrough } from "@/packages/domain/src/pricing";
+
+import type { VehicleRates } from "@/packages/domain/src/types";
 
 type Tab =
   | "booking"
@@ -123,6 +133,8 @@ type Vehicle = {
   status: string;
   /* The damage it carries from its last hire. */
   damageMarks: DamageMark[];
+  /* Its own rates, which a booking discount never changes. */
+  rates: VehicleRates | null;
 };
 
 type Reservation = {
@@ -136,6 +148,10 @@ type Reservation = {
   backdated: boolean;
   /* The cancellation it is waiting on, or was last refused. */
   cancellationRequestStatus: string | null;
+  /* The booking's own rates, and its daily-rate discount. */
+  rates: VehicleRates | null;
+  dailyRateDiscountId: string | null;
+  dailyRateDiscountStatus: string | null;
   /* Extended prices for the agreement's charges table:
      units booked multiplied by the rate quoted at booking. */
   dailyCents: number;
@@ -263,10 +279,6 @@ const returnAdjustmentOptions = [
   {
     type: "other",
     label: "Other",
-  },
-  {
-    type: "discount",
-    label: "Discount",
   },
 ] as const;
 
@@ -409,6 +421,34 @@ function extendedPrice(
   }
 
   return Math.round(units * rate);
+}
+
+/* Stored rates in cents, or null where a rate is not set. */
+function ratesFrom(
+  value: unknown,
+): VehicleRates | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const rates = value as Record<string, unknown>;
+
+  const cents = (field: string) => {
+    const amount = Number(rates[field]);
+
+    return rates[field] == null ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0
+      ? null
+      : amount;
+  };
+
+  return {
+    currency: "USD",
+    dailyCents: cents("dailyCents"),
+    weeklyCents: cents("weeklyCents"),
+    monthlyCents: cents("monthlyCents"),
+  };
 }
 
 function bookingMoment(
@@ -661,12 +701,6 @@ export function ReservationComposer() {
   const [chargeThrough, setChargeThrough] =
     useState("");
 
-  const [discountAmount, setDiscountAmount] =
-    useState("");
-
-  const [discountReason, setDiscountReason] =
-    useState("");
-
   const [pendingDiscounts, setPendingDiscounts] =
     useState<RentalDiscount[]>([]);
 
@@ -758,17 +792,33 @@ export function ReservationComposer() {
     useState<DamageMark[] | null>(null);
 
   /*
-   * A discount offered at the counter, and the money taken
-   * there. Whatever is not paid now is left as the rental's
-   * balance due.
+   * A discount on the daily rate offered at the counter, and
+   * the money taken there. Whatever is not paid now is left as
+   * the rental's balance due.
    */
-  const [checkoutDiscount, setCheckoutDiscount] =
+  const [checkoutRateDiscount, setCheckoutRateDiscount] =
+    useState<DailyRateDiscountDraft>(
+      EMPTY_DAILY_RATE_DISCOUNT,
+    );
+
+  /*
+   * The same discount asked for on the booking, and what it is
+   * priced against: held in state so the totals follow the
+   * vehicle and the dates as they are chosen.
+   */
+  const [bookingRateDiscount, setBookingRateDiscount] =
+    useState<DailyRateDiscountDraft>(
+      EMPTY_DAILY_RATE_DISCOUNT,
+    );
+
+  const [bookingVehicleId, setBookingVehicleId] =
     useState("");
 
-  const [
-    checkoutDiscountReason,
-    setCheckoutDiscountReason,
-  ] = useState("");
+  const [bookingPickupAt, setBookingPickupAt] =
+    useState("");
+
+  const [bookingReturnAt, setBookingReturnAt] =
+    useState("");
 
   const [checkoutPaidNow, setCheckoutPaidNow] =
     useState("");
@@ -1191,6 +1241,9 @@ export function ReservationComposer() {
                     "damageMarks",
                   ),
                 ),
+              rates: ratesFrom(
+                snapshot.get("rates"),
+              ),
             }),
           )
           .sort(
@@ -1237,6 +1290,17 @@ export function ReservationComposer() {
             cancellationRequestStatus:
               snapshot.get(
                 "cancellationRequestStatus",
+              ) ?? null,
+            rates: ratesFrom(
+              snapshot.get("rateSnapshot"),
+            ),
+            dailyRateDiscountId:
+              snapshot.get(
+                "dailyRateDiscountId",
+              ) ?? null,
+            dailyRateDiscountStatus:
+              snapshot.get(
+                "dailyRateDiscountStatus",
               ) ?? null,
             dailyCents:
               extendedPrice(
@@ -1873,8 +1937,39 @@ export function ReservationComposer() {
       : 0;
   }
 
+  /*
+   * What a discount on the daily rate takes off the rental
+   * days, priced the way the checkout will price it: the
+   * booking's own rates and dates, the cheapest mix re-run.
+   */
+  const checkoutPeriod =
+    checkoutReservationQuote?.pickupAt &&
+    checkoutReservationQuote.expectedReturnAt
+      ? {
+          pickupAt:
+            checkoutReservationQuote.pickupAt,
+          expectedReturnAt:
+            checkoutReservationQuote.expectedReturnAt,
+        }
+      : null;
+
+  const checkoutDiscountPreview =
+    previewDailyRateDiscount(
+      checkoutRateDiscount,
+      checkoutReservationQuote?.rates ?? null,
+      checkoutPeriod,
+    );
+
   const checkoutDiscountCents =
-    centsFromDollars(checkoutDiscount);
+    checkoutDiscountPreview.discountedTotalCents !==
+      null &&
+    checkoutDiscountPreview.fullTotalCents !== null
+      ? Math.max(
+          0,
+          checkoutDiscountPreview.fullTotalCents -
+            checkoutDiscountPreview.discountedTotalCents,
+        )
+      : 0;
 
   /*
    * An administrator's discount comes straight off; anyone
@@ -1884,6 +1979,50 @@ export function ReservationComposer() {
   const checkoutDiscountAppliedCents = isAdmin
     ? checkoutDiscountCents
     : 0;
+
+  /*
+   * The booking tab prices the discount against the chosen
+   * vehicle's own rates and the dates as typed.
+   */
+  const bookingRates =
+    vehicles.find(
+      (vehicle) =>
+        vehicle.id === bookingVehicleId,
+    )?.rates ?? null;
+
+  const bookingPeriod =
+    bookingPickupAt && bookingReturnAt
+      ? (() => {
+          try {
+            return {
+              pickupAt: localToIso(
+                bookingPickupAt,
+              ),
+              expectedReturnAt: localToIso(
+                bookingReturnAt,
+              ),
+            };
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+
+  const bookingDiscountPreview =
+    previewDailyRateDiscount(
+      bookingRateDiscount,
+      bookingRates,
+      bookingPeriod,
+    );
+
+  /* The booking's own discount, already asked for or applied. */
+  const checkoutBookingDiscount =
+    checkoutReservationQuote?.dailyRateDiscountStatus ===
+      "pending" ||
+    checkoutReservationQuote?.dailyRateDiscountStatus ===
+      "approved"
+      ? checkoutReservationQuote.dailyRateDiscountStatus
+      : null;
 
   const dueAtCheckoutCents =
     agreementTotalCents -
@@ -1955,9 +2094,7 @@ export function ReservationComposer() {
           amount * 100,
         );
 
-        return option.type === "discount"
-          ? sum - cents
-          : sum + cents;
+        return sum + cents;
       },
       0,
     );
@@ -2210,8 +2347,31 @@ export function ReservationComposer() {
         formElement,
       );
 
+    const bookingDiscount =
+      dailyRateDiscountPayload(
+        bookingRateDiscount,
+      );
+
     void run(
       async () => {
+        if (
+          bookingDiscount &&
+          !bookingDiscount.reason
+        ) {
+          throw new Error(
+            "Say why the discount is being offered.",
+          );
+        }
+
+        if (
+          bookingDiscount &&
+          bookingDiscountPreview.error
+        ) {
+          throw new Error(
+            bookingDiscountPreview.error,
+          );
+        }
+
         const result =
           await callFirestoreOperation<
             {
@@ -2230,6 +2390,11 @@ export function ReservationComposer() {
                 | null;
               bookingMedia: CloudinaryMedia[];
               backdated: boolean;
+              dailyRateDiscount: {
+                type: "amount" | "percent";
+                value: number;
+                reason: string;
+              } | null;
             },
             {
               reservationId: string;
@@ -2237,6 +2402,10 @@ export function ReservationComposer() {
                 baseRentalCents: number;
                 chargedDays: number;
               };
+              discountStatus:
+                | "approved"
+                | "pending"
+                | null;
             }
           >(
             "createReservation",
@@ -2297,10 +2466,19 @@ export function ReservationComposer() {
               bookingMedia: [],
 
               backdated,
+
+              dailyRateDiscount: bookingDiscount,
             },
           );
 
         formElement.reset();
+
+        setBookingRateDiscount(
+          EMPTY_DAILY_RATE_DISCOUNT,
+        );
+        setBookingVehicleId("");
+        setBookingPickupAt("");
+        setBookingReturnAt("");
 
         setSelectedCustomerId(
           "",
@@ -2337,13 +2515,20 @@ export function ReservationComposer() {
 
         setBackdated(false);
 
+        const discountNote =
+          result.discountStatus === "pending"
+            ? " · daily-rate discount waiting for an administrator, charged at the full rate until then"
+            : result.discountStatus === "approved"
+              ? " · daily-rate discount applied"
+              : "";
+
         return `${
           wasBackdated
             ? "Backdated booking recorded"
             : "Booking confirmed"
         } · ${result.quote.chargedDays} day(s) · ${formatMoney(
           result.quote.baseRentalCents,
-        )}. Check the vehicle out to sign and issue the rental agreement.`;
+        )}${discountNote}. Check the vehicle out to sign and issue the rental agreement.`;
       },
     );
   }
@@ -2363,12 +2548,23 @@ export function ReservationComposer() {
 
     void run(
       async () => {
-        if (
-          checkoutDiscountCents > 0 &&
-          !checkoutDiscountReason.trim()
-        ) {
+        const rateDiscount =
+          dailyRateDiscountPayload(
+            checkoutRateDiscount,
+          );
+
+        if (rateDiscount && !rateDiscount.reason) {
           throw new Error(
             "Say why the discount is being offered.",
+          );
+        }
+
+        if (
+          rateDiscount &&
+          checkoutDiscountPreview.error
+        ) {
+          throw new Error(
+            checkoutDiscountPreview.error,
           );
         }
 
@@ -2420,8 +2616,9 @@ export function ReservationComposer() {
                 | null;
               extraHours: number;
               damageMarks: DamageMark[];
-              discount: {
-                amountCents: number;
+              dailyRateDiscount: {
+                type: "amount" | "percent";
+                value: number;
                 reason: string;
               } | null;
               paidNowCents: number;
@@ -2528,15 +2725,7 @@ export function ReservationComposer() {
               damageMarks:
                 checkoutDamageMarks,
 
-              discount:
-                checkoutDiscountCents > 0
-                  ? {
-                      amountCents:
-                        checkoutDiscountCents,
-                      reason:
-                        checkoutDiscountReason.trim(),
-                    }
-                  : null,
+              dailyRateDiscount: rateDiscount,
 
               paidNowCents:
                 checkoutPaidNowCents,
@@ -2548,8 +2737,9 @@ export function ReservationComposer() {
         setCheckoutReservationId("");
         setCheckoutMedia([]);
         setCheckoutDamage(null);
-        setCheckoutDiscount("");
-        setCheckoutDiscountReason("");
+        setCheckoutRateDiscount(
+          EMPTY_DAILY_RATE_DISCOUNT,
+        );
         setCheckoutPaidNow("");
         setCustomerSignature(null);
         setSignatureName("");
@@ -3264,89 +3454,6 @@ export function ReservationComposer() {
     );
   }
 
-  function offerDiscount() {
-    void run(async () => {
-      const amountCents = Math.round(
-        Number(discountAmount) * 100,
-      );
-
-      if (
-        !paymentRentalId ||
-        !Number.isFinite(amountCents) ||
-        amountCents <= 0
-      ) {
-        throw new Error(
-          "Select the rental and enter the discount amount.",
-        );
-      }
-
-      /*
-       * A long hire that was paid up owes nothing until the
-       * rent since then is charged, so there would be nothing
-       * for the discount to come off. The rent on screen is
-       * charged first, under the same key the payment uses,
-       * so taking the payment afterwards does not charge it
-       * again.
-       */
-      const rentKey = `rent-${paymentRentalId}-${chargeThrough}`;
-
-      if (chargeThrough && rentChargeCents > 0) {
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            expectedReturnAt: string;
-            note: string;
-            idempotencyKey: string;
-          },
-          {
-            extensionCents: number;
-            outstandingCents: number;
-          }
-        >("extendRental", {
-          rentalId: paymentRentalId,
-          expectedReturnAt:
-            localToIso(chargeThrough),
-          note: "Rent charged with payment",
-          idempotencyKey: operationKey(rentKey),
-        });
-
-        releaseOperationKey(rentKey);
-
-        setChargeThrough("");
-      }
-
-      const result =
-        await callFirestoreOperation<
-          {
-            rentalId: string;
-            amountCents: number;
-            reason: string;
-            idempotencyKey: string;
-          },
-          {
-            status: string;
-            outstandingCents: number;
-          }
-        >("requestRentalDiscount", {
-          rentalId: paymentRentalId,
-          amountCents,
-          reason: discountReason.trim(),
-          idempotencyKey: operationKey("discount"),
-        });
-
-      releaseOperationKey("discount");
-
-      setDiscountAmount("");
-      setDiscountReason("");
-
-      return result.status === "approved"
-        ? `Discount applied · ${formatMoney(
-            result.outstandingCents,
-          )} now outstanding.`
-        : "Discount sent to an administrator for approval.";
-    });
-  }
-
   function decideDiscount(
     discount: RentalDiscount,
     decision: "approve" | "reject",
@@ -3380,9 +3487,11 @@ export function ReservationComposer() {
       });
 
       return result.status === "approved"
-        ? `Discount approved for ${discount.vehicleRegistration} · ${formatMoney(
-            result.outstandingCents ?? 0,
-          )} now outstanding.`
+        ? result.outstandingCents === null
+          ? `Discount approved for ${discount.vehicleRegistration} · the booking is now priced at the discounted daily rate.`
+          : `Discount approved for ${discount.vehicleRegistration} · ${formatMoney(
+              result.outstandingCents,
+            )} now outstanding.`
         : `Discount for ${discount.vehicleRegistration} rejected.`;
     });
   }
@@ -4767,6 +4876,11 @@ export function ReservationComposer() {
                 name="vehicleId"
                 required
                 defaultValue=""
+                onChange={(event) =>
+                  setBookingVehicleId(
+                    event.target.value,
+                  )
+                }
               >
                 <option
                   value=""
@@ -4878,6 +4992,11 @@ export function ReservationComposer() {
                     ? todayDateTime()
                     : undefined
                 }
+                onChange={(event) =>
+                  setBookingPickupAt(
+                    event.target.value,
+                  )
+                }
                 required
               />
             </div>
@@ -4902,9 +5021,23 @@ export function ReservationComposer() {
                     ? undefined
                     : todayDateTime()
                 }
+                onChange={(event) =>
+                  setBookingReturnAt(
+                    event.target.value,
+                  )
+                }
                 required
               />
             </div>
+
+            <DailyRateDiscountField
+              idPrefix="booking-rate-discount"
+              draft={bookingRateDiscount}
+              onChange={setBookingRateDiscount}
+              rates={bookingRates}
+              period={bookingPeriod}
+              isAdmin={isAdmin}
+            />
 
             <div className="field">
               <label htmlFor="pickup-location">
@@ -5201,63 +5334,57 @@ export function ReservationComposer() {
 
             </fieldset>
 
-            {/* ------------------------------ discount */}
-            <fieldset className="field full checkout-block">
-              <legend>
-                Discount (optional)
-              </legend>
-
-              <p className="form-help">
-                {isAdmin
-                  ? "Comes straight off what the renter owes."
-                  : "Sent to an administrator to approve. It comes off the balance once approved; until then the renter is charged the full amount."}
-              </p>
-
-              <div className="checkout-charges">
-                <div className="field">
-                  <label htmlFor="checkout-discount">
-                    Discount (USD)
-                  </label>
-
-                  <input
-                    id="checkout-discount"
-                    type="number"
-                    min={0}
-                    step="0.01"
-                    value={checkoutDiscount}
-                    onChange={(event) =>
-                      setCheckoutDiscount(
-                        event.target.value,
-                      )
+            {/* ---------------- discount on the daily rate */}
+            {checkoutBookingDiscount ? (
+              <div className="field full">
+                <p className="form-help">
+                  <span
+                    className={
+                      checkoutBookingDiscount ===
+                      "pending"
+                        ? "status-pill cleaning"
+                        : "status-pill available"
                     }
-                  />
-                </div>
+                  >
+                    {checkoutBookingDiscount ===
+                    "pending"
+                      ? "Daily-rate discount waiting for approval"
+                      : "Daily-rate discount applied"}
+                  </span>{" "}
+                  {(() => {
+                    const asked =
+                      pendingDiscounts.find(
+                        (discount) =>
+                          discount.id ===
+                          checkoutReservationQuote?.dailyRateDiscountId,
+                      );
 
-                <div className="field">
-                  <label htmlFor="checkout-discount-reason">
-                    Reason
-                    {checkoutDiscountCents > 0
-                      ? " (required)"
-                      : ""}
-                  </label>
-
-                  <input
-                    id="checkout-discount-reason"
-                    maxLength={500}
-                    required={
-                      checkoutDiscountCents > 0
-                    }
-                    placeholder="e.g. Returning customer"
-                    value={checkoutDiscountReason}
-                    onChange={(event) =>
-                      setCheckoutDiscountReason(
-                        event.target.value,
-                      )
-                    }
-                  />
-                </div>
+                    return asked
+                      ? `${describeDailyRateDiscount(
+                          asked,
+                        )} — ${asked.reason}. `
+                      : "";
+                  })()}
+                  {checkoutBookingDiscount ===
+                  "pending"
+                    ? "Asked for on the booking; it carries through checkout and the hire is charged the full rate until it is approved."
+                    : "The rental days below are already at the discounted daily rate."}
+                </p>
               </div>
-            </fieldset>
+            ) : (
+              <DailyRateDiscountField
+                idPrefix="checkout-rate-discount"
+                draft={checkoutRateDiscount}
+                onChange={setCheckoutRateDiscount}
+                rates={
+                  checkoutReservationQuote?.rates ??
+                  null
+                }
+                period={checkoutPeriod}
+                isAdmin={isAdmin}
+                disabled={!checkoutReservationQuote}
+              />
+            )}
 
             {checkoutReservationQuote && (
               <div className="field full payment-due">
@@ -5298,8 +5425,8 @@ export function ReservationComposer() {
                     <div>
                       <dt>
                         {isAdmin
-                          ? "Discount"
-                          : "Discount (waiting for approval)"}
+                          ? "Daily-rate discount"
+                          : "Daily-rate discount (waiting for approval)"}
                       </dt>
                       <dd>
                         −
@@ -6178,25 +6305,11 @@ export function ReservationComposer() {
 
 
               {/*
-                * A discount needs an administrator. Anyone
-                * else asks for one on the Payment tab once
-                * the return is done.
+                * Discounts are given on the daily rate at
+                * booking or checkout, never at the end.
                 */}
-              {!isAdmin && (
-                <p className="form-help">
-                  To offer a discount, complete the
-                  return and request it on the Payment
-                  tab. An administrator approves it.
-                </p>
-              )}
-
               <div className="checkout-charges">
                 {returnAdjustmentOptions
-                  .filter(
-                    (option) =>
-                      isAdmin ||
-                      option.type !== "discount",
-                  )
                   .map(
                   (option) => (
                     <div
@@ -6395,11 +6508,17 @@ export function ReservationComposer() {
                       >
                         <p>
                           <strong>
-                            {formatMoney(
-                              discount.amountCents,
-                            )}
+                            {discount.dailyRate
+                              ? describeDailyRateDiscount(
+                                  discount,
+                                )
+                              : formatMoney(
+                                  discount.amountCents,
+                                )}
                           </strong>
-                          {" off "}
+                          {discount.dailyRate
+                            ? " · "
+                            : " off "}
                           {
                             discount.vehicleRegistration
                           }
@@ -6412,6 +6531,11 @@ export function ReservationComposer() {
                           {" — asked by "}
                           {discount.requestedByName ||
                             "staff"}
+                          {discount.dailyRate
+                            ? discount.rentalId
+                              ? " at checkout"
+                              : " on the booking"
+                            : " at the end of the hire"}
                         </p>
 
                         <input
@@ -6740,21 +6864,24 @@ export function ReservationComposer() {
               * after the payment has been taken.
               */}
             {/*
-              * A discount comes off at the end, when the
-              * balance is settled. An administrator's applies
-              * at once; anyone else's waits for approval and
-              * the balance does not change until then.
+              * Discounts are no longer offered at the end of a
+              * hire. One asked for here before that changed
+              * still waits for an administrator, so it is shown.
               */}
-            {selectedPayableRental && (
-              <fieldset className="field full checkout-block">
-                <legend>Discount</legend>
+            {selectedPayableRental &&
+              pendingDiscountForRental && (
+                <fieldset className="field full checkout-block">
+                  <legend>Discount</legend>
 
-                {pendingDiscountForRental ? (
                   <p className="form-help">
                     <strong>
-                      {formatMoney(
-                        pendingDiscountForRental.amountCents,
-                      )}
+                      {pendingDiscountForRental.dailyRate
+                        ? describeDailyRateDiscount(
+                            pendingDiscountForRental,
+                          )
+                        : formatMoney(
+                            pendingDiscountForRental.amountCents,
+                          )}
                     </strong>{" "}
                     discount waiting for an
                     administrator&apos;s approval
@@ -6763,75 +6890,8 @@ export function ReservationComposer() {
                     The balance changes once it is
                     approved.
                   </p>
-                ) : (
-                  <>
-                    <p className="form-help">
-                      {isAdmin
-                        ? "Comes off the balance straight away."
-                        : "Sent to an administrator. It comes off the balance once approved."}
-                      {rentChargeCents > 0
-                        ? " The rent above is charged first, so the discount has something to come off."
-                        : ""}
-                    </p>
-
-                    <div className="field">
-                      <label htmlFor="discount-amount">
-                        Discount (USD)
-                      </label>
-
-                      <input
-                        id="discount-amount"
-                        type="number"
-                        min="0.01"
-                        max="100000"
-                        step="0.01"
-                        inputMode="decimal"
-                        value={discountAmount}
-                        onChange={(event) =>
-                          setDiscountAmount(
-                            event.target.value,
-                          )
-                        }
-                      />
-                    </div>
-
-                    <div className="field">
-                      <label htmlFor="discount-reason">
-                        Reason
-                      </label>
-
-                      <input
-                        id="discount-reason"
-                        maxLength={500}
-                        value={discountReason}
-                        onChange={(event) =>
-                          setDiscountReason(
-                            event.target.value,
-                          )
-                        }
-                      />
-                    </div>
-
-                    <div className="form-actions">
-                      <button
-                        type="button"
-                        className="button"
-                        disabled={
-                          busy ||
-                          !discountAmount ||
-                          !discountReason.trim()
-                        }
-                        onClick={offerDiscount}
-                      >
-                        {isAdmin
-                          ? "Apply discount"
-                          : "Request approval"}
-                      </button>
-                    </div>
-                  </>
-                )}
-              </fieldset>
-            )}
+                </fieldset>
+              )}
 
             {selectedPayableRental && (
               <div className="field full payment-due">

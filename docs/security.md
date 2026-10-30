@@ -43,6 +43,7 @@ That decision is made on the **Staff** screen, which only an administrator can l
 | Contract tampering before delivery | An agreement can only be sent after an administrator approves it; approval freezes a snapshot in a subcollection the rules make immutable, and the message is rendered from that snapshot alone |
 | Mail credential exposure | The deployed application uses no mail provider: an agreement leaves from the office's own mail account, so there is no sending credential to expose. The provider-based send in the unbuilt `functions/` reference reads its key from a secret, never from the bundle |
 | Customer deletion covering tracks | Deletion is admin-only, is refused while any booking or rental references the customer, and writes an audit entry naming the record removed |
+| Staff approving their own cancellation, backdated return or discount | Only an administrator may set a booking to cancelled, close a rental more than 15 minutes in the past, or change a booking's or rental's rates; staff can only create a pending request in their own name, which another administrator decides once, with the effect written in the same transaction |
 | XSS/injection | React rendering, no raw HTML rendering; the emailed agreement escapes every value that came from a person |
 
 ### Residual risks

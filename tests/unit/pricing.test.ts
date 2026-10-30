@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateBalance, chargedRentalDays, quoteRental, rentOwedThrough } from "../../packages/domain/src/pricing";
+import { calculateBalance, chargedRentalDays, discountedDailyCents, quoteRental, rentOwedThrough, withDailyRate } from "../../packages/domain/src/pricing";
 import { isValidVehicleTransition } from "../../packages/domain/src/lifecycle";
 import { pickupWindowError } from "../../packages/domain/src/booking";
 
@@ -36,4 +36,57 @@ describe("rent owed on a long hire", () => {
     expect(rentOwedThrough({ pickupAt, chargedThroughAt: "2026-08-08T08:00:00.000Z", throughAt: "2026-08-08T12:00:00.000Z", baseRentalCents: 45_000 }, rates)).toBe(7_500));
   it("owes nothing for a date already paid for", () =>
     expect(rentOwedThrough({ pickupAt, chargedThroughAt: "2026-08-08T08:00:00.000Z", throughAt: "2026-08-05T08:00:00.000Z", baseRentalCents: 45_000 }, rates)).toBe(0));
+});
+
+describe("daily-rate discount", () => {
+  const pickupAt = "2026-08-01T08:00:00.000Z";
+  const days = (count: number) => new Date(Date.parse(pickupAt) + count * 86_400_000).toISOString();
+
+  it("takes a dollar discount off the daily rate", () => expect(discountedDailyCents(7_500, { type: "amount", value: 1_000 })).toBe(6_500));
+  it("takes a percentage off the daily rate", () => expect(discountedDailyCents(7_500, { type: "percent", value: 20 })).toBe(6_000));
+  it("rounds a percentage to whole cents", () => {
+    expect(discountedDailyCents(7_499, { type: "percent", value: 12.5 })).toBe(6_562); // 6561.625
+    expect(discountedDailyCents(1_001, { type: "percent", value: 50 })).toBe(501); // 500.5 rounds up
+    expect(discountedDailyCents(999, { type: "percent", value: 33.3 })).toBe(666); // 666.333
+  });
+  it("refuses a dollar discount that is nothing or the whole rate", () => {
+    expect(() => discountedDailyCents(7_500, { type: "amount", value: 0 })).toThrow("more than $0");
+    expect(() => discountedDailyCents(7_500, { type: "amount", value: 7_500 })).toThrow("less than the daily rate");
+    expect(() => discountedDailyCents(7_500, { type: "amount", value: 12.5 })).toThrow();
+  });
+  it("refuses a percentage outside 0 to 100", () => {
+    expect(() => discountedDailyCents(7_500, { type: "percent", value: 0 })).toThrow("more than 0%");
+    expect(() => discountedDailyCents(7_500, { type: "percent", value: 100 })).toThrow("less than 100%");
+  });
+  it("refuses a vehicle with no daily rate", () => expect(() => discountedDailyCents(0, { type: "percent", value: 10 })).toThrow("no daily rate"));
+  it("changes only the daily rate", () =>
+    expect(withDailyRate(rates, 6_000)).toEqual({ currency: "USD", dailyCents: 6_000, weeklyCents: 45_000, monthlyCents: 150_000 }));
+
+  it("prices a hire at the discounted daily rate", () =>
+    expect(quoteRental({ pickupAt, expectedReturnAt: days(3) }, withDailyRate(rates, 6_000))).toMatchObject({ dailyUnits: 3, baseRentalCents: 18_000 }));
+
+  it("keeps the weekly rate when it is still cheaper than seven discounted days", () =>
+    expect(quoteRental({ pickupAt, expectedReturnAt: days(7) }, withDailyRate(rates, 7_000))).toMatchObject({ weeklyUnits: 1, dailyUnits: 0, baseRentalCents: 45_000 }));
+
+  it("chooses discounted days over the weekly rate once they are cheaper", () =>
+    expect(quoteRental({ pickupAt, expectedReturnAt: days(7) }, withDailyRate(rates, 6_000))).toMatchObject({ weeklyUnits: 0, dailyUnits: 7, baseRentalCents: 42_000 }));
+
+  it("mixes a week with discounted days on a longer hire", () =>
+    expect(quoteRental({ pickupAt, expectedReturnAt: days(9) }, withDailyRate(rates, 7_000))).toMatchObject({ weeklyUnits: 1, dailyUnits: 2, baseRentalCents: 59_000 }));
+
+  it("drops the week for nine discounted days when they come out cheaper", () =>
+    expect(quoteRental({ pickupAt, expectedReturnAt: days(9) }, withDailyRate(rates, 6_000))).toMatchObject({ weeklyUnits: 0, dailyUnits: 9, baseRentalCents: 54_000 }));
+
+  it("charges an extension at the discounted daily rate", () => {
+    const discounted = withDailyRate(rates, 6_000);
+    const before = quoteRental({ pickupAt, expectedReturnAt: days(2) }, discounted).baseRentalCents;
+    const after = quoteRental({ pickupAt, expectedReturnAt: days(3) }, discounted).baseRentalCents;
+    expect(after - before).toBe(6_000);
+  });
+
+  it("charges rent on a long hire at the discounted daily rate", () =>
+    expect(rentOwedThrough({ pickupAt, chargedThroughAt: days(2), throughAt: days(4), baseRentalCents: 12_000 }, withDailyRate(rates, 6_000))).toBe(12_000));
+
+  it("moves rent on a long hire onto the weekly rate when that beats discounted days", () =>
+    expect(rentOwedThrough({ pickupAt, chargedThroughAt: days(6), throughAt: days(8), baseRentalCents: 42_000 }, withDailyRate(rates, 7_000))).toBe(10_000));
 });

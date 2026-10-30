@@ -272,11 +272,76 @@ allow list: if isAdmin();
             == resource.data.cancellationRequestId;
     }
 
+    /* A discount on the daily rate is the one way a booking's
+       daily rate leaves the vehicle's: staff point the booking
+       at the discount they have just asked for, and only when
+       none is waiting or applied. */
+    function discountLockUntouched() {
+      return !request.resource.data.diff(resource.data)
+        .affectedKeys()
+        .hasAny([
+          "dailyRateDiscountId",
+          "dailyRateDiscountStatus"
+        ]);
+    }
+
+    function openingDiscountRequest(reservationId) {
+      let discountId =
+        request.resource.data.get(
+          "dailyRateDiscountId", null
+        );
+      let after = getAfter(
+        /databases/$(database)/documents/rentalDiscounts/$(discountId)
+      ).data;
+
+      return !(
+          resource.data.get(
+            "dailyRateDiscountStatus", null
+          ) in ["pending", "approved"]
+        )
+        && request.resource.data.dailyRateDiscountStatus
+            == "pending"
+        && discountId is string
+        && after.status == "pending"
+        && after.reservationId == reservationId;
+    }
+
+    /* Staff book at the vehicle's own daily rate; a discount
+       on it can only be asked for, never applied, by them. */
+    function bookingPricedFromVehicle(reservationId) {
+      let data = request.resource.data;
+      let discountStatus = data.get(
+        "dailyRateDiscountStatus", null
+      );
+
+      return data.get("status", null) != "confirmed"
+        || (
+          data.get("rateSnapshot", {})
+              .get("dailyCents", null)
+            == get(
+              /databases/$(database)/documents/vehicles/$(data.vehicleId)
+            ).data.get("rates", {}).get("dailyCents", null)
+          && (
+            discountStatus == null
+            || (
+              discountStatus == "pending"
+              && getAfter(
+                /databases/$(database)/documents/rentalDiscounts/$(data.dailyRateDiscountId)
+              ).data.reservationId == reservationId
+            )
+          )
+        );
+    }
+
     match /reservations/{reservationId} {
 
       allow read: if isStaff();
 
-      allow create: if isStaff();
+      allow create: if isStaff()
+        && (
+          isAdmin()
+          || bookingPricedFromVehicle(reservationId)
+        );
 
       /* A booking is only cancelled with a reason: the
          cancelled list on Bookings says why each one went.
@@ -302,6 +367,23 @@ allow list: if isAdmin();
           || cancellationLockUntouched()
           || openingCancellationRequest(reservationId)
           || withdrawingCancellationAtCheckout()
+        )
+        && (
+          isAdmin()
+          || (
+            request.resource.data.get("rateSnapshot", null)
+                == resource.data.get("rateSnapshot", null)
+            && (
+              discountLockUntouched()
+              || openingDiscountRequest(reservationId)
+            )
+            && !(
+              request.resource.data.get("status", null)
+                  == "confirmed"
+              && resource.data.get("status", null)
+                  != "confirmed"
+            )
+          )
         );
 
       allow delete: if isAdmin();
@@ -549,11 +631,23 @@ allow list: if isAdmin();
         && after.rentalId == rentalId;
     }
 
+    /* A rental checked out by staff is priced at its
+       booking's rates, not at rates of its own. */
+    function rentalPricedFromBooking() {
+      return request.resource.data.get("status", null)
+          != "active"
+        || request.resource.data.get("rateSnapshot", null)
+          == get(
+            /databases/$(database)/documents/reservations/$(request.resource.data.reservationId)
+          ).data.get("rateSnapshot", null);
+    }
+
     match /rentals/{rentalId} {
 
       allow read: if isStaff();
 
-      allow create: if isStaff();
+      allow create: if isStaff()
+        && (isAdmin() || rentalPricedFromBooking());
 
       allow update: if isStaff()
         && (
@@ -570,6 +664,11 @@ allow list: if isAdmin();
           isAdmin()
           || returnLockUntouched()
           || openingReturnRequest(rentalId)
+        )
+        && (
+          isAdmin()
+          || request.resource.data.get("rateSnapshot", null)
+              == resource.data.get("rateSnapshot", null)
         );
 
       allow delete: if isAdmin();
@@ -674,14 +773,74 @@ allow list: if isAdmin();
        DISCOUNTS
        ========================================================= */
 
+    /* A discount on the daily rate: the amounts agree with
+       each other and with the booking's rate, the booking is
+       locked to it in the same write, and an approved one has
+       already re-priced the booking. */
+    function dailyRateDiscountValid(discountId) {
+      let data = request.resource.data;
+      let booking = getAfter(
+        /databases/$(database)/documents/reservations/$(data.reservationId)
+      ).data;
+
+      return data.get("kind", null) == "daily_rate"
+        && data.reservationId is string
+        && data.keys().hasAll(["rentalId"])
+        && (data.rentalId == null || data.rentalId is string)
+        && data.get("reason", null) is string
+        && data.reason.trim().size() > 0
+        && data.reason.size() <= 500
+        && data.originalDailyCents is int
+        && data.discountedDailyCents is int
+        && data.discountedDailyCents >= 1
+        && data.discountedDailyCents
+            < data.originalDailyCents
+        && data.amountCents
+            == data.originalDailyCents
+              - data.discountedDailyCents
+        && (
+          (
+            data.discountType == "amount"
+            && data.discountValue == data.amountCents
+          )
+          || (
+            data.discountType == "percent"
+            && data.discountValue is number
+            && data.discountValue > 0
+            && data.discountValue < 100
+            && math.abs(
+              math.round(
+                data.originalDailyCents
+                  * (100.0 - data.discountValue)
+                  / 100.0
+              ) - data.discountedDailyCents
+            ) <= 1
+          )
+        )
+        && booking.dailyRateDiscountId == discountId
+        && (
+          (
+            data.status == "pending"
+            && booking.rateSnapshot.dailyCents
+                == data.originalDailyCents
+          )
+          || (
+            data.status == "approved"
+            && booking.rateSnapshot.dailyCents
+                == data.discountedDailyCents
+          )
+        );
+    }
+
     match /rentalDiscounts/{discountId} {
 
       allow read: if isStaff();
 
-      /* Anyone on staff may offer a discount, in their own
-         name, and it waits for an administrator. Only an
-         administrator's own discount may be approved as it
-         is written. */
+      /* Anyone on staff may offer a discount on the daily rate,
+         in their own name, and it waits for an administrator.
+         Only an administrator's own discount may be approved
+         as it is written. A discount off the balance can no
+         longer be offered at all. */
       allow create: if isStaff()
         && request.resource.data.requestedBy
             == request.auth.uid
@@ -692,23 +851,26 @@ allow list: if isAdmin();
           || (
             isAdmin()
             && request.resource.data.status == "approved"
+            && request.resource.data.reviewedBy
+                == request.auth.uid
           )
-        );
+        )
+        && dailyRateDiscountValid(discountId);
 
-      /* Only an administrator decides, only once, and never
-         by changing what was asked for. */
-      allow update: if isAdmin()
-        && resource.data.status == "pending"
-        && request.resource.data.status in [
-          "approved",
-          "rejected"
-        ]
-        && request.resource.data.rentalId
-            == resource.data.rentalId
-        && request.resource.data.amountCents
-            == resource.data.amountCents
-        && request.resource.data.requestedBy
-            == resource.data.requestedBy;
+      /* Only an administrator decides, only once, in their own
+         name, never their own request, and never by changing
+         what was asked for. Approving a discount on the daily
+         rate re-prices the booking in the same write. Waiting
+         discounts off the balance are still decided here. */
+      allow update: if adminDecidesPending()
+        && (
+          resource.data.get("kind", null) != "daily_rate"
+          || request.resource.data.status != "approved"
+          || getAfter(
+            /databases/$(database)/documents/reservations/$(resource.data.reservationId)
+          ).data.rateSnapshot.dailyCents
+              == resource.data.discountedDailyCents
+        );
 
       allow delete: if false;
     }

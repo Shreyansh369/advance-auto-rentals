@@ -12,6 +12,7 @@ import {
 
 import {
   callFirestoreOperation,
+  describeDailyRateDiscount,
   type LedgerEntryDetail,
 } from "@/lib/services/firestore-client";
 
@@ -318,6 +319,15 @@ export function LedgerEntryReceipt({
                 </>
               )}
 
+              {discount?.dailyRate && (
+                <Row
+                  label="Discount"
+                  value={describeDailyRateDiscount(
+                    discount,
+                  )}
+                />
+              )}
+
               {discount && (
                 <>
                   <Row
@@ -606,9 +616,13 @@ export function LedgerEntryReceipt({
                         </span>
 
                         <b>
-                          {formatMoney(
-                            item.amountCents,
-                          )}
+                          {item.dailyRate
+                            ? describeDailyRateDiscount(
+                                item,
+                              )
+                            : formatMoney(
+                                item.amountCents,
+                              )}
                         </b>
                       </li>
                     ))}

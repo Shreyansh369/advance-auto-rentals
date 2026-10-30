@@ -19,7 +19,9 @@ import { getFirebaseClient } from "@/lib/firebase/client";
 import {
   calculateBalance,
   chargedRentalDays,
+  discountedDailyCents,
   quoteRental,
+  withDailyRate,
 } from "@/packages/domain/src/pricing";
 import type {
   VehicleDocument,
@@ -2036,7 +2038,64 @@ export type RentalAgreementView = {
   damageMarks: DamageMark[];
   /* As it came back; null until the vehicle is returned. */
   returnDamageMarks: DamageMark[] | null;
+  /*
+   * The discount on the daily rate, applied or waiting: the
+   * rate it came off, how much, the rate it left, and who
+   * asked and who approved. Null when there is none.
+   */
+  dailyRateDiscount: {
+    status: DiscountStatus;
+    type: "amount" | "percent";
+    value: number;
+    originalDailyCents: number;
+    discountedDailyCents: number;
+    requestedByName: string;
+    reviewedByName: string | null;
+  } | null;
 };
+
+/*
+ * The discount on a booking's daily rate the agreement prints:
+ * the applied one if there is one, else one still waiting.
+ */
+async function bookingDailyRateDiscount(
+  reservationId: string | null,
+): Promise<RentalDiscount | null> {
+  if (!reservationId) {
+    return null;
+  }
+
+  const { db } = getFirebaseClient();
+
+  try {
+    const snapshot = await getDocs(
+      query(
+        collection(db, "rentalDiscounts"),
+        where("reservationId", "==", reservationId),
+        limit(20),
+      ),
+    );
+
+    const discounts = snapshot.docs
+      .map((entry) =>
+        rentalDiscountFrom(entry.id, entry.data()),
+      )
+      .filter((discount) => discount.dailyRate);
+
+    return (
+      discounts.find(
+        (discount) => discount.status === "approved",
+      ) ??
+      discounts.find(
+        (discount) => discount.status === "pending",
+      ) ??
+      null
+    );
+  } catch {
+    /* Rules not deployed yet: the agreement still prints. */
+    return null;
+  }
+}
 
 function fuelToGas(
   value: unknown,
@@ -2145,6 +2204,11 @@ async function getRentalAgreement(
     rental.returnOdometerValue == null
       ? null
       : Number(rental.returnOdometerValue);
+
+  const rateDiscount =
+    await bookingDailyRateDiscount(
+      trimmedOrNull(rental.reservationId),
+    );
 
   return {
     rentalId: rentalSnapshot.id,
@@ -2357,7 +2421,248 @@ async function getRentalAgreement(
           rental.returnDamageMarks,
         )
       : null,
+
+    dailyRateDiscount:
+      rateDiscount?.dailyRate
+        ? {
+            status: rateDiscount.status,
+            type: rateDiscount.dailyRate.type,
+            value: rateDiscount.dailyRate.value,
+            originalDailyCents:
+              rateDiscount.dailyRate
+                .originalDailyCents,
+            discountedDailyCents:
+              rateDiscount.dailyRate
+                .discountedDailyCents,
+            requestedByName:
+              rateDiscount.requestedByName,
+            reviewedByName:
+              rateDiscount.reviewedByName,
+          }
+        : null,
   };
+}
+
+/* =========================================================
+   Daily-rate discount
+   ========================================================= */
+
+/*
+ * A discount on the daily rate is agreed at the start of a
+ * hire — on the booking or at checkout — never at the end. It
+ * is entered as dollars off the daily rate (in cents here) or
+ * as a percentage of it, always with a reason.
+ */
+export type DailyRateDiscountInput = {
+  type: "amount" | "percent";
+  /* Whole cents for "amount"; a percentage for "percent". */
+  value: number;
+  reason: string;
+};
+
+function dailyRateDiscountInput(
+  value: unknown,
+): DailyRateDiscountInput | null {
+  if (value == null) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+
+  if (
+    source.type !== "amount" &&
+    source.type !== "percent"
+  ) {
+    throw new Error(
+      "Choose a dollar or a percentage discount.",
+    );
+  }
+
+  const amount = Number(source.value);
+
+  if (
+    source.type === "amount" &&
+    !Number.isSafeInteger(amount)
+  ) {
+    throw new Error(
+      "Enter the discount as a dollar amount.",
+    );
+  }
+
+  const reason = trimmedOrNull(source.reason);
+
+  if (!reason) {
+    throw new Error(
+      "Say why the discount is being offered.",
+    );
+  }
+
+  if (reason.length > 500) {
+    throw new Error(
+      "Keep the discount reason under 500 characters.",
+    );
+  }
+
+  return {
+    type: source.type,
+    value: amount,
+    reason,
+  };
+}
+
+/*
+ * The agreement's daily, weekly and monthly rows for a quote:
+ * the bundles it was priced at, each at its rate.
+ */
+function quotedChargeRows(
+  quote: Record<string, unknown>,
+  rates: Record<string, unknown>,
+): { daily: number; weekly: number; monthly: number } {
+  const row = (
+    units: string,
+    rate: string,
+  ) => {
+    const value =
+      Number(quote[units] ?? 0) *
+      Number(rates[rate] ?? 0);
+
+    return Number.isFinite(value)
+      ? Math.round(value)
+      : 0;
+  };
+
+  return {
+    daily: row("dailyUnits", "dailyCents"),
+    weekly: row("weeklyUnits", "weeklyCents"),
+    monthly: row("monthlyUnits", "monthlyCents"),
+  };
+}
+
+/* The stored agreement with its rental rows re-priced. */
+function repricedAgreement(
+  agreement: Record<string, unknown>,
+  quote: Record<string, unknown>,
+  rates: Record<string, unknown>,
+): Record<string, unknown> {
+  const charges: Record<string, unknown> = {
+    ...((agreement.charges ?? {}) as Record<
+      string,
+      unknown
+    >),
+    ...quotedChargeRows(quote, rates),
+  };
+
+  return {
+    ...agreement,
+    charges,
+    chargeTotalCents: CHARGE_KEYS.reduce(
+      (sum, key) =>
+        sum + (Number(charges[key] ?? 0) || 0),
+      0,
+    ),
+  };
+}
+
+/*
+ * Writes the discount record and its audit entry. An
+ * administrator's own discount is its own approval; anyone
+ * else's waits, and the hire is charged the full daily rate
+ * until it is approved.
+ */
+function writeDailyRateDiscount(
+  transaction: {
+    set: (
+      reference: ReturnType<typeof doc>,
+      data: Record<string, unknown>,
+    ) => unknown;
+  },
+  input: {
+    discountRef: ReturnType<typeof doc>;
+    discount: DailyRateDiscountInput;
+    status: DiscountStatus;
+    reservationId: string;
+    rentalId: string | null;
+    offeredAt: "booking" | "checkout";
+    customerName: string;
+    vehicleRegistration: string;
+    originalDailyCents: number;
+    discountedDailyCents: number;
+    actorUid: string;
+    actorName: string;
+  },
+): void {
+  const { db } = getFirebaseClient();
+
+  const approved = input.status === "approved";
+
+  transaction.set(input.discountRef, {
+    kind: "daily_rate",
+    reservationId: input.reservationId,
+    rentalId: input.rentalId,
+    customerNameSnapshot: input.customerName,
+    vehicleRegistrationSnapshot:
+      input.vehicleRegistration,
+    discountType: input.discount.type,
+    discountValue: input.discount.value,
+    originalDailyCents:
+      input.originalDailyCents,
+    discountedDailyCents:
+      input.discountedDailyCents,
+
+    /* What comes off each day, as the rules require. */
+    amountCents:
+      input.originalDailyCents -
+      input.discountedDailyCents,
+
+    reason: input.discount.reason,
+    status: input.status,
+    offeredAt: input.offeredAt,
+    requestedBy: input.actorUid,
+    requestedByNameSnapshot: input.actorName,
+    requestedAt: nowTimestamp(),
+    reviewedBy: approved
+      ? input.actorUid
+      : null,
+    reviewedByNameSnapshot: approved
+      ? input.actorName
+      : null,
+    reviewedAt: approved
+      ? nowTimestamp()
+      : null,
+    reviewNote: null,
+    updatedAt: nowTimestamp(),
+  });
+
+  transaction.set(
+    doc(collection(db, "auditLogs")),
+    {
+      actorUid: input.actorUid,
+      action: approved
+        ? "discount.daily_rate_applied"
+        : "discount.daily_rate_requested",
+      resource: {
+        collection: "rentalDiscounts",
+        id: input.discountRef.id,
+      },
+      details: {
+        actorName: input.actorName,
+        reservationId: input.reservationId,
+        rentalId: input.rentalId,
+        offeredAt: input.offeredAt,
+        discountType: input.discount.type,
+        discountValue: input.discount.value,
+        originalDailyCents:
+          input.originalDailyCents,
+        discountedDailyCents:
+          input.discountedDailyCents,
+        reason: input.discount.reason,
+        decision: approved
+          ? "approved (administrator's own)"
+          : "pending",
+      },
+      createdAt: nowTimestamp(),
+    },
+  );
 }
 
 /* =========================================================
@@ -2380,6 +2685,8 @@ async function createReservation(
      * ahead. Everything else about it is an ordinary booking.
      */
     backdated?: boolean;
+    /* A discount on the daily rate, asked for at booking. */
+    dailyRateDiscount?: DailyRateDiscountInput | null;
   },
 ): Promise<{
   reservationId: string;
@@ -2387,6 +2694,7 @@ async function createReservation(
     baseRentalCents: number;
     chargedDays: number;
   };
+  discountStatus: DiscountStatus | null;
 }> {
   const { db } =
     getFirebaseClient();
@@ -2424,6 +2732,18 @@ async function createReservation(
     sanitizeMediaList(
       input.bookingMedia,
     );
+
+  const rateDiscount =
+    dailyRateDiscountInput(
+      input.dailyRateDiscount,
+    );
+
+  const discountRef = doc(
+    collection(db, "rentalDiscounts"),
+  );
+
+  let discountStatus: DiscountStatus | null =
+    null;
 
   const reservationRef =
     doc(
@@ -2474,6 +2794,13 @@ async function createReservation(
           transaction,
           actorUid,
         );
+
+      const actor = rateDiscount
+        ? await actorProfileSnapshot(
+            transaction,
+            actorUid,
+          )
+        : null;
 
       if (!vehicleSnapshot.exists()) {
         throw new Error(
@@ -2591,6 +2918,34 @@ async function createReservation(
         );
       }
 
+      /*
+       * The vehicle's own rates never change. An approved
+       * discount becomes this booking's daily rate in its own
+       * snapshot; a waiting one leaves the full rate in place
+       * until an administrator approves it.
+       */
+      const discountedDaily = rateDiscount
+        ? discountedDailyCents(
+            Number(vehicle.rates.dailyCents ?? 0),
+            rateDiscount,
+          )
+        : null;
+
+      discountStatus = rateDiscount
+        ? actor?.role === "admin"
+          ? "approved"
+          : "pending"
+        : null;
+
+      const bookingRates =
+        discountStatus === "approved" &&
+        discountedDaily !== null
+          ? withDailyRate(
+              vehicle.rates,
+              discountedDaily,
+            )
+          : vehicle.rates;
+
       quote = quoteRental(
         {
           pickupAt:
@@ -2600,7 +2955,7 @@ async function createReservation(
             input.expectedReturnAt,
         },
 
-        vehicle.rates,
+        bookingRates,
       );
 
       transaction.set(
@@ -2654,7 +3009,7 @@ async function createReservation(
           backdated,
 
           rateSnapshot: {
-            ...vehicle.rates,
+            ...bookingRates,
 
             quotedAt:
               new Date().toISOString(),
@@ -2667,6 +3022,15 @@ async function createReservation(
           },
 
           quote,
+
+          ...(discountStatus
+            ? {
+                dailyRateDiscountId:
+                  discountRef.id,
+                dailyRateDiscountStatus:
+                  discountStatus,
+              }
+            : {}),
 
           notes:
             trimmedOrNull(
@@ -2736,6 +3100,34 @@ async function createReservation(
             nowTimestamp(),
         },
       );
+
+      if (
+        rateDiscount &&
+        discountStatus &&
+        actor &&
+        discountedDaily !== null
+      ) {
+        writeDailyRateDiscount(transaction, {
+          discountRef,
+          discount: rateDiscount,
+          status: discountStatus,
+          reservationId: reservationRef.id,
+          rentalId: null,
+          offeredAt: "booking",
+          customerName: String(
+            customerSnapshot.get("fullName") ??
+              "",
+          ),
+          vehicleRegistration:
+            vehicle.registrationNumber,
+          originalDailyCents: Number(
+            vehicle.rates.dailyCents,
+          ),
+          discountedDailyCents: discountedDaily,
+          actorUid,
+          actorName: actor.name,
+        });
+      }
     },
   );
 
@@ -2744,6 +3136,8 @@ async function createReservation(
       reservationRef.id,
 
     quote: quote!,
+
+    discountStatus,
   };
 }
 
@@ -3918,14 +4312,12 @@ async function checkoutReservation(
     /* Scratches, dents and the rest, marked on the drawings. */
     damageMarks?: unknown;
     /*
-     * A discount offered at the counter. An administrator's
-     * comes off the balance at once; anyone else's waits for
-     * an administrator, exactly as it does on the Payment tab.
+     * A discount on the daily rate offered at the counter. An
+     * administrator's re-prices the hire at once; anyone
+     * else's waits for an administrator, and the hire is
+     * charged the full rate until it is approved.
      */
-    discount?: {
-      amountCents: number;
-      reason: string;
-    } | null;
+    dailyRateDiscount?: DailyRateDiscountInput | null;
     /*
      * Money taken at the counter towards the rental, by the
      * method chosen on the agreement. Whatever is not taken
@@ -3989,29 +4381,10 @@ async function checkoutReservation(
     { strict: true },
   );
 
-  const discountCents = assertMoneyCents(
-    input.discount?.amountCents ?? 0,
-    "Discount amount",
-  );
-
-  const discountReason = trimmedOrNull(
-    input.discount?.reason,
-  );
-
-  if (discountCents > 0 && !discountReason) {
-    throw new Error(
-      "Say why the discount is being offered.",
+  const rateDiscount =
+    dailyRateDiscountInput(
+      input.dailyRateDiscount,
     );
-  }
-
-  if (
-    discountReason &&
-    discountReason.length > 500
-  ) {
-    throw new Error(
-      "Keep the discount reason under 500 characters.",
-    );
-  }
 
   const paidNowCents = assertMoneyCents(
     input.paidNowCents ?? 0,
@@ -4183,7 +4556,7 @@ async function checkoutReservation(
         );
 
       const actor =
-        discountCents > 0
+        rateDiscount
           ? await actorProfileSnapshot(
               transaction,
               actorUid,
@@ -4236,57 +4609,142 @@ async function checkoutReservation(
         agreementAdjustmentCents;
 
       /*
-       * A discount can only forgive what is owed, and the
-       * money taken now cannot be more than is left once it
-       * is applied — a waiting discount included, or its
-       * approval would find nothing left to forgive.
+       * One daily-rate discount per booking: one asked for at
+       * booking carries through checkout, waiting or applied,
+       * and is not asked for twice.
        */
       if (
-        discountCents >
-        owedBeforeDiscountCents
+        rateDiscount &&
+        (reservation.dailyRateDiscountStatus ===
+          "pending" ||
+          reservation.dailyRateDiscountStatus ===
+            "approved")
       ) {
         throw new Error(
-          `The discount is more than the ${formatCents(
-            owedBeforeDiscountCents,
-          )} owed on this rental.`,
+          reservation.dailyRateDiscountStatus ===
+            "pending"
+            ? "A daily-rate discount on this booking is already waiting for an administrator."
+            : "This booking already has a daily-rate discount.",
         );
       }
 
+      const bookingRates = (reservation.rateSnapshot ??
+        {}) as Record<string, any>;
+
+      const discountedDaily = rateDiscount
+        ? discountedDailyCents(
+            Number(bookingRates.dailyCents ?? 0),
+            rateDiscount,
+          )
+        : null;
+
+      const discountedRates =
+        discountedDaily !== null
+          ? withDailyRate(
+              {
+                ...bookingRates,
+                currency: "USD" as const,
+                dailyCents: bookingRates.dailyCents ?? null,
+                weeklyCents: bookingRates.weeklyCents ?? null,
+                monthlyCents: bookingRates.monthlyCents ?? null,
+              },
+              discountedDaily,
+            )
+          : null;
+
+      const discountedQuote = discountedRates
+        ? quoteRental(
+            {
+              pickupAt: toIso(reservation.pickupAt),
+              expectedReturnAt: toIso(
+                reservation.expectedReturnAt,
+              ),
+            },
+            discountedRates,
+          )
+        : null;
+
+      /* What the discount takes off the rental days. */
+      const discountReductionCents =
+        discountedQuote
+          ? Math.max(
+              0,
+              baseRentalCents -
+                discountedQuote.baseRentalCents,
+            )
+          : 0;
+
+      /*
+       * The money taken now cannot be more than is left once
+       * the discount is applied — a waiting discount included,
+       * or its approval would find nothing left to forgive.
+       */
       if (
         paidNowCents >
         owedBeforeDiscountCents -
-          discountCents
+          discountReductionCents
       ) {
         throw new Error(
           `The amount paid now is more than the ${formatCents(
             owedBeforeDiscountCents -
-              discountCents,
+              discountReductionCents,
           )} owed on this rental. The deposit is recorded separately.`,
         );
       }
 
-      discountStatus =
-        discountCents > 0
-          ? actor?.role === "admin"
-            ? "approved"
-            : "pending"
-          : null;
+      discountStatus = rateDiscount
+        ? actor?.role === "admin"
+          ? "approved"
+          : "pending"
+        : null;
 
-      const appliedDiscountCents =
-        discountStatus === "approved"
-          ? discountCents
-          : 0;
+      const discountApplied =
+        discountStatus === "approved" &&
+        discountedRates !== null &&
+        discountedQuote !== null;
+
+      const openingBaseCents = discountApplied
+        ? baseRentalCents - discountReductionCents
+        : baseRentalCents;
 
       const openingAdjustmentCents =
-        agreementAdjustmentCents -
-        appliedDiscountCents;
+        agreementAdjustmentCents;
 
       const openingTotalCents =
-        baseRentalCents +
+        openingBaseCents +
         openingAdjustmentCents;
 
       outstandingAfterCheckout =
         openingTotalCents - paidNowCents;
+
+      /*
+       * An applied discount becomes this rental's daily rate
+       * in its own snapshot, and the agreement's rental rows
+       * are priced from it.
+       */
+      const repricing =
+        discountApplied
+          ? {
+              rateSnapshot: discountedRates,
+              quote: discountedQuote,
+            }
+          : {};
+
+      const rentalAgreement = discountApplied
+        ? repricedAgreement(
+            agreement,
+            discountedQuote as unknown as Record<string, unknown>,
+            discountedRates as unknown as Record<string, unknown>,
+          )
+        : agreement;
+
+      const discountLock = discountStatus
+        ? {
+            dailyRateDiscountId: discountRef.id,
+            dailyRateDiscountStatus:
+              discountStatus,
+          }
+        : {};
 
       transaction.set(
         rentalRef,
@@ -4314,7 +4772,11 @@ async function checkoutReservation(
               input.notes,
             ),
 
-          agreement,
+          agreement: rentalAgreement,
+
+          ...repricing,
+
+          ...discountLock,
 
           checkoutMedia,
 
@@ -4367,7 +4829,7 @@ async function checkoutReservation(
           pickupAt:
             reservation.pickupAt,
 
-          baseRentalCents,
+          baseRentalCents: openingBaseCents,
 
           /*
            * The agreement's charge rows — waivers, insurance,
@@ -4434,6 +4896,10 @@ async function checkoutReservation(
                   "withdrawn",
               }
             : {}),
+
+          ...repricing,
+
+          ...discountLock,
 
           updatedAt:
             nowTimestamp(),
@@ -4595,41 +5061,41 @@ async function checkoutReservation(
         );
       }
 
-      if (discountStatus && actor) {
-        transaction.set(discountRef, {
+      if (
+        rateDiscount &&
+        discountStatus &&
+        actor &&
+        discountedDaily !== null
+      ) {
+        writeDailyRateDiscount(transaction, {
+          discountRef,
+          discount: rateDiscount,
+          status: discountStatus,
+          reservationId: reservationRef.id,
           rentalId: rentalRef.id,
-          customerNameSnapshot: String(
+          offeredAt: "checkout",
+          customerName: String(
             reservation.customerNameSnapshot ??
               "",
           ),
-          vehicleRegistrationSnapshot:
-            vehicleRegistration,
-          amountCents: discountCents,
-          reason: discountReason,
-          status: discountStatus,
-          offeredAt: "checkout",
-          requestedBy: actorUid,
-          requestedByNameSnapshot: actor.name,
-          requestedAt: nowTimestamp(),
-
-          /* An administrator's own discount is its own approval. */
-          reviewedBy:
-            discountStatus === "approved"
-              ? actorUid
-              : null,
-          reviewedByNameSnapshot:
-            discountStatus === "approved"
-              ? actor.name
-              : null,
-          reviewedAt:
-            discountStatus === "approved"
-              ? nowTimestamp()
-              : null,
-          reviewNote: null,
-          updatedAt: nowTimestamp(),
+          vehicleRegistration,
+          originalDailyCents: Number(
+            bookingRates.dailyCents,
+          ),
+          discountedDailyCents: discountedDaily,
+          actorUid,
+          actorName: actor.name,
         });
 
-        if (discountStatus === "approved") {
+        /*
+         * The rental days are on the books at the full rate
+         * above; an applied discount is the line that takes
+         * the difference off, so Finance and the bill show it.
+         */
+        if (
+          discountApplied &&
+          discountReductionCents > 0
+        ) {
           transaction.set(
             doc(
               collection(
@@ -4648,35 +5114,14 @@ async function checkoutReservation(
               ),
               entryType: "rental_discount",
               adjustmentType: "discount",
-              amountCents: -discountCents,
+              amountCents: -discountReductionCents,
               discountId: discountRef.id,
-              note: discountReason,
+              note: rateDiscount.reason,
               occurredAt: nowTimestamp(),
               recordedBy: actorUid,
             },
           );
         }
-
-        transaction.set(
-          doc(collection(db, "auditLogs")),
-          {
-            actorUid,
-            action:
-              discountStatus === "approved"
-                ? "discount.applied"
-                : "discount.requested",
-            resource: {
-              collection: "rentalDiscounts",
-              id: discountRef.id,
-            },
-            details: {
-              rentalId: rentalRef.id,
-              amountCents: discountCents,
-              offeredAt: "checkout",
-            },
-            createdAt: nowTimestamp(),
-          },
-        );
       }
 
       if (paidNowCents > 0) {
@@ -5932,12 +6377,10 @@ async function returnRental(
       );
 
       /*
-       * A discount needs an administrator's say-so. Anyone
-       * else offers one from the payment screen, where it
-       * waits for approval instead of coming straight off.
+       * Discounts are given on the daily rate at the start of
+       * the hire, never at the end of it.
        */
       if (
-        returnedBy.role !== "admin" &&
         normalised.adjustments.some(
           (adjustment) =>
             adjustment.type === "discount" &&
@@ -5945,7 +6388,7 @@ async function returnRental(
         )
       ) {
         throw new Error(
-          "A discount needs an administrator's approval. Complete the return, then request it on the Payment tab.",
+          "A discount is given on the daily rate at booking or checkout, not at return.",
         );
       }
 
@@ -6915,6 +7358,7 @@ export type RentalDiscount = {
   rentalId: string;
   customerName: string;
   vehicleRegistration: string;
+  /* Off the balance; for a daily-rate discount, off each day. */
   amountCents: number;
   reason: string;
   status: DiscountStatus;
@@ -6923,6 +7367,18 @@ export type RentalDiscount = {
   reviewedByName: string | null;
   reviewedAt: string | null;
   reviewNote: string | null;
+  /*
+   * Set on a discount on the daily rate; null on one offered
+   * off the balance before that was replaced.
+   */
+  dailyRate: {
+    reservationId: string;
+    type: "amount" | "percent";
+    value: number;
+    originalDailyCents: number;
+    discountedDailyCents: number;
+    offeredAt: string | null;
+  } | null;
 };
 
 function discountStatusOf(
@@ -6963,6 +7419,28 @@ function rentalDiscountFrom(
       ? toIso(data.reviewedAt)
       : null,
     reviewNote: trimmedOrNull(data.reviewNote),
+    dailyRate:
+      data.kind === "daily_rate"
+        ? {
+            reservationId: String(
+              data.reservationId ?? "",
+            ),
+            type:
+              data.discountType === "percent"
+                ? "percent"
+                : "amount",
+            value: Number(data.discountValue ?? 0),
+            originalDailyCents: Number(
+              data.originalDailyCents ?? 0,
+            ),
+            discountedDailyCents: Number(
+              data.discountedDailyCents ?? 0,
+            ),
+            offeredAt: trimmedOrNull(
+              data.offeredAt,
+            ),
+          }
+        : null,
   };
 }
 
@@ -7068,234 +7546,33 @@ function applyDiscount(
   return outstandingCents;
 }
 
+/* "$10.00 off the daily rate ($75.00 → $65.00)". */
+export function describeDailyRateDiscount(
+  discount: Pick<RentalDiscount, "dailyRate" | "amountCents">,
+): string {
+  const rate = discount.dailyRate;
+
+  if (!rate) {
+    return `${formatCents(discount.amountCents)} off`;
+  }
+
+  const off =
+    rate.type === "percent"
+      ? `${rate.value}%`
+      : formatCents(rate.value);
+
+  return `${off} off the daily rate (${formatCents(
+    rate.originalDailyCents,
+  )} → ${formatCents(
+    rate.discountedDailyCents,
+  )} a day)`;
+}
+
 function formatCents(cents: number): string {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
   }).format(cents / 100);
-}
-
-async function requestRentalDiscount(
-  input: {
-    rentalId: string;
-    amountCents: number;
-    reason: string;
-    idempotencyKey: string;
-  },
-): Promise<{
-  discountId: string;
-  status: DiscountStatus;
-  outstandingCents: number;
-}> {
-  const { db } = getFirebaseClient();
-
-  const actorUid = getActorUid();
-
-  const rentalId = trimmedOrNull(input.rentalId);
-
-  if (!rentalId) {
-    throw new Error("Select the rental to discount.");
-  }
-
-  const amountCents = assertMoneyCents(
-    input.amountCents,
-    "Discount amount",
-  );
-
-  if (amountCents <= 0) {
-    throw new Error(
-      "Discount amount must be greater than zero.",
-    );
-  }
-
-  const reason = trimmedOrNull(input.reason);
-
-  if (!reason) {
-    throw new Error(
-      "Say why the discount is being offered.",
-    );
-  }
-
-  if (reason.length > 500) {
-    throw new Error(
-      "Keep the discount reason under 500 characters.",
-    );
-  }
-
-  /*
-   * One request at a time per rental, so an administrator
-   * never approves two versions of the same discount. The
-   * query cannot run inside a browser transaction; the
-   * idempotency key below is what stops a double submit.
-   */
-  const waiting = await getDocs(
-    query(
-      collection(db, "rentalDiscounts"),
-      where("rentalId", "==", rentalId),
-      where("status", "==", "pending"),
-      limit(1),
-    ),
-  );
-
-  if (!waiting.empty) {
-    throw new Error(
-      "A discount on this rental is already waiting for an administrator.",
-    );
-  }
-
-  const operationRef = doc(
-    db,
-    "idempotencyKeys",
-    `discount_${input.idempotencyKey}`,
-  );
-
-  const discountRef = doc(
-    collection(db, "rentalDiscounts"),
-  );
-
-  const financialRef = doc(
-    db,
-    "rentalFinancials",
-    rentalId,
-  );
-
-  const rentalRef = doc(db, "rentals", rentalId);
-
-  let response:
-    | {
-        discountId: string;
-        status: DiscountStatus;
-        outstandingCents: number;
-      }
-    | undefined;
-
-  await runTransaction(db, async (transaction) => {
-    const previous = await transaction.get(
-      operationRef,
-    );
-
-    if (previous.exists()) {
-      response = previous.get("response");
-
-      return;
-    }
-
-    const [financialSnapshot, rentalSnapshot] =
-      await Promise.all([
-        transaction.get(financialRef),
-        transaction.get(rentalRef),
-      ]);
-
-    if (
-      !financialSnapshot.exists() ||
-      !rentalSnapshot.exists()
-    ) {
-      throw new Error(
-        "Rental financial record was not found.",
-      );
-    }
-
-    const actor = await actorProfileSnapshot(
-      transaction,
-      actorUid,
-    );
-
-    const financial = financialSnapshot.data();
-
-    const rental = rentalSnapshot.data();
-
-    const status: DiscountStatus =
-      actor.role === "admin"
-        ? "approved"
-        : "pending";
-
-    let outstandingCents = Number(
-      financial.outstandingCents ?? 0,
-    );
-
-    if (status === "approved") {
-      outstandingCents = applyDiscount(
-        transaction,
-        {
-          rentalId,
-          discountId: discountRef.id,
-          financial,
-          amountCents,
-          reason,
-          actorUid,
-        },
-      );
-    } else if (amountCents > outstandingCents) {
-      throw new Error(
-        `The discount is more than the ${formatCents(
-          Math.max(outstandingCents, 0),
-        )} still owed on this rental.`,
-      );
-    }
-
-    transaction.set(discountRef, {
-      rentalId,
-      customerNameSnapshot: String(
-        financial.customerNameSnapshot ??
-          rental.customerNameSnapshot ??
-          "",
-      ),
-      vehicleRegistrationSnapshot: String(
-        financial.vehicleRegistration ??
-          rental.vehicleRegistrationSnapshot ??
-          "",
-      ),
-      amountCents,
-      reason,
-      status,
-      requestedBy: actorUid,
-      requestedByNameSnapshot: actor.name,
-      requestedAt: nowTimestamp(),
-
-      /* An administrator's own discount is its own approval. */
-      reviewedBy:
-        status === "approved" ? actorUid : null,
-      reviewedByNameSnapshot:
-        status === "approved" ? actor.name : null,
-      reviewedAt:
-        status === "approved"
-          ? nowTimestamp()
-          : null,
-      reviewNote: null,
-      updatedAt: nowTimestamp(),
-    });
-
-    transaction.set(
-      doc(collection(db, "auditLogs")),
-      {
-        actorUid,
-        action:
-          status === "approved"
-            ? "discount.applied"
-            : "discount.requested",
-        resource: {
-          collection: "rentalDiscounts",
-          id: discountRef.id,
-        },
-        details: { rentalId, amountCents },
-        createdAt: nowTimestamp(),
-      },
-    );
-
-    response = {
-      discountId: discountRef.id,
-      status,
-      outstandingCents,
-    };
-
-    transaction.set(operationRef, {
-      response,
-      actorUid,
-      createdAt: nowTimestamp(),
-    });
-  });
-
-  return response!;
 }
 
 async function reviewRentalDiscount(
@@ -7366,6 +7643,22 @@ async function reviewRentalDiscount(
       throw new Error(
         "This discount has already been decided.",
       );
+    }
+
+    /* A discount on the daily rate re-prices the hire. */
+    if (discount.kind === "daily_rate") {
+      result = await decideDailyRateDiscount(
+        transaction,
+        {
+          discountRef,
+          discount,
+          decision: input.decision,
+          note,
+          actorUid,
+        },
+      );
+
+      return;
     }
 
     const rentalId = String(discount.rentalId);
@@ -7451,6 +7744,333 @@ async function reviewRentalDiscount(
   });
 
   return result;
+}
+
+/*
+ * Decides a discount on the daily rate, inside the caller's
+ * transaction. Approved before checkout, the booking is
+ * re-priced; after it, the rental, its booking and its balance
+ * are, and the difference is booked as a discount line. The
+ * approved rate becomes the hire's own daily rate, so the
+ * quote, extensions, rent on a long hire and the agreement all
+ * price from it. The vehicle's own rates never change.
+ */
+async function decideDailyRateDiscount(
+  transaction: Parameters<
+    Parameters<typeof runTransaction>[1]
+  >[0],
+  input: {
+    discountRef: ReturnType<typeof doc>;
+    discount: Record<string, any>;
+    decision: "approve" | "reject";
+    note: string | null;
+    actorUid: string;
+  },
+): Promise<{
+  status: DiscountStatus;
+  outstandingCents: number | null;
+}> {
+  const { db } = getFirebaseClient();
+
+  const { discount, actorUid, note } = input;
+
+  const reservationId = String(
+    discount.reservationId ?? "",
+  );
+
+  const reservationRef = doc(
+    db,
+    "reservations",
+    reservationId,
+  );
+
+  const reservationSnapshot =
+    await transaction.get(reservationRef);
+
+  if (!reservationSnapshot.exists()) {
+    throw new Error("Booking was not found.");
+  }
+
+  const reservation = reservationSnapshot.data();
+
+  /* Once checked out, the rental is what is priced. */
+  const rentalId =
+    reservation.status === "confirmed"
+      ? null
+      : trimmedOrNull(reservation.rentalId);
+
+  const rentalRef = rentalId
+    ? doc(db, "rentals", rentalId)
+    : null;
+
+  const financialRef = rentalId
+    ? doc(db, "rentalFinancials", rentalId)
+    : null;
+
+  const [rentalSnapshot, financialSnapshot] =
+    await Promise.all([
+      rentalRef
+        ? transaction.get(rentalRef)
+        : null,
+      financialRef
+        ? transaction.get(financialRef)
+        : null,
+    ]);
+
+  const actor = await actorProfileSnapshot(
+    transaction,
+    actorUid,
+  );
+
+  if (actor.role !== "admin") {
+    throw new Error(
+      "Only an administrator can approve a discount.",
+    );
+  }
+
+  if (discount.requestedBy === actorUid) {
+    throw new Error(
+      "A request has to be decided by another administrator.",
+    );
+  }
+
+  const status: DiscountStatus =
+    input.decision === "approve"
+      ? "approved"
+      : "rejected";
+
+  let outstandingCents: number | null = null;
+
+  const lock = {
+    dailyRateDiscountStatus: status,
+    updatedAt: nowTimestamp(),
+  };
+
+  if (status === "approved") {
+    if (reservation.status === "cancelled") {
+      throw new Error(
+        "This booking was cancelled. Reject the discount instead.",
+      );
+    }
+
+    const originalDailyCents = Number(
+      discount.originalDailyCents,
+    );
+
+    const discountedDaily = Number(
+      discount.discountedDailyCents,
+    );
+
+    const priced = (rentalId
+      ? rentalSnapshot?.data()
+      : reservation) as Record<string, any> | undefined;
+
+    if (!priced) {
+      throw new Error("Rental was not found.");
+    }
+
+    const rates = (priced.rateSnapshot ??
+      {}) as Record<string, any>;
+
+    /*
+     * The discount was worked out from this rate. Anything
+     * else means the hire was re-priced since it was asked
+     * for, and approving it would discount the wrong figure.
+     */
+    if (
+      Number(rates.dailyCents) !==
+      originalDailyCents
+    ) {
+      throw new Error(
+        "The daily rate on this hire has changed since the discount was asked for. Reject it and ask again.",
+      );
+    }
+
+    const discountedRates = withDailyRate(
+      {
+        ...rates,
+        currency: "USD" as const,
+        dailyCents: rates.dailyCents ?? null,
+        weeklyCents: rates.weeklyCents ?? null,
+        monthlyCents: rates.monthlyCents ?? null,
+      },
+      discountedDaily,
+    );
+
+    const discountedQuote = quoteRental(
+      {
+        pickupAt: toIso(priced.pickupAt),
+        expectedReturnAt: toIso(
+          priced.expectedReturnAt,
+        ),
+      },
+      discountedRates,
+    );
+
+    const repricing = {
+      rateSnapshot: discountedRates,
+      quote: discountedQuote,
+    };
+
+    if (rentalRef && financialRef) {
+      if (!financialSnapshot?.exists()) {
+        throw new Error(
+          "Rental financial record was not found.",
+        );
+      }
+
+      const financial = financialSnapshot.data();
+
+      const reductionCents = Math.max(
+        0,
+        Number(financial.baseRentalCents ?? 0) -
+          discountedQuote.baseRentalCents,
+      );
+
+      const currentOutstanding = calculateBalance(
+        Math.round(
+          Number(financial.totalCents ?? 0),
+        ),
+        assertMoneyCents(
+          financial.paidCents ?? 0,
+          "Amount received",
+        ),
+        assertMoneyCents(
+          financial.refundedCents ?? 0,
+          "Amount refunded",
+        ),
+      );
+
+      /*
+       * A discount only forgives what is still owed: money
+       * already taken is a refund, a separate decision.
+       */
+      if (reductionCents > currentOutstanding) {
+        throw new Error(
+          `The discount takes ${formatCents(
+            reductionCents,
+          )} off, more than the ${formatCents(
+            Math.max(currentOutstanding, 0),
+          )} still owed on this rental.`,
+        );
+      }
+
+      outstandingCents =
+        currentOutstanding - reductionCents;
+
+      transaction.update(financialRef, {
+        baseRentalCents:
+          discountedQuote.baseRentalCents,
+        totalCents:
+          Number(financial.totalCents ?? 0) -
+          reductionCents,
+        outstandingCents,
+        updatedAt: nowTimestamp(),
+      });
+
+      transaction.update(rentalRef, {
+        ...repricing,
+        agreement: repricedAgreement(
+          (priced.agreement ?? {}) as Record<
+            string,
+            unknown
+          >,
+          discountedQuote as unknown as Record<string, unknown>,
+          discountedRates as unknown as Record<string, unknown>,
+        ),
+        ...lock,
+      });
+
+      if (reductionCents > 0) {
+        transaction.set(
+          doc(collection(db, "financialLedger")),
+          {
+            rentalId,
+            vehicleId: String(
+              financial.vehicleId ??
+                priced.vehicleId ??
+                "",
+            ),
+            vehicleRegistration: String(
+              financial.vehicleRegistration ??
+                priced.vehicleRegistrationSnapshot ??
+                "",
+            ),
+            customerId: String(
+              financial.customerId ??
+                priced.customerId ??
+                "",
+            ),
+            entryType: "rental_discount",
+            adjustmentType: "discount",
+            amountCents: -reductionCents,
+            discountId: input.discountRef.id,
+            note: String(discount.reason ?? ""),
+            occurredAt: nowTimestamp(),
+            recordedBy: actorUid,
+          },
+        );
+      }
+    }
+
+    transaction.update(reservationRef, {
+      ...repricing,
+      ...lock,
+    });
+  } else {
+    transaction.update(reservationRef, lock);
+
+    if (rentalRef && rentalSnapshot?.exists()) {
+      transaction.update(rentalRef, lock);
+    }
+  }
+
+  transaction.update(input.discountRef, {
+    status,
+    reviewedBy: actorUid,
+    reviewedByNameSnapshot: actor.name,
+    reviewedAt: nowTimestamp(),
+    reviewNote: note,
+    updatedAt: nowTimestamp(),
+  });
+
+  transaction.set(
+    doc(collection(db, "auditLogs")),
+    {
+      actorUid,
+      action:
+        status === "approved"
+          ? "discount.daily_rate_approved"
+          : "discount.daily_rate_rejected",
+      resource: {
+        collection: "rentalDiscounts",
+        id: input.discountRef.id,
+      },
+      details: {
+        actorName: actor.name,
+        reservationId,
+        rentalId,
+        discountType: discount.discountType ?? null,
+        discountValue: discount.discountValue ?? null,
+        originalDailyCents:
+          discount.originalDailyCents ?? null,
+        discountedDailyCents:
+          discount.discountedDailyCents ?? null,
+        reason: String(discount.reason ?? ""),
+        requestedBy: String(
+          discount.requestedBy ?? "",
+        ),
+        requestedByName: String(
+          discount.requestedByNameSnapshot ?? "",
+        ),
+        decision: status,
+        note,
+      },
+      createdAt: nowTimestamp(),
+    },
+  );
+
+  return { status, outstandingCents };
 }
 
 /* Discounts still waiting for an administrator. */
@@ -9431,20 +10051,44 @@ async function getLedgerEntryDetail(
       a.occurredAt.localeCompare(b.occurredAt),
     );
 
-  const discounts = discountSnapshot
-    ? discountSnapshot.docs
-        .map((snapshot) =>
-          rentalDiscountFrom(
-            snapshot.id,
-            snapshot.data(),
-          ),
-        )
-        .sort((a, b) =>
-          String(a.requestedAt).localeCompare(
-            String(b.requestedAt),
-          ),
-        )
+  /*
+   * A discount on the daily rate asked for at booking was filed
+   * before the rental existed, so it is found by the booking.
+   */
+  const bookingId = trimmedOrNull(
+    rental?.reservationId,
+  );
+
+  const bookingDiscounts = bookingId
+    ? await getDocs(
+        query(
+          collection(db, "rentalDiscounts"),
+          where("reservationId", "==", bookingId),
+          limit(50),
+        ),
+      )
+        .then((snapshot) => snapshot.docs)
+        .catch(() => [])
     : [];
+
+  const discounts = [
+    ...new Map(
+      [
+        ...(discountSnapshot?.docs ?? []),
+        ...bookingDiscounts,
+      ].map((snapshot) => [
+        snapshot.id,
+        rentalDiscountFrom(
+          snapshot.id,
+          snapshot.data(),
+        ),
+      ]),
+    ).values(),
+  ].sort((a, b) =>
+    String(a.requestedAt).localeCompare(
+      String(b.requestedAt),
+    ),
+  );
 
   const discountId = trimmedOrNull(entry.discountId);
 
@@ -11743,7 +12387,7 @@ async function rentalRequests(
           .catch(() => [])
       : Promise.resolve([]);
 
-  const [cancellations, returns] =
+  const [cancellations, returns, discounts] =
     await Promise.all([
       read(
         "cancellationRequests",
@@ -11751,6 +12395,11 @@ async function rentalRequests(
         reservationId,
       ),
       read("returnRequests", "rentalId", rentalId),
+      read(
+        "rentalDiscounts",
+        "reservationId",
+        reservationId,
+      ),
     ]);
 
   const entries: RentalRequestEntry[] = [
@@ -11804,6 +12453,24 @@ async function rentalRequests(
         reviewNote: request.reviewNote,
       };
     }),
+
+    ...discounts
+      .map((entry) =>
+        rentalDiscountFrom(entry.id, entry.data()),
+      )
+      .filter((discount) => discount.dailyRate)
+      .map((discount) => ({
+        id: discount.id,
+        kind: "daily_rate_discount" as const,
+        summary: describeDailyRateDiscount(discount),
+        reason: discount.reason,
+        status: discount.status,
+        requestedByName: discount.requestedByName,
+        requestedAt: discount.requestedAt,
+        reviewedByName: discount.reviewedByName,
+        reviewedAt: discount.reviewedAt,
+        reviewNote: discount.reviewNote,
+      })),
   ];
 
   return entries.sort((a, b) =>
@@ -12214,18 +12881,6 @@ export async function callFirestoreOperation<
               type: string;
               amountCents: number;
             }>;
-            idempotencyKey: string;
-          },
-        )) as TResult
-      );
-
-    case "requestRentalDiscount":
-      return (
-        (await requestRentalDiscount(
-          data as {
-            rentalId: string;
-            amountCents: number;
-            reason: string;
             idempotencyKey: string;
           },
         )) as TResult
