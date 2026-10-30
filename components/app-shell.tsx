@@ -21,6 +21,7 @@ import {
   CalendarDays,
   CarFront,
   LayoutDashboard,
+  ListChecks,
   LogOut,
   Menu,
   ReceiptText,
@@ -54,8 +55,18 @@ const navigation = [
     href: "/rentals",
     label: "Bookings",
     icon: CalendarDays,
-    countsPendingDiscounts: true,
     countsCancellations: true,
+  },
+  {
+    /* Every request waiting for an administrator, in one
+       place. Reached from the menu on a phone rather than
+       taking a bottom-bar slot. */
+    href: "/approvals",
+    label: "Approvals",
+    icon: ListChecks,
+    admin: true,
+    countsPendingDiscounts: true,
+    menuOnly: true,
   },
   {
     href: "/customers",
@@ -250,7 +261,7 @@ export function AppShell({
   /*
    * Discounts offered by staff wait for an administrator, and
    * nothing else tells one that a customer is waiting on the
-   * answer, so they are counted beside Bookings the same way.
+   * answer, so they are counted beside Approvals the same way.
    */
   const [pendingDiscounts, setPendingDiscounts] =
     useState(0);
@@ -653,6 +664,7 @@ export function AppShell({
         aria-label="Mobile navigation"
       >
         {items
+          .filter((item) => !item.menuOnly)
           .slice(0, 4)
           .map(
             ({

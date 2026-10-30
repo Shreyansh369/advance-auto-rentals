@@ -3602,7 +3602,7 @@ export type CancellationRequest = {
   reviewNote: string | null;
 };
 
-function cancellationRequestFrom(
+export function cancellationRequestFrom(
   id: string,
   data: Record<string, unknown>,
 ): CancellationRequest {
@@ -6578,7 +6578,7 @@ export type ReturnRequest = {
   reviewNote: string | null;
 };
 
-function returnRequestFrom(
+export function returnRequestFrom(
   id: string,
   data: Record<string, unknown>,
 ): ReturnRequest {
@@ -7425,7 +7425,7 @@ function discountStatusOf(
     : "pending";
 }
 
-function rentalDiscountFrom(
+export function rentalDiscountFrom(
   id: string,
   data: Record<string, unknown>,
 ): RentalDiscount {

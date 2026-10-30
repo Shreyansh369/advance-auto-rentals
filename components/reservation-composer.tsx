@@ -3454,6 +3454,59 @@ export function ReservationComposer() {
     );
   }
 
+  /*
+   * The Approvals screen links here as ?tab=payment&rental=<id>
+   * after approving a backdated return that leaves a balance,
+   * so the desk lands on the payment with that rental chosen.
+   */
+  const linkedPaymentRental =
+    useRef<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(
+      window.location.search,
+    );
+
+    if (params.get("tab") !== "payment") {
+      return;
+    }
+
+    linkedPaymentRental.current =
+      params.get("rental");
+
+    const timer = window.setTimeout(
+      () => setTab("payment"),
+      0,
+    );
+
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const rentalId = linkedPaymentRental.current;
+
+    if (
+      !rentalId ||
+      !payableRentals.some(
+        (rental) => rental.id === rentalId,
+      )
+    ) {
+      return;
+    }
+
+    linkedPaymentRental.current = null;
+
+    const timer = window.setTimeout(
+      () => selectPaymentRental(rentalId),
+      0,
+    );
+
+    return () => window.clearTimeout(timer);
+    // selectPaymentRental is redefined on every render; this
+    // runs once the list holding the linked rental arrives.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [payableRentals]);
+
   function decideDiscount(
     discount: RentalDiscount,
     decision: "approve" | "reject",
