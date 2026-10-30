@@ -306,6 +306,35 @@ allow list: if isAdmin();
         && after.reservationId == reservationId;
     }
 
+    /* Staff move a booking on only as checkout and return do,
+       each proven by its rental in the same write: confirmed
+       to checked out with an active rental, checked out to
+       completed with the rental returned. Anything else —
+       a cancellation by another name — is an administrator's. */
+    function staffBookingStatusChange() {
+      let from = resource.data.get("status", null);
+      let to = request.resource.data.get("status", null);
+
+      return from == to
+        || (
+          from == "confirmed"
+          && to == "checked_out"
+          && request.resource.data.get("rentalId", null)
+              is string
+          && getAfter(
+            /databases/$(database)/documents/rentals/$(request.resource.data.rentalId)
+          ).data.status == "active"
+        )
+        || (
+          from == "checked_out"
+          && to == "completed"
+          && resource.data.get("rentalId", null) is string
+          && getAfter(
+            /databases/$(database)/documents/rentals/$(resource.data.rentalId)
+          ).data.status == "returned"
+        );
+    }
+
     /* Staff book at the vehicle's own daily rate; a discount
        on it can only be asked for, never applied, by them. */
     function bookingPricedFromVehicle(reservationId) {
@@ -377,12 +406,7 @@ allow list: if isAdmin();
               discountLockUntouched()
               || openingDiscountRequest(reservationId)
             )
-            && !(
-              request.resource.data.get("status", null)
-                  == "confirmed"
-              && resource.data.get("status", null)
-                  != "confirmed"
-            )
+            && staffBookingStatusChange()
           )
         );
 

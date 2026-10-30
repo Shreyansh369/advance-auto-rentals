@@ -314,6 +314,33 @@ describe("Firestore access policy", () => {
     );
   });
 
+  it("stops staff releasing a booking under another status name", async () => {
+    const db = asUser(OPS);
+
+    await assertSucceeds(setDoc(doc(db, "reservations", "res_side_door"), { status: "confirmed", vehicleId: "vehicle_001" }));
+    for (const status of ["completed", "checked_out", "no_show", "expired"]) {
+      await assertFails(updateDoc(doc(db, "reservations", "res_side_door"), { status }));
+    }
+
+    /* A real checkout and a real return still move it on. */
+    const checkout = writeBatch(db);
+    checkout.set(doc(db, "rentals", "rental_side_door"), { status: "active", reservationId: "res_side_door", pickupOdometerKm: 10 });
+    checkout.update(doc(db, "reservations", "res_side_door"), { status: "checked_out", rentalId: "rental_side_door" });
+    await assertSucceeds(checkout.commit());
+
+    await assertFails(updateDoc(doc(db, "reservations", "res_side_door"), { status: "completed" }));
+
+    const closing = writeBatch(db);
+    closing.update(doc(db, "rentals", "rental_side_door"), {
+      status: "returned",
+      returnFuelLevel: "full",
+      returnOdometerKm: null,
+      actualReturnAt: serverTimestamp(),
+    });
+    closing.update(doc(db, "reservations", "res_side_door"), { status: "completed" });
+    await assertSucceeds(closing.commit());
+  });
+
   it("lets staff ask for a cancellation only as their own pending request, locked to the booking", async () => {
     const db = asUser(OPS);
     const request = (id: string, data: Record<string, unknown>) => {
@@ -424,7 +451,18 @@ describe("Firestore access policy", () => {
       }),
     );
 
+    /* Marking the booking checked out without a rental is not a checkout. */
+    const fake = writeBatch(db);
+    fake.update(doc(db, "reservations", "res_waiting_3"), {
+      status: "checked_out",
+      rentalId: "rental_missing",
+      cancellationRequestStatus: "withdrawn",
+    });
+    fake.update(doc(db, "cancellationRequests", "cancel_pending_3"), { status: "withdrawn", withdrawnBy: OPS });
+    await assertFails(fake.commit());
+
     const checkout = writeBatch(db);
+    checkout.set(doc(db, "rentals", "rental_x"), { status: "active", reservationId: "res_waiting_3" });
     checkout.update(doc(db, "reservations", "res_waiting_3"), {
       status: "checked_out",
       rentalId: "rental_x",
