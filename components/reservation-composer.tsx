@@ -2119,7 +2119,7 @@ export function ReservationComposer() {
           !paymentMethod
         ) {
           throw new Error(
-            "Choose how the renter is paying — cash, check or credit card — before recording the amount paid now.",
+            "Choose how the renter is paying — cash, check, credit card, credit or ATH — before recording the amount paid now.",
           );
         }
 
@@ -5919,6 +5919,14 @@ export function ReservationComposer() {
 
                 <option value="other">
                   Other
+                </option>
+
+                <option value="account_credit">
+                  Credit
+                </option>
+
+                <option value="ath">
+                  ATH
                 </option>
               </select>
             </div>

@@ -371,6 +371,8 @@ export const paymentSchema =
         "card",
         "bank_transfer",
         "other",
+        "account_credit",
+        "ath",
       ]),
 
     externalReference:

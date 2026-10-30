@@ -2988,6 +2988,8 @@ const PAYMENT_METHODS = [
   "cash",
   "check",
   "credit",
+  "account_credit",
+  "ath",
 ] as const;
 
 /*
@@ -3469,6 +3471,10 @@ async function checkoutReservation(
         return "check";
       case "credit":
         return "card";
+      case "account_credit":
+        return "account_credit";
+      case "ath":
+        return "ath";
       default:
         return null;
     }
@@ -3476,7 +3482,7 @@ async function checkoutReservation(
 
   if (paidNowCents > 0 && !paidNowMethod) {
     throw new Error(
-      "Choose how the renter is paying — cash, check or credit card — before recording the amount paid now.",
+      "Choose how the renter is paying — cash, check, credit card, credit or ATH — before recording the amount paid now.",
     );
   }
 
@@ -9498,6 +9504,8 @@ const RENTAL_PAYMENT_METHODS = [
   "card",
   "bank_transfer",
   "other",
+  "account_credit",
+  "ath",
 ] as const;
 
 export type PastRentalInput = {

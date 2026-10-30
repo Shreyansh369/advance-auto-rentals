@@ -501,6 +501,12 @@ export function PastBookingForm({
             <option value="other">
               Other
             </option>
+
+            <option value="account_credit">
+              Credit
+            </option>
+
+            <option value="ath">ATH</option>
           </select>
         </div>
 

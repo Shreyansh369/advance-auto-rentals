@@ -20,6 +20,8 @@ import {
   formatMoney,
 } from "@/lib/presentation";
 
+import { paymentMethodLabel } from "@/lib/agreement";
+
 /** The hydration flag never changes, so there is nothing to subscribe to. */
 function subscribeToNothing(): () => void {
   return () => {};
@@ -268,7 +270,7 @@ export function LedgerEntryReceipt({
                 <>
                   <Row
                     label="Paid by"
-                    value={entryTypeLabel(
+                    value={paymentMethodLabel(
                       detail.payment.method,
                     )}
                   />

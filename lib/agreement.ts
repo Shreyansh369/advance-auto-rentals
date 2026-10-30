@@ -126,7 +126,45 @@ export const PAYMENT_METHODS = [
   /* A credit card — not "on credit". The money is still
      taken at the counter or later on the Payment tab. */
   { value: "credit", label: "Credit card" },
+  /* "Credit" as the client writes it: a separate method from a
+     credit card, so it has a value of its own that can never be
+     read as the card's "credit". */
+  { value: "account_credit", label: "Credit" },
+  { value: "ath", label: "ATH" },
 ] as const;
 
 export type AgreementPaymentMethod =
   (typeof PAYMENT_METHODS)[number]["value"];
+
+/*
+ * How a payment on the till was taken. "card" is a credit card;
+ * the two methods added after it carry the client's own labels.
+ */
+export const RENTAL_PAYMENT_METHOD_OPTIONS = [
+  { value: "cash", label: "Cash" },
+  { value: "card", label: "Card" },
+  { value: "bank_transfer", label: "Bank transfer" },
+  { value: "other", label: "Other" },
+  { value: "account_credit", label: "Credit" },
+  { value: "ath", label: "ATH" },
+] as const;
+
+/* The label for a stored payment method, old or new. */
+export function paymentMethodLabel(
+  value: string,
+): string {
+  const known = RENTAL_PAYMENT_METHOD_OPTIONS.find(
+    (method) => method.value === value,
+  );
+
+  if (known) {
+    return known.label;
+  }
+
+  const words = value.replaceAll("_", " ");
+
+  return (
+    words.charAt(0).toUpperCase() +
+    words.slice(1)
+  );
+}
